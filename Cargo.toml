@@ -1,0 +1,62 @@
+[package]
+name = "meshcore"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Christian Wohlert <christian667@gmail.com>"]
+description = "A Rust client library for MeshCore mesh networking devices"
+license = "MIT"
+repository = "https://github.com/chrstnwhlrt/meshcore-rs"
+keywords = ["meshcore", "mesh", "networking", "serial", "lora"]
+categories = ["network-programming", "embedded", "asynchronous"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
+
+# Serial port communication
+tokio-serial = "5"
+
+# Error handling
+thiserror = "2"
+
+# Buffer handling
+bytes = "1"
+
+# Logging/tracing
+tracing = "0.1"
+
+# Hex encoding for public keys
+hex = "0.4"
+
+# Futures utilities
+futures = "0.3"
+
+# Optional: SHA256 for flood scope topic hashing
+sha2 = { version = "0.10", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+default = []
+# Enable SHA256-based flood scope topic hashing
+sha2 = ["dep:sha2"]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Allow certain patterns that are acceptable for this library
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# Allow patterns common in async code
+significant_drop_tightening = "allow"
+# Allow patterns needed for protocol handling
+cast_possible_truncation = "allow"
+# Allow if-let-else for clearer code
+option_if_let_else = "allow"
