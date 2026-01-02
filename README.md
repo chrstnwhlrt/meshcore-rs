@@ -415,7 +415,7 @@ MIT License - see [LICENSE](LICENSE) file.
 ## Related Projects
 
 - [meshcore_py](https://github.com/fdlamotte/meshcore_py) - Original Python library (reference implementation)
-- [meshcli-rs](https://github.com/chrstnwhlrt/meshcore-cli-rs) - Rust CLI for MeshCore (uses this library)
+- [meshcore-cli-rs](https://github.com/chrstnwhlrt/meshcore-cli-rs) - Rust CLI for MeshCore (uses this library)
 - [meshcore-cli](https://github.com/meshcore-dev/meshcore-cli) - Original Python CLI
 
 ## Contributing
