@@ -77,20 +77,41 @@ impl<T: Transport> CommandHandler<T> {
 
     /// Sends a raw command and waits for specific response types.
     async fn send_and_wait(&self, data: Bytes, expected: &[PacketType]) -> Result<Event> {
+        // IMPORTANT: Subscribe BEFORE sending to avoid race conditions.
+        // With broadcast channels, events are only delivered to subscribers
+        // that exist at the time of dispatch. If we send first and then
+        // subscribe, a fast response could be dispatched before our
+        // subscription is created, causing us to miss it.
+        let filter = EventFilter::packet_types(expected.to_vec());
+        let mut subscription = self.dispatcher.subscribe(None);
+
         // Send the command
         {
             let mut transport = self.transport.lock().await;
             transport.send(data).await?;
         }
 
-        // Wait for response
-        let filter = EventFilter::packet_types(expected.to_vec());
-        self.dispatcher
-            .wait_for(filter, self.timeout)
-            .await
-            .ok_or_else(|| Error::Timeout {
-                timeout_ms: u64::try_from(self.timeout.as_millis()).unwrap_or(u64::MAX),
-            })
+        // Wait for matching response with timeout
+        let timeout = self.timeout;
+        tokio::select! {
+            biased;
+            result = async {
+                loop {
+                    if let Some(event) = subscription.recv().await {
+                        if filter.matches(&event) {
+                            return Some(event);
+                        }
+                    } else {
+                        return None;
+                    }
+                }
+            } => result.ok_or_else(|| Error::Timeout {
+                timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            }),
+            () = tokio::time::sleep(timeout) => Err(Error::Timeout {
+                timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            }),
+        }
     }
 
     /// Sends a command and expects OK/Error response.
