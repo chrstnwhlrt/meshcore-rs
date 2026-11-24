@@ -1,0 +1,790 @@
+//! BLE transport over the Nordic UART service, through BlueZ (feature `ble`,
+//! Linux only).
+//!
+//! Each write to the RX characteristic is one frame and each notification of
+//! the TX characteristic is one frame, so no framing bytes are added. As in
+//! meshcore_py's `BLEConnection`, the device is found by its address, by a
+//! part of its name or as the first MeshCore device in range; frames are
+//! written with response, and a write that does not finish within 10 s takes
+//! the link down.
+//!
+//! MeshCore takes frames only over a paired link. A PIN pairs a device that is
+//! not paired yet, and pairs it anew when it has forgotten the pairing (after
+//! it was flashed); without a PIN an unpaired device is refused before
+//! anything is written to it.
+//!
+//! A device does not advertise while it is connected, so one this computer is
+//! connected to counts as in range without advertising. Its link is used when
+//! no program uses it (one left behind by a program that ended without
+//! disconnecting); while another program gets the device's frames over it,
+//! connecting fails with [`Error::DeviceInUse`]. When a program lets go of a
+//! device, BlueZ shows the link as connected for 2 s more but no longer
+//! serves it; connecting then waits for that link to go and connects anew.
+
+use std::fmt;
+use std::pin::pin;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bluer::agent::Agent;
+use bluer::gatt::WriteOp;
+use bluer::gatt::remote::{Characteristic, CharacteristicWriteRequest};
+use bluer::{
+    Adapter, AdapterEvent, Address, Device, DeviceEvent, DeviceProperty, DiscoveryFilter,
+    DiscoveryTransport, ErrorKind, Session, Uuid,
+};
+use futures_util::{Stream, StreamExt, stream};
+use tokio::sync::{OnceCell, mpsc};
+use tokio::task::JoinHandle;
+
+use crate::error::{Error, Result};
+use crate::transport::{BoxFuture, FrameWriter, LINK_CAPACITY, Link, LinkEvent, Transport};
+
+/// The Nordic UART service.
+pub const UART_SERVICE_UUID: Uuid = Uuid::from_u128(0x6E40_0001_B5A3_F393_E0A9_E50E_24DC_CA9E);
+/// The characteristic the host writes frames to.
+pub const UART_RX_CHAR_UUID: Uuid = Uuid::from_u128(0x6E40_0002_B5A3_F393_E0A9_E50E_24DC_CA9E);
+/// The characteristic the device notifies frames on.
+pub const UART_TX_CHAR_UUID: Uuid = Uuid::from_u128(0x6E40_0003_B5A3_F393_E0A9_E50E_24DC_CA9E);
+
+/// The prefix MeshCore companions advertise their name with.
+pub const NAME_PREFIX: &str = "MeshCore";
+
+/// The largest PIN the firmware takes (six digits).
+const MAX_PIN: u32 = 999_999;
+
+/// How long to wait for BlueZ to drop a link a program let go of. BlueZ
+/// disconnects 2 s after it was asked to.
+const LINK_DROP_WAIT: Duration = Duration::from_secs(3);
+
+/// BLE settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BleConfig {
+    /// The device: its address (`AA:BB:CC:DD:EE:FF`), a part of its name, or
+    /// `None` for the first MeshCore device in range. As in meshcore_py, text
+    /// with a `:` is taken for an address.
+    pub address: Option<String>,
+    /// The PIN to pair with when the device is not paired yet, or has
+    /// forgotten the pairing (shown on the device's display, or set in its
+    /// firmware). A paired device needs none.
+    pub pin: Option<u32>,
+    /// How long to scan for the device (10 s, as meshcore_py's scan).
+    pub scan_timeout: Duration,
+    /// How long connecting, pairing and reading the services may take (20 s).
+    pub connect_timeout: Duration,
+    /// How long one write may take before the link counts as dead (10 s, as
+    /// in meshcore_py).
+    pub write_timeout: Duration,
+}
+
+impl Default for BleConfig {
+    fn default() -> Self {
+        Self {
+            address: None,
+            pin: None,
+            scan_timeout: Duration::from_secs(10),
+            connect_timeout: Duration::from_secs(20),
+            write_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+impl BleConfig {
+    /// Settings for a device address or a part of its name.
+    #[must_use]
+    pub fn new(address: impl Into<String>) -> Self {
+        Self {
+            address: Some(address.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Sets the PIN to pair with.
+    #[must_use]
+    pub const fn pin(mut self, pin: Option<u32>) -> Self {
+        self.pin = pin;
+        self
+    }
+
+    /// Sets how long to scan for the device.
+    #[must_use]
+    pub const fn scan_timeout(mut self, timeout: Duration) -> Self {
+        self.scan_timeout = timeout;
+        self
+    }
+
+    /// Sets how long connecting, pairing and reading the services may take.
+    #[must_use]
+    pub const fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    /// Sets how long one write may take.
+    #[must_use]
+    pub const fn write_timeout(mut self, timeout: Duration) -> Self {
+        self.write_timeout = timeout;
+        self
+    }
+}
+
+/// A MeshCore device in range, as [`scan`] finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BleDevice {
+    /// The name (`MeshCore-...`).
+    pub name: String,
+    /// The address (`AA:BB:CC:DD:EE:FF`).
+    pub address: String,
+    /// The signal strength in dBm, or `None` for a device this computer is
+    /// connected to (it does not advertise while connected).
+    pub rssi: Option<i16>,
+}
+
+/// Which device the settings ask for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Target {
+    Address(Address),
+    /// A MeshCore device whose name contains this part (any if `None`).
+    Name(Option<String>),
+}
+
+impl Target {
+    fn of(config: &BleConfig) -> Result<Self> {
+        match config.address.as_deref() {
+            Some(text) if text.contains(':') => Address::from_str(text)
+                .map(Self::Address)
+                .map_err(|_| Error::invalid(format!("{text} is not a Bluetooth address"))),
+            other => Ok(Self::Name(other.map(str::to_string))),
+        }
+    }
+
+    fn matches(&self, address: Address, name: Option<&str>) -> bool {
+        match self {
+            Self::Address(wanted) => address == *wanted,
+            Self::Name(part) => name.is_some_and(|name| {
+                name.starts_with(NAME_PREFIX)
+                    && part.as_deref().is_none_or(|part| name.contains(part))
+            }),
+        }
+    }
+}
+
+impl fmt::Display for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Address(address) => write!(f, "{address}"),
+            Self::Name(Some(part)) => write!(f, "{NAME_PREFIX} device with \"{part}\" in its name"),
+            Self::Name(None) => write!(f, "{NAME_PREFIX} device"),
+        }
+    }
+}
+
+fn check_pin(pin: Option<u32>) -> Result<Option<u32>> {
+    match pin {
+        Some(pin) if pin > MAX_PIN => Err(Error::invalid("the BLE PIN has at most six digits")),
+        pin => Ok(pin),
+    }
+}
+
+/// The default adapter, if it is on.
+async fn powered_adapter(session: &Session) -> Result<Adapter> {
+    let adapter = session.default_adapter().await?;
+    if !adapter.is_powered().await? {
+        return Err(Error::DeviceNotFound(format!(
+            "the Bluetooth adapter {} is off",
+            adapter.name()
+        )));
+    }
+    Ok(adapter)
+}
+
+/// Scans (LE only) until `timeout` or until `wanted` takes a device in range;
+/// returns the address it took. Devices this computer is connected to count
+/// as in range; they come first, with all devices BlueZ knows already.
+async fn discover(
+    adapter: &Adapter,
+    timeout: Duration,
+    mut wanted: impl FnMut(&BleDevice) -> bool,
+) -> Result<Option<Address>> {
+    adapter
+        .set_discovery_filter(DiscoveryFilter {
+            transport: DiscoveryTransport::Le,
+            ..DiscoveryFilter::default()
+        })
+        .await?;
+    let events = adapter.discover_devices_with_changes().await?;
+    let mut events = pin!(events);
+    let deadline = crate::util::deadline_after(timeout);
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, events.next()).await {
+        let AdapterEvent::DeviceAdded(address) = event else {
+            continue;
+        };
+        let Ok(device) = adapter.device(address) else {
+            continue;
+        };
+        // Devices BlueZ knows from earlier but that are out of range have no
+        // RSSI, and neither have connected ones.
+        let rssi = device.rssi().await.ok().flatten();
+        if rssi.is_none() && !device.is_connected().await.unwrap_or(false) {
+            continue;
+        }
+        let name = device.name().await.ok().flatten().unwrap_or_default();
+        let found = BleDevice {
+            name,
+            address: address.to_string(),
+            rssi,
+        };
+        if wanted(&found) {
+            return Ok(Some(address));
+        }
+    }
+    Ok(None)
+}
+
+/// Scans for MeshCore devices in range for `timeout`. A device this computer
+/// is connected to is listed without RSSI.
+///
+/// # Errors
+///
+/// [`Error::DeviceNotFound`] when the adapter is off, [`Error::Ble`] when
+/// BlueZ cannot scan.
+pub async fn scan(timeout: Duration) -> Result<Vec<BleDevice>> {
+    let session = Session::new().await?;
+    let adapter = powered_adapter(&session).await?;
+    let target = Target::Name(None);
+    let mut found: Vec<BleDevice> = Vec::new();
+    discover(&adapter, timeout, |device| {
+        if let Ok(address) = Address::from_str(&device.address)
+            && target.matches(address, Some(&device.name))
+        {
+            match found
+                .iter_mut()
+                .find(|known| known.address == device.address)
+            {
+                Some(known) => *known = device.clone(),
+                None => found.push(device.clone()),
+            }
+        }
+        false
+    })
+    .await?;
+    Ok(found)
+}
+
+/// Finds the device the settings ask for. A known address is used as is,
+/// everything else needs the device in range (advertising or connected).
+async fn find_device(adapter: &Adapter, target: &Target, timeout: Duration) -> Result<Device> {
+    if let Target::Address(address) = target
+        && adapter.device_addresses().await?.contains(address)
+    {
+        return Ok(adapter.device(*address)?);
+    }
+    log::info!(target: "meshcore", "scanning for a {target}");
+    let found = discover(adapter, timeout, |device| {
+        Address::from_str(&device.address)
+            .is_ok_and(|address| target.matches(address, Some(&device.name)))
+    })
+    .await?;
+    match found {
+        Some(address) => Ok(adapter.device(address)?),
+        None => Err(Error::DeviceNotFound(format!("no {target} in range"))),
+    }
+}
+
+/// Pairs with an agent that answers the device's passkey request with the PIN.
+async fn pair(session: &Session, device: &Device, pin: u32) -> Result<()> {
+    let agent = Agent {
+        request_passkey: Some(Box::new(move |_| Box::pin(async move { Ok(pin) }))),
+        request_pin_code: Some(Box::new(move |_| {
+            Box::pin(async move { Ok(format!("{pin:06}")) })
+        })),
+        ..Agent::default()
+    };
+    // Registered only while pairing; the handle unregisters it when dropped.
+    let _agent = session.register_agent(agent).await?;
+    log::info!(target: "meshcore", "pairing with {}", device.address());
+    device.pair().await.map_err(|err| match err.kind {
+        ErrorKind::AuthenticationFailed | ErrorKind::AuthenticationRejected => {
+            Error::PairingFailed(format!(
+                "{} did not take the PIN, is it the right one? ({err})",
+                device.address()
+            ))
+        }
+        _ => Error::Ble(err),
+    })
+}
+
+/// Connects, or keeps the link BlueZ already has.
+async fn connect(device: &Device) -> Result<()> {
+    match device.connect().await {
+        Err(err) if err.kind != ErrorKind::AlreadyConnected => Err(Error::Ble(err)),
+        _ => Ok(()),
+    }
+}
+
+/// Connects, and pairs anew with the PIN when the device refuses the pairing
+/// this computer has: flashed anew, it has forgotten it. BlueZ then aborts the
+/// connection itself.
+async fn connect_or_repair(
+    adapter: &Adapter,
+    device: &Device,
+    pin: Option<u32>,
+    scan_timeout: Duration,
+) -> Result<()> {
+    let Err(err) = connect(device).await else {
+        return Ok(());
+    };
+    let refused = match &err {
+        Error::Ble(ble) => {
+            ble.kind == ErrorKind::Failed && ble.message == "le-connection-abort-by-local"
+        }
+        _ => false,
+    };
+    if !refused || !device.is_paired().await? {
+        return Err(err);
+    }
+    let address = device.address();
+    if pin.is_none() {
+        return Err(Error::PairingFailed(format!(
+            "{address} refused the pairing this computer has; if it was flashed anew, \
+             give its PIN to pair again"
+        )));
+    }
+    log::info!(target: "meshcore", "{address} refused the pairing this computer has, pairing again");
+    // Removing the device drops the pairing; BlueZ knows the device again
+    // once it hears it.
+    adapter.remove_device(address).await?;
+    let wanted = address.to_string();
+    if discover(adapter, scan_timeout, |found| found.address == wanted)
+        .await?
+        .is_none()
+    {
+        return Err(Error::DeviceNotFound(format!("{address} is not in range")));
+    }
+    connect(device).await
+}
+
+/// Whether BlueZ drops the device's link within [`LINK_DROP_WAIT`]. After a
+/// program lets go of a device, BlueZ keeps showing the link as connected for
+/// 2 s but refuses to use it.
+async fn link_drops(device: &Device) -> bool {
+    let dropped = async {
+        let events = device.events().await?;
+        let mut events = pin!(events);
+        if !device.is_connected().await? {
+            return Ok::<_, bluer::Error>(true);
+        }
+        while let Some(event) = events.next().await {
+            if matches!(
+                event,
+                DeviceEvent::PropertyChanged(DeviceProperty::Connected(false))
+            ) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    matches!(
+        tokio::time::timeout(LINK_DROP_WAIT, dropped).await,
+        Ok(Ok(true))
+    )
+}
+
+/// Asks BlueZ to disconnect without waiting, for drop handlers. BlueZ keeps
+/// a link no program uses (the device then stops advertising), so a link
+/// given up without closing it is taken down this way. It needs the Tokio
+/// runtime to go on running for a moment, which a program that exits right
+/// away does not give it.
+fn disconnect_in_background(device: Device) {
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(async move {
+            if let Err(err) = device.disconnect().await {
+                log::debug!(target: "meshcore", "BLE disconnect failed: {err}");
+            }
+        });
+    }
+}
+
+/// Takes down the link a transport is making when connecting is given up
+/// halfway, as when a caller's timeout drops the future: BlueZ would finish
+/// the connection anyway.
+#[derive(Default)]
+struct CancelGuard(Option<Device>);
+
+impl CancelGuard {
+    fn arm(&mut self, device: &Device) {
+        self.0 = Some(device.clone());
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        if let Some(device) = self.0.take() {
+            disconnect_in_background(device);
+        }
+    }
+}
+
+/// The RX and TX characteristics of the device's Nordic UART service.
+async fn uart_characteristics(device: &Device) -> Result<(Characteristic, Characteristic)> {
+    for service in device.services().await? {
+        if service.uuid().await? != UART_SERVICE_UUID {
+            continue;
+        }
+        let (mut rx, mut tx) = (None, None);
+        for characteristic in service.characteristics().await? {
+            let uuid = characteristic.uuid().await?;
+            if uuid == UART_RX_CHAR_UUID {
+                rx = Some(characteristic);
+            } else if uuid == UART_TX_CHAR_UUID {
+                tx = Some(characteristic);
+            }
+        }
+        if let (Some(rx), Some(tx)) = (rx, tx) {
+            return Ok((rx, tx));
+        }
+    }
+    Err(Error::DeviceNotFound(format!(
+        "{} has no Nordic UART service, is it a MeshCore companion?",
+        device.address()
+    )))
+}
+
+/// Connects over BLE.
+#[derive(Clone)]
+pub struct BleTransport {
+    config: BleConfig,
+    /// The D-Bus session to BlueZ, made on the first open and kept for
+    /// reconnecting.
+    session: Arc<OnceCell<Session>>,
+}
+
+impl fmt::Debug for BleTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BleTransport")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BleTransport {
+    /// A transport for the given settings.
+    #[must_use]
+    pub fn new(config: BleConfig) -> Self {
+        Self {
+            config,
+            session: Arc::default(),
+        }
+    }
+
+    /// The settings.
+    #[must_use]
+    pub const fn config(&self) -> &BleConfig {
+        &self.config
+    }
+
+    /// Pairs if needed, finds the UART service and starts notifications.
+    /// A link that was there before (`existing`) may belong to another
+    /// program, which then gets the device's frames already.
+    async fn start(
+        &self,
+        session: &Session,
+        device: &Device,
+        pin: Option<u32>,
+        existing: bool,
+    ) -> Result<Link> {
+        let in_use = || {
+            Error::DeviceInUse(format!(
+                "another program on this computer is connected to {}",
+                device.address()
+            ))
+        };
+        let (rx, tx) = uart_characteristics(device).await?;
+        if existing && tx.notifying().await? == Some(true) {
+            return Err(in_use());
+        }
+        if !device.is_paired().await? {
+            // MeshCore takes frames only over a paired link. Without a PIN,
+            // the first write would leave pairing to the desktop's agent,
+            // and a write cut off while that waits leaves BlueZ stuck.
+            let Some(pin) = pin else {
+                return Err(Error::PairingFailed(format!(
+                    "{} is not paired with this computer, give its PIN",
+                    device.address()
+                )));
+            };
+            pair(session, device, pin).await?;
+        }
+        let notifications = match tx.notify().await {
+            Ok(notifications) => notifications,
+            // Another program took the notifications for itself (AcquireNotify).
+            Err(err)
+                if existing
+                    && err.kind == ErrorKind::NotPermitted
+                    && err.message == "Notify acquired" =>
+            {
+                return Err(in_use());
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let device_events = device.events().await?;
+        let (sender, events) = mpsc::channel(LINK_CAPACITY);
+        let reader_task = tokio::spawn(read_link(notifications, device_events, sender.clone()));
+        log::info!(target: "meshcore", "BLE connection started");
+        Ok(Link {
+            info: device.address().to_string(),
+            events,
+            writer: Box::new(BleWriter {
+                device: Some(device.clone()),
+                rx,
+                reader_task: Some(reader_task),
+                events: sender,
+                write_timeout: self.config.write_timeout,
+            }),
+        })
+    }
+}
+
+impl Transport for BleTransport {
+    fn open(&self) -> BoxFuture<'_, Result<Link>> {
+        Box::pin(async move {
+            let config = &self.config;
+            let pin = check_pin(config.pin)?;
+            let target = Target::of(config)?;
+            let session = self.session.get_or_try_init(Session::new).await?;
+            let adapter = powered_adapter(session).await?;
+            let device = find_device(&adapter, &target, config.scan_timeout).await?;
+            log::info!(target: "meshcore", "connecting to {}", device.address());
+            // Armed for a link this call makes, not for one that was there.
+            let mut guard = CancelGuard::default();
+            let setup = async {
+                let had_link = device.is_connected().await?;
+                if !had_link {
+                    guard.arm(&device);
+                }
+                connect_or_repair(&adapter, &device, pin, config.scan_timeout).await?;
+                match self.start(session, &device, pin, had_link).await {
+                    // The link BlueZ had may be one it is taking down.
+                    Err(err) if had_link && link_drops(&device).await => {
+                        log::debug!(
+                            target: "meshcore",
+                            "BlueZ closed the link it had ({err}), connecting anew"
+                        );
+                        guard.arm(&device);
+                        connect(&device).await?;
+                        self.start(session, &device, pin, false).await
+                    }
+                    result => result,
+                }
+            };
+            let result = tokio::time::timeout(config.connect_timeout, setup).await;
+            guard.disarm();
+            let error = match result {
+                Ok(Ok(link)) => return Ok(link),
+                Ok(Err(err)) => err,
+                Err(_) => Error::Timeout,
+            };
+            // Do not leave a half set up link behind, but leave the link of
+            // another program alone.
+            if !matches!(error, Error::DeviceInUse(_))
+                && let Err(err) = device.disconnect().await
+            {
+                log::debug!(target: "meshcore", "BLE disconnect failed: {err}");
+            }
+            Err(error)
+        })
+    }
+
+    fn describe(&self) -> String {
+        Target::of(&self.config).map_or_else(|_| "BLE".to_string(), |target| target.to_string())
+    }
+}
+
+/// What the link reader waits for.
+enum Input {
+    Frame(Vec<u8>),
+    Device(DeviceEvent),
+}
+
+/// Forwards notified frames until the device disconnects.
+async fn read_link(
+    notifications: impl Stream<Item = Vec<u8>> + Send,
+    device_events: impl Stream<Item = DeviceEvent> + Send,
+    events: mpsc::Sender<LinkEvent>,
+) {
+    let inputs = stream::select(
+        notifications.map(Input::Frame),
+        device_events.map(Input::Device),
+    );
+    let mut inputs = pin!(inputs);
+    loop {
+        match inputs.next().await {
+            Some(Input::Frame(frame)) => {
+                log::trace!(target: "meshcore", "received a {} byte frame", frame.len());
+                if events.send(LinkEvent::Frame(frame)).await.is_err() {
+                    return;
+                }
+            }
+            Some(Input::Device(DeviceEvent::PropertyChanged(DeviceProperty::Connected(false))))
+            | None => {
+                break;
+            }
+            Some(Input::Device(_)) => {}
+        }
+    }
+    log::debug!(target: "meshcore", "link closed: ble_disconnect");
+    let _ = events
+        .send(LinkEvent::Closed("ble_disconnect".into()))
+        .await;
+}
+
+struct BleWriter {
+    /// `None` once closed.
+    device: Option<Device>,
+    rx: Characteristic,
+    reader_task: Option<JoinHandle<()>>,
+    events: mpsc::Sender<LinkEvent>,
+    write_timeout: Duration,
+}
+
+impl FrameWriter for BleWriter {
+    fn write_frame<'a>(&'a mut self, frame: &'a [u8]) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            // With response, as meshcore_py writes.
+            let request = CharacteristicWriteRequest {
+                op_type: WriteOp::Request,
+                ..CharacteristicWriteRequest::default()
+            };
+            let (reason, err) =
+                match tokio::time::timeout(self.write_timeout, self.rx.write_ext(frame, &request))
+                    .await
+                {
+                    Ok(Ok(())) => return Ok(()),
+                    Ok(Err(err)) => (format!("ble_write_failed: {err}"), Error::Ble(err)),
+                    Err(_) => ("ble_write_timeout".to_string(), Error::ConnectionLost),
+                };
+            // A write that failed or stalled leaves the link unusable (a second
+            // write racing a stalled one drops it anyway): report it closed so
+            // the client can reconnect.
+            log::warn!(target: "meshcore", "{reason}");
+            if let Some(task) = self.reader_task.take() {
+                task.abort();
+            }
+            let _ = self.events.send(LinkEvent::Closed(reason)).await;
+            Err(err)
+        })
+    }
+
+    fn close(&mut self) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            if let Some(task) = self.reader_task.take() {
+                task.abort();
+            }
+            if let Some(device) = self.device.take()
+                && let Err(err) = device.disconnect().await
+            {
+                log::debug!(target: "meshcore", "BLE disconnect failed: {err}");
+            }
+        })
+    }
+}
+
+impl Drop for BleWriter {
+    fn drop(&mut self) {
+        if let Some(task) = self.reader_task.take() {
+            task.abort();
+        }
+        // Dropped without closing, as when the client is dropped.
+        if let Some(device) = self.device.take() {
+            disconnect_in_background(device);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn address(text: &str) -> Address {
+        Address::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn text_with_a_colon_is_an_address() {
+        let config = BleConfig::new("c0:ff:ee:00:11:22");
+        assert_eq!(
+            Target::of(&config).unwrap(),
+            Target::Address(address("C0:FF:EE:00:11:22"))
+        );
+        assert!(matches!(
+            Target::of(&BleConfig::new("C0:FF")),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert_eq!(
+            Target::of(&BleConfig::new("Hamburg")).unwrap(),
+            Target::Name(Some("Hamburg".into()))
+        );
+        assert_eq!(
+            Target::of(&BleConfig::default()).unwrap(),
+            Target::Name(None)
+        );
+    }
+
+    #[test]
+    fn names_match_like_meshcore_py() {
+        let any = address("00:00:00:00:00:01");
+        assert!(Target::Name(None).matches(any, Some("MeshCore-Hamburg")));
+        assert!(!Target::Name(None).matches(any, Some("OnePlus Buds")));
+        assert!(!Target::Name(None).matches(any, None));
+        let part = Target::Name(Some("burg".into()));
+        assert!(part.matches(any, Some("MeshCore-Hamburg")));
+        assert!(!part.matches(any, Some("MeshCore-Berlin")));
+        // An address matches whatever the name.
+        assert!(Target::Address(any).matches(any, None));
+        assert!(!Target::Address(any).matches(address("00:00:00:00:00:02"), Some("MeshCore-x")));
+    }
+
+    #[test]
+    fn pins_have_six_digits_at_most() {
+        assert_eq!(check_pin(Some(123_456)).unwrap(), Some(123_456));
+        assert_eq!(check_pin(None).unwrap(), None);
+        assert!(matches!(
+            check_pin(Some(1_000_000)),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn config_builders() {
+        let config = BleConfig::new("MeshCore-1")
+            .pin(Some(123_456))
+            .scan_timeout(Duration::from_secs(5))
+            .connect_timeout(Duration::from_secs(30))
+            .write_timeout(Duration::from_secs(2));
+        assert_eq!(config.pin, Some(123_456));
+        assert_eq!(config.scan_timeout, Duration::from_secs(5));
+        assert_eq!(config.connect_timeout, Duration::from_secs(30));
+        assert_eq!(config.write_timeout, Duration::from_secs(2));
+        let defaults = BleConfig::default();
+        assert_eq!(defaults.write_timeout, Duration::from_secs(10));
+        assert_eq!(defaults.address, None);
+    }
+
+    #[test]
+    fn targets_describe_themselves() {
+        assert_eq!(Target::Name(None).to_string(), "MeshCore device");
+        assert_eq!(
+            BleTransport::new(BleConfig::new("Hamburg")).describe(),
+            "MeshCore device with \"Hamburg\" in its name"
+        );
+        assert_eq!(
+            BleTransport::new(BleConfig::new("C0:FF:EE:00:11:22")).describe(),
+            "C0:FF:EE:00:11:22"
+        );
+    }
+}

@@ -1,21 +1,14 @@
-//! Protocol definitions for `MeshCore` communication.
-//!
-//! This module contains the low-level protocol types including:
-//! - Frame encoding/decoding
-//! - Packet type definitions
-//! - Command opcodes
-//! - Binary data parsing
+//! The companion protocol: codes, framing and path encoding.
 
-pub mod command;
+pub(crate) mod bytes;
+pub mod codes;
 pub mod frame;
-pub mod packet;
-pub mod parser;
+pub(crate) mod parse;
+pub mod path;
 
-pub use command::{BinaryReqType, CommandOpcode, ControlDataType, MessageType, StatsType};
-pub use frame::{FRAME_HEADER, FrameDecoder, MAX_FRAME_SIZE, encode as encode_frame};
-pub use packet::PacketType;
-pub use parser::{
-    parse_battery, parse_channel, parse_channel_message, parse_contact, parse_contact_message,
-    parse_core_stats, parse_device_info, parse_device_status, parse_packet_stats,
-    parse_radio_stats, parse_self_info,
+pub use codes::{AnonReqType, BinaryReqType, CommandType, ControlType, PacketType, StatsType};
+pub use frame::{
+    DEVICE_MAX_FRAME_SIZE, FRAME_START_IN, FRAME_START_OUT, FrameDecoder, MAX_ACCEPTED_FRAME_SIZE,
+    encode as encode_frame,
 };
+pub use path::{MAX_PATH_SIZE, PathLen, encode_reply_path, parse_path_hex, split_hops};

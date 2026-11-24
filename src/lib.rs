@@ -1,69 +1,85 @@
 //! # meshcore
 //!
-//! A Rust client library for `MeshCore` mesh networking devices.
+//! A client library for [MeshCore](https://meshcore.co.uk) companion radios
+//! over serial (USB), TCP (WiFi) and BLE, ported from the Python library
+//! [meshcore_py](https://github.com/meshcore-dev/meshcore_py).
 //!
-//! This library provides async communication with `MeshCore` devices over USB/Serial.
+//! ```no_run
+//! use meshcore::{MeshCore, Options, SerialConfig};
+//!
+//! # async fn demo() -> meshcore::Result<()> {
+//! let mc = MeshCore::create_serial(SerialConfig::new("/dev/ttyUSB0"), Options::default()).await?;
+//! println!("connected to {}", mc.self_info().map(|i| i.name).unwrap_or_default());
+//!
+//! let battery = mc.get_bat().await?;
+//! println!("battery: {} mV", battery.level);
+//!
+//! for contact in mc.get_contacts(0).await?.contacts {
+//!     println!("{} {}", contact.public_key, contact.name);
+//! }
+//! mc.disconnect().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## How it works
+//!
+//! - Every command is an async method on [`MeshCore`], named as in
+//!   meshcore_py, that waits for the device's reply and returns it typed.
+//!   Device errors come back as [`Error::Device`] with the firmware's
+//!   [`ErrorCode`]. One command is in flight at a time.
+//! - Every frame the device sends becomes an [`Event`]; [`MeshCore::subscribe`]
+//!   delivers them, [`MeshCore::wait_for`] waits for one.
+//! - Answers from remote nodes (status, telemetry, neighbours, ...) are matched
+//!   to their request by tag; the `*_sync` methods wait for them.
+//! - The client keeps the device's self info, a contact cache, contacts heard
+//!   but not added, and the channel secrets for decoding the RX log.
+//!
+//! ## Transports
+//!
+//! [`MeshCore::create_serial`] for USB/serial companions and
+//! [`MeshCore::create_tcp`] for WiFi companions are always built;
+//! `MeshCore::create_ble` for BLE companions comes with the `ble` feature.
+//! Other links implement [`Transport`].
 //!
 //! ## Features
 //!
-//! - Async/await based API using Tokio
-//! - Event-driven architecture for handling device notifications
-//! - Type-safe protocol implementation
-//! - Comprehensive error handling
-//!
-//! ## Quick Start
-//!
-//! ```no_run
-//! use meshcore::MeshCore;
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), meshcore::Error> {
-//!     // Connect to a `MeshCore` device
-//!     let mut client = MeshCore::serial("/dev/ttyUSB0");
-//!     let info = client.connect().await?;
-//!
-//!     println!("Connected to: {}", info.name);
-//!     println!("Public key: {}", info.public_key);
-//!
-//!     // Get battery status
-//!     let battery = client.get_battery().await?;
-//!     println!("Battery: {}mV", battery.millivolts);
-//!
-//!     // Disconnect
-//!     client.disconnect().await?;
-//!     Ok(())
-//! }
-//! ```
-//!
-//! ## Architecture
-//!
-//! The library is organized into several modules:
-//!
-//! - [`protocol`] - Low-level protocol types (frames, packets, commands)
-//! - [`types`] - Data structures (contacts, devices, messages, statistics)
-//! - [`transport`] - Transport implementations (currently USB/Serial)
-//! - [`event`] - Async event system for handling notifications
-//! - [`commands`] - Command handler for device operations
-//! - [`client`] - High-level [`MeshCore`] client
+//! - `ble`: BLE transport over the Nordic UART service through BlueZ (Linux
+//!   only, needs libdbus; without effect on other systems).
+//! - `serde`: `serde::Serialize` with meshcore_py's payload field names.
 
 pub mod client;
-pub mod commands;
 pub mod error;
 pub mod event;
+pub mod hex;
+pub mod lpp;
+mod packet;
 pub mod protocol;
+#[cfg(feature = "serde")]
+mod serde_impl;
+mod state;
 pub mod transport;
 pub mod types;
+mod util;
 
-// Re-exports for convenience
-pub use client::MeshCore;
-pub use commands::ContactUpdateParams;
-pub use error::{Error, FrameError, Result};
-pub use event::{Event, EventDispatcher, EventFilter, StatsData, Subscription};
-pub use protocol::{BinaryReqType, CommandOpcode, PacketType, StatsType};
-pub use transport::{SerialTransport, serial::list_ports};
-pub use types::{
-    Acknowledgment, BatteryStatus, Channel, ChannelMessage, Contact, ContactFlags, ContactMessage,
-    ContactType, CoreStats, DeviceInfo, DeviceStatus, PacketStats, PublicKey, RadioConfig,
-    RadioStats, SelfInfo, SignalQuality, Telemetry, TelemetryMode, TelemetryReading,
-    TelemetryValue, TextType,
+pub use client::{
+    FloodScope, MAX_CHANNEL_DATA_LENGTH, MAX_TEXT_LENGTH, MeshCore, Options, RequestOptions,
+    RetryOptions, TraceRequest, parse_trace_path,
 };
+pub use error::{Error, ErrorCode, Result};
+pub use event::{ErrorInfo, Event, EventKind, Subscription};
+pub use lpp::{LppReading, LppType, LppValue, Telemetry};
+pub use protocol::{
+    AnonReqType, BinaryReqType, CommandType, ControlType, PacketType, PathLen, StatsType,
+};
+#[cfg(all(feature = "ble", target_os = "linux"))]
+pub use transport::ble::{BleConfig, BleDevice, BleTransport};
+pub use transport::serial::{SerialConfig, SerialTransport, list_ports};
+pub use transport::tcp::TcpTransport;
+pub use transport::{FrameWriter, Link, LinkEvent, Transport};
+pub use types::*;
+
+// The README's examples compile as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

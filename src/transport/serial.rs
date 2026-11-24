@@ -1,271 +1,164 @@
-//! Serial/USB transport implementation.
-//!
-//! This module provides serial port communication for `MeshCore` devices
-//! connected via USB.
+//! Serial (USB) transport.
 
-use std::future::Future;
-use std::io;
-use std::pin::Pin;
-use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::sync::{Mutex, mpsc};
-use tokio_serial::{SerialPortBuilderExt, SerialStream};
+use tokio::io::AsyncReadExt;
+use tokio::sync::mpsc;
+use tokio_serial::{SerialPort, SerialPortBuilderExt};
 
-use crate::error::{Error, Result};
-use crate::protocol::{FrameDecoder, encode_frame};
-use crate::transport::Transport;
+use crate::error::Result;
+use crate::transport::{
+    BoxFuture, LINK_CAPACITY, Link, StreamWriter, Transport, spawn_stream_reader,
+};
 
-/// Default baud rate for `MeshCore` devices.
+/// The baud rate MeshCore companion radios use.
 pub const DEFAULT_BAUD_RATE: u32 = 115_200;
 
-/// Default connection delay.
-pub const DEFAULT_CONNECTION_DELAY: Duration = Duration::from_millis(300);
-
-/// Configuration for serial transport.
-#[derive(Debug, Clone)]
+/// Serial port settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SerialConfig {
-    /// Serial port path (e.g., "/dev/ttyUSB0" or "COM3").
+    /// The port, e.g. `/dev/ttyUSB0` or `COM3`.
     pub port: String,
-    /// Baud rate.
+    /// The baud rate.
     pub baud_rate: u32,
-    /// Delay after connection before sending commands.
-    pub connection_delay: Duration,
+    /// DTR after opening; `None` leaves the line as the OS sets it.
+    pub dtr: Option<bool>,
+    /// RTS after opening; `None` leaves the line as the OS sets it.
+    pub rts: Option<bool>,
+    /// How long to wait after opening before reading.
+    pub settle_delay: Duration,
+    /// How long to read and drop stale bytes after the settle delay.
+    pub drain_duration: Duration,
 }
 
 impl SerialConfig {
-    /// Creates a new serial configuration with default settings.
+    /// Default settings for a port: 115200 baud, DTR and RTS untouched.
     #[must_use]
     pub fn new(port: impl Into<String>) -> Self {
         Self {
             port: port.into(),
             baud_rate: DEFAULT_BAUD_RATE,
-            connection_delay: DEFAULT_CONNECTION_DELAY,
+            dtr: None,
+            rts: None,
+            settle_delay: Duration::from_millis(300),
+            drain_duration: Duration::from_millis(500),
         }
     }
 
     /// Sets the baud rate.
     #[must_use]
-    pub const fn baud_rate(mut self, rate: u32) -> Self {
-        self.baud_rate = rate;
+    pub const fn baud_rate(mut self, baud_rate: u32) -> Self {
+        self.baud_rate = baud_rate;
         self
     }
 
-    /// Sets the connection delay.
+    /// Sets DTR after opening.
     #[must_use]
-    pub const fn connection_delay(mut self, delay: Duration) -> Self {
-        self.connection_delay = delay;
+    pub const fn dtr(mut self, dtr: Option<bool>) -> Self {
+        self.dtr = dtr;
+        self
+    }
+
+    /// Sets RTS after opening.
+    #[must_use]
+    pub const fn rts(mut self, rts: Option<bool>) -> Self {
+        self.rts = rts;
+        self
+    }
+
+    /// Sets how long to wait after opening (default 300 ms; boards that
+    /// reset on open need it).
+    #[must_use]
+    pub const fn settle_delay(mut self, delay: Duration) -> Self {
+        self.settle_delay = delay;
+        self
+    }
+
+    /// Sets how long to read and drop stale bytes after the settle delay
+    /// (default 500 ms).
+    #[must_use]
+    pub const fn drain_duration(mut self, duration: Duration) -> Self {
+        self.drain_duration = duration;
         self
     }
 }
 
-/// Serial transport for `MeshCore` communication.
-///
-/// Uses split read/write halves to allow concurrent reading and writing.
+/// Connects over a serial port.
+#[derive(Debug, Clone)]
 pub struct SerialTransport {
     config: SerialConfig,
-    writer: Option<Arc<Mutex<WriteHalf<SerialStream>>>>,
-    reader: Option<ReadHalf<SerialStream>>,
-    decoder: FrameDecoder,
-    frame_tx: Option<mpsc::Sender<Bytes>>,
 }
 
 impl SerialTransport {
-    /// Creates a new serial transport with the given configuration.
+    /// A transport for the given settings.
     #[must_use]
-    pub fn new(config: SerialConfig) -> Self {
-        Self {
-            config,
-            writer: None,
-            reader: None,
-            decoder: FrameDecoder::new(),
-            frame_tx: None,
-        }
+    pub const fn new(config: SerialConfig) -> Self {
+        Self { config }
     }
 
-    /// Creates a new serial transport for the given port with default settings.
+    /// The settings.
     #[must_use]
-    pub fn with_port(port: impl Into<String>) -> Self {
-        Self::new(SerialConfig::new(port))
-    }
-
-    /// Sets the frame receiver channel.
-    ///
-    /// Received frames will be sent to this channel.
-    pub fn set_frame_sender(&mut self, tx: mpsc::Sender<Bytes>) {
-        self.frame_tx = Some(tx);
-    }
-
-    /// Takes the reader half for use in a background task.
-    ///
-    /// This can only be called once after connecting.
-    pub fn take_reader(&mut self) -> Option<ReadHalf<SerialStream>> {
-        self.reader.take()
-    }
-
-    /// Gets the frame decoder.
-    pub fn decoder_mut(&mut self) -> &mut FrameDecoder {
-        &mut self.decoder
-    }
-
-    /// Gets the frame sender channel.
-    #[must_use]
-    pub fn frame_tx(&self) -> Option<mpsc::Sender<Bytes>> {
-        self.frame_tx.clone()
-    }
-
-    /// Runs the read loop with a given reader, processing incoming data.
-    ///
-    /// This should be spawned as a separate task.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if reading fails or the connection is lost.
-    pub async fn run_read_loop_with_reader(
-        mut reader: ReadHalf<SerialStream>,
-        mut decoder: FrameDecoder,
-        frame_tx: mpsc::Sender<Bytes>,
-    ) -> Result<()> {
-        let mut buf = [0u8; 1024];
-
-        loop {
-            let n = match reader.read(&mut buf).await {
-                Ok(0) => {
-                    tracing::debug!("serial port closed");
-                    return Err(Error::Io(io::Error::new(
-                        io::ErrorKind::ConnectionReset,
-                        "serial port closed",
-                    )));
-                }
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::error!("serial read error: {}", e);
-                    return Err(Error::Io(e));
-                }
-            };
-
-            tracing::trace!("received {} bytes", n);
-            decoder.feed(&buf[..n]);
-
-            // Process all complete frames
-            loop {
-                match decoder.decode() {
-                    Ok(Some(frame)) => {
-                        tracing::trace!("decoded frame: {} bytes", frame.len());
-                        if frame_tx.send(frame).await.is_err() {
-                            tracing::debug!("frame receiver dropped");
-                            return Ok(());
-                        }
-                    }
-                    Ok(None) => break, // Need more data
-                    Err(e) => {
-                        tracing::warn!("frame decode error: {}", e);
-                        // Continue processing - the decoder skips invalid bytes
-                    }
-                }
-            }
-        }
+    pub const fn config(&self) -> &SerialConfig {
+        &self.config
     }
 }
 
 impl Transport for SerialTransport {
-    fn connect(&mut self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+    fn open(&self) -> BoxFuture<'_, Result<Link>> {
         Box::pin(async move {
-            if self.writer.is_some() {
-                return Ok(());
+            let config = &self.config;
+            log::info!(target: "meshcore", "opening serial port {}", config.port);
+            let mut stream =
+                tokio_serial::new(&config.port, config.baud_rate).open_native_async()?;
+            if let Some(dtr) = config.dtr {
+                stream.write_data_terminal_ready(dtr)?;
             }
-
-            tracing::info!("connecting to serial port: {}", self.config.port);
-
-            let mut stream = tokio_serial::new(&self.config.port, self.config.baud_rate)
-                .open_native_async()
-                .map_err(Error::Serial)?;
-
-            // Set RTS to false, matching Python behavior
-            // This is important for proper device initialization
-            if let Err(e) = tokio_serial::SerialPort::write_request_to_send(&mut stream, false) {
-                tracing::warn!("failed to set RTS: {}", e);
+            if let Some(rts) = config.rts {
+                stream.write_request_to_send(rts)?;
             }
+            tokio::time::sleep(config.settle_delay).await;
 
-            // Wait for device to be ready
-            tokio::time::sleep(self.config.connection_delay).await;
-
-            // Drain any stale data from the device buffer
-            // Some devices send data shortly after connection opens
+            // Some boards print boot output or hold stale frames; drop them.
+            let mut drained = 0usize;
             let mut buf = [0u8; 1024];
-            let mut total_drained = 0usize;
-
-            // Try draining for up to 500ms with multiple read attempts
-            let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-            while tokio::time::Instant::now() < drain_deadline {
+            let deadline = crate::util::deadline_after(config.drain_duration);
+            while tokio::time::Instant::now() < deadline {
                 match tokio::time::timeout(Duration::from_millis(20), stream.read(&mut buf)).await {
-                    Ok(Ok(n)) if n > 0 => {
-                        total_drained += n;
-                    }
-                    _ => {
-                        // Brief pause then try again
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
+                    Ok(Ok(n)) if n > 0 => drained += n,
+                    _ => tokio::time::sleep(Duration::from_millis(10)).await,
                 }
             }
-
-            if total_drained > 0 {
-                tracing::debug!("drained {} stale bytes from buffer", total_drained);
+            if drained > 0 {
+                log::debug!(target: "meshcore", "dropped {drained} stale bytes");
             }
 
-            // Split the stream into read and write halves
             let (reader, writer) = tokio::io::split(stream);
-            self.reader = Some(reader);
-            self.writer = Some(Arc::new(Mutex::new(writer)));
-            self.decoder.clear();
-
-            tracing::info!("connected to serial port");
-            Ok(())
+            let (sender, events) = mpsc::channel(LINK_CAPACITY);
+            let reader_task = spawn_stream_reader(reader, sender, "serial", None);
+            log::info!(target: "meshcore", "serial connection started");
+            Ok(Link {
+                info: config.port.clone(),
+                events,
+                writer: Box::new(StreamWriter::new(writer, reader_task)),
+            })
         })
     }
 
-    fn disconnect(&mut self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-        Box::pin(async move {
-            if self.writer.is_some() || self.reader.is_some() {
-                tracing::info!("disconnecting from serial port");
-                self.writer = None;
-                self.reader = None;
-            }
-            Ok(())
-        })
-    }
-
-    fn send(&mut self, data: Bytes) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-        let writer = self.writer.clone();
-        Box::pin(async move {
-            let writer = writer.ok_or(Error::NotConnected)?;
-            let mut writer = writer.lock().await;
-
-            let frame = encode_frame(&data);
-            tracing::trace!("sending frame: {} bytes", frame.len());
-
-            writer.write_all(&frame).await.map_err(Error::Io)?;
-            writer.flush().await.map_err(Error::Io)?;
-
-            Ok(())
-        })
-    }
-
-    fn is_connected(&self) -> bool {
-        self.writer.is_some()
+    fn describe(&self) -> String {
+        self.config.port.clone()
     }
 }
 
-/// Lists available serial ports.
+/// The names of the serial ports the system has.
 ///
 /// # Errors
 ///
-/// Returns an error if the port list cannot be retrieved.
+/// [`Error::Serial`](crate::Error::Serial) when the ports cannot be listed.
 pub fn list_ports() -> Result<Vec<String>> {
-    let ports = tokio_serial::available_ports().map_err(Error::Serial)?;
-    Ok(ports.into_iter().map(|p| p.port_name).collect())
+    Ok(tokio_serial::available_ports()?
+        .into_iter()
+        .map(|port| port.port_name)
+        .collect())
 }
 
 #[cfg(test)]
@@ -273,25 +166,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_serial_config_defaults() {
-        let config = SerialConfig::new("/dev/ttyUSB0");
-        assert_eq!(config.port, "/dev/ttyUSB0");
-        assert_eq!(config.baud_rate, DEFAULT_BAUD_RATE);
-    }
-
-    #[test]
-    fn test_serial_config_builder() {
+    fn config_defaults_leave_lines_alone() {
         let config = SerialConfig::new("/dev/ttyUSB0")
             .baud_rate(9600)
-            .connection_delay(Duration::from_secs(1));
+            .dtr(Some(true));
         assert_eq!(config.baud_rate, 9600);
-        assert_eq!(config.connection_delay, Duration::from_secs(1));
+        assert_eq!(config.dtr, Some(true));
+        assert_eq!(config.rts, None);
+        assert_eq!(config.settle_delay, Duration::from_millis(300));
+        assert_eq!(config.drain_duration, Duration::from_millis(500));
     }
 
     #[test]
-    #[ignore = "Requires /sys/class/tty - not available in sandboxed builds"]
-    fn test_list_ports() {
-        // Just verify it doesn't panic
-        let _ = list_ports();
+    fn config_builders_set_the_delays() {
+        let config = SerialConfig::new("COM3")
+            .rts(Some(false))
+            .settle_delay(Duration::ZERO)
+            .drain_duration(Duration::from_millis(50));
+        assert_eq!(config.port, "COM3");
+        assert_eq!(config.rts, Some(false));
+        assert_eq!(config.settle_delay, Duration::ZERO);
+        assert_eq!(config.drain_duration, Duration::from_millis(50));
     }
 }

@@ -1,10 +1,13 @@
 # meshcore-rs
 
-A Rust client library for interacting with [MeshCore](https://meshcore.co.uk) companion radio nodes.
+A Rust client library for [MeshCore](https://meshcore.co.uk) companion radios
+connected over USB (serial), WiFi (TCP) or Bluetooth LE. It is a port of the Python library
+[meshcore_py](https://github.com/meshcore-dev/meshcore_py) and keeps its command
+names, event types and payload fields.
 
 ## Disclaimer
 
-**This project is an independent, community-driven port of [meshcore_py](https://github.com/fdlamotte/meshcore_py) to Rust.**
+**This project is an independent, community-driven port of [meshcore_py](https://github.com/meshcore-dev/meshcore_py) to Rust.**
 
 - This project is **not affiliated with, endorsed by, or officially associated with MeshCore** or its developers in any way.
 - This is provided **as-is, without any warranty** of any kind, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and noninfringement.
@@ -12,401 +15,349 @@ A Rust client library for interacting with [MeshCore](https://meshcore.co.uk) co
 - Use at your own risk. The authors are not responsible for any damage to hardware, data loss, or other issues that may arise from using this software.
 - Protocol implementation is based on reverse engineering and may be incomplete or incorrect.
 
-## Features
+## Status
 
-- **Async/await API** using Tokio runtime
-- **Event-driven architecture** for handling device notifications
-- **Type-safe protocol implementation** with comprehensive error handling
-- **Serial/USB transport** for companion radio communication
-- **Full command set** matching the Python library capabilities
+The library follows meshcore_py 2.3.19 and the companion protocol of firmware
+1.18.0, including paths with 2 and 3 byte hashes per hop. The parser covers every
+response and push code that firmware sends. A parity test runs the same 61 device
+frames through meshcore_py and through this library and compares the JSON of
+the resulting events; they match except for the deliberate fixes listed below.
 
-### Supported Operations
-
-| Category | Commands |
-|----------|----------|
-| **Device** | `app_start`, `device_query`, `get_battery`, `get_time`, `set_time`, `reboot`, `get_stats` |
-| **Configuration** | `set_name`, `set_coords`, `set_tx_power`, `set_radio`, `set_tuning`, `set_device_pin`, `set_other_params` |
-| **Contacts** | `get_contacts`, `update_contact`, `remove_contact`, `reset_path`, `share_contact`, `export_contact`, `import_contact` |
-| **Messaging** | `send_message`, `send_command`, `send_channel_message`, `get_message`, `send_login`, `send_logout` |
-| **Channels** | `get_channel`, `set_channel` |
-| **Binary Protocol** | `binary_status_request`, `binary_telemetry_request`, `binary_mma_request`, `binary_acl_request`, `binary_neighbours_request` |
-| **Path Discovery** | `path_discovery`, `send_trace`, `set_flood_scope`, `node_discover` |
-| **Telemetry** | `get_self_telemetry`, `send_telemetry_request` |
-| **Security** | `export_private_key`, `import_private_key`, `sign_start`, `sign_data`, `sign_finish` |
-| **Custom Variables** | `get_custom_vars`, `set_custom_var` |
+Serial and TCP are tested end to end against a simulated device on a pseudo
+terminal and on a local socket. BLE (feature `ble`) runs through BlueZ and is
+available on Linux only. Serial and BLE were tested on a LilyGO T-LoRa V2.1-1.6
+with the companion firmware 1.18.0, through meshcore-cli-rs and
+`examples/check.rs`: scanning, pairing (also after flashing the device anew),
+connecting by name and by address, the read commands, channel messages, login,
+trace, reboot, reconnecting, and links BlueZ still held. `examples/check.rs`
+runs such checks against any device (see Development).
 
 ## Installation
-
-Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
 meshcore = { git = "https://github.com/chrstnwhlrt/meshcore-rs" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-### Feature Flags
+Rust 1.89 or newer. Two features are optional:
 
-- `sha2` - Enable SHA256-based flood scope topic hashing
+- `ble` adds the BLE transport. It talks to BlueZ over D-Bus, so it works on
+  Linux only and needs libdbus (`pkg-config` and the dbus development files) to
+  build; on other systems the feature has no effect. It adds about 50 crates
+  (bluer and its D-Bus stack) to the build.
+- `serde` adds `serde::Serialize` to events and data types with meshcore_py's
+  field names, so `serde_json::to_string(&event)` prints what meshcore_py would
+  print for the same frame (keys, key order, hex for keys and tags).
 
-## Quick Start
+## Quick start
 
-```rust
-use meshcore::MeshCore;
-
-#[tokio::main]
-async fn main() -> Result<(), meshcore::Error> {
-    // Connect to a MeshCore device
-    let mut client = MeshCore::serial("/dev/ttyUSB0");
-    let info = client.connect().await?;
-
-    println!("Connected to: {}", info.name);
-    println!("Public key: {}", info.public_key);
-
-    // Get battery status
-    let battery = client.get_battery().await?;
-    println!("Battery: {}mV", battery.millivolts);
-
-    // Disconnect
-    client.disconnect().await?;
-    Ok(())
-}
-```
-
-## Architecture
-
-The library is organized into several modules:
-
-| Module | Description |
-|--------|-------------|
-| `client` | High-level `MeshCore` client API |
-| `commands` | Command handler for device operations |
-| `protocol` | Low-level protocol types (frames, packets, commands) |
-| `types` | Data structures (contacts, devices, messages, statistics, telemetry) |
-| `transport` | Transport implementations (USB/Serial) |
-| `event` | Async event system for handling notifications |
-| `error` | Error types and result definitions |
-
-## Usage Examples
-
-### Device Information
-
-```rust
-use meshcore::MeshCore;
+```rust no_run
+use meshcore::{MeshCore, Options, SerialConfig};
 
 #[tokio::main]
-async fn main() -> Result<(), meshcore::Error> {
-    let mut client = MeshCore::serial("/dev/ttyUSB0");
-    let self_info = client.connect().await?;
-
-    println!("Device: {}", self_info.name);
-    println!("TX Power: {} dBm", self_info.tx_power);
-    println!("Location: {:.6}, {:.6}",
-        self_info.latitude.unwrap_or(0.0),
-        self_info.longitude.unwrap_or(0.0));
-
-    // Query detailed device info
-    let device_info = client.get_device_info().await?;
-    println!("Firmware version: {}", device_info.firmware_version);
-    if let Some(model) = &device_info.model {
-        println!("Model: {}", model);
-    }
-    if let Some(max_contacts) = device_info.max_contacts {
-        println!("Max contacts: {}", max_contacts);
+async fn main() -> meshcore::Result<()> {
+    let mc = MeshCore::create_serial(SerialConfig::new("/dev/ttyUSB0"), Options::default()).await?;
+    if let Some(info) = mc.self_info() {
+        println!("{} ({}), {} dBm", info.name, info.public_key, info.tx_power);
     }
 
-    client.disconnect().await?;
-    Ok(())
-}
-```
+    let battery = mc.get_bat().await?;
+    println!("battery: {} mV", battery.level);
 
-### Working with Contacts
-
-```rust
-use meshcore::MeshCore;
-
-#[tokio::main]
-async fn main() -> Result<(), meshcore::Error> {
-    let mut client = MeshCore::serial("/dev/ttyUSB0");
-    client.connect().await?;
-
-    // Get contacts
-    let contacts = client.get_contacts().await?;
-
-    for contact in contacts.values() {
-        println!("{}: {} ({})",
-            contact.name,
-            contact.public_key,
-            if contact.is_flood() { "flood" } else { "direct" });
+    for contact in mc.get_contacts(0).await?.contacts {
+        println!("{:<20} {}", contact.name, contact.public_key);
     }
 
-    client.disconnect().await?;
+    mc.disconnect().await
+}
+```
+
+## Connecting
+
+`MeshCore::create_serial` opens the port and starts the session. When the node
+does not answer, it tries again with DTR set and then with DTR inverted, as
+meshcore_py does; a port that cannot be opened fails at once. `SerialConfig`
+sets the baud rate (115200), DTR and RTS (left alone by default), the wait after
+opening (`settle_delay`, 300 ms, for boards that reset on open) and how long old
+bytes are read and dropped (`drain_duration`, 500 ms). `list_ports()` lists the
+serial ports of the system.
+
+`MeshCore::create_tcp` connects to a WiFi companion (the firmware listens on
+port 5000 unless built otherwise):
+
+```rust no_run
+use meshcore::{MeshCore, Options};
+
+#[tokio::main]
+async fn main() -> meshcore::Result<()> {
+    let options = Options {
+        auto_reconnect: true,
+        ..Options::default()
+    };
+    let mc = MeshCore::create_tcp("192.168.1.50", 5000, options).await?;
+    println!("{:?}", mc.send_device_query().await?.model);
     Ok(())
 }
 ```
 
-### Sending Messages
+Like meshcore_py, the client counts the frames it sends and receives over TCP.
+When the next frame would be the fifth more sent than received, it takes the
+link for dead instead of sending, and reports `tcp_no_response`.
 
-```rust
-use meshcore::MeshCore;
+`MeshCore::create_ble` (feature `ble`) finds a companion by its address, by a
+part of its name (it advertises as `MeshCore-<node name>`) or as the first one
+in range, as meshcore_py does. A companion advertises only while no other app
+(such as the phone app) is connected to it.
 
-#[tokio::main]
-async fn main() -> Result<(), meshcore::Error> {
-    let mut client = MeshCore::serial("/dev/ttyUSB0");
-    client.connect().await?;
+```rust ignore
+use meshcore::{BleConfig, MeshCore, Options};
 
-    // Find a contact by name
-    let contacts = client.get_contacts().await?;
-    let recipient = contacts.values()
-        .find(|c| c.name == "Alice")
-        .expect("Contact not found");
-
-    // Send a message (automatically waits for ACK)
-    client.send_message(&recipient.public_key, "Hello!").await?;
-    println!("Message sent and acknowledged!");
-
-    client.disconnect().await?;
-    Ok(())
-}
+let config = BleConfig::new("Hamburg").pin(Some(123456));
+let mc = MeshCore::create_ble(config, Options::default()).await?;
 ```
 
-### Using the Low-Level Commands API
+A device that is not paired with this computer needs its PIN, which it shows on
+its display or has set in its firmware; once paired, it needs none. Without a
+PIN the library writes nothing to an unpaired device, because MeshCore takes
+frames only over a paired link and leaving the pairing to the desktop's agent
+can leave BlueZ stuck. A missing or wrong PIN ends in `Error::PairingFailed`.
+After the device was flashed anew, it has forgotten the pairing BlueZ still
+keeps; with the PIN the library removes the old pairing and pairs again.
 
-For more control, use the commands handler directly:
+A device this computer is still connected to does not advertise, but the scan
+lists it (without RSSI) and a name search finds it. The library uses such a
+link when no program uses it, as after a program ended without disconnecting.
+While another program on this computer gets the device's frames over it,
+connecting fails with `Error::DeviceInUse` rather than mixing the frames of both
+programs. When a program has just let go of the device, BlueZ shows the link as
+connected for 2 s more but no longer serves it, so the library waits for that
+link to go and connects anew.
 
-```rust
-use meshcore::MeshCore;
-use std::time::Duration;
+BlueZ keeps a link up after its program is gone, and the device does not
+advertise meanwhile. So call `disconnect` before the program ends; it waits the
+2 s BlueZ takes, and a shorter timeout around it is fine. A client dropped
+without it, or a connect given up halfway, takes its link down in the
+background, which needs the Tokio runtime to keep running for a moment.
+
+`meshcore::transport::ble::scan` lists the MeshCore devices in range. Frames go
+one per write (with response) and one per notification; a write that takes
+longer than 10 s takes the link down, as in meshcore_py.
+
+`Options` holds the default command timeout (15 s), automatic reconnecting (off;
+up to 3 attempts a second apart, a new link starts with `APP_START` again) and
+the event buffer (1024 events per subscriber). Other links can implement
+`Transport` and go to `MeshCore::new`.
+
+## Commands
+
+Every command is an async method named as in meshcore_py. It waits for the
+device's reply and returns it typed; a device error comes back as
+`Error::Device` with the firmware's `ErrorCode`. One command is in flight at a
+time, so a `MeshCore` (it is `Clone`) can be shared between tasks.
+
+| Area | Methods |
+|------|---------|
+| Device | `send_appstart`, `send_device_query`, `get_bat`, `get_time`, `set_time`, `reboot`, `get_stats_core`, `get_stats_radio`, `get_stats_packets`, `get_self_telemetry`, `run_cli_command` |
+| Settings | `set_name`, `set_coords`, `set_tx_power`, `set_radio`, `get_tuning`, `set_tuning`, `set_other_params` and its single setters such as `set_manual_add_contacts`, `set_devicepin`, `get_custom_vars`, `set_custom_var`, `get_allowed_repeat_freq`, `get_path_hash_mode`, `set_path_hash_mode`, `get_autoadd_config`, `set_autoadd_config` |
+| Contacts | `get_contacts`, `get_contact_by_key`, `add_contact`, `update_contact`, `remove_contact`, `reset_path`, `change_contact_path`, `change_contact_flags`, `share_contact`, `export_contact`, `import_contact`, `get_advert_path`, `send_advert` |
+| Messages | `send_msg`, `send_msg_with_retry`, `send_cmd`, `get_msg`, `fetch_messages`, `start_auto_message_fetching` |
+| Channels | `get_channel`, `set_channel`, `send_chan_msg`, `send_channel_data`, `set_flood_scope`, `set_default_flood_scope`, `get_default_flood_scope` |
+| Remote nodes | `send_login_sync`, `send_logout`, `req_status_sync`, `req_telemetry_sync`, `req_mma_sync`, `req_acl_sync`, `fetch_all_neighbours`, `req_owner_info_sync`, `req_binary_sync`, `req_regions_sync`, `req_owner_sync`, `req_basic_sync`, `send_path_discovery_sync`, `trace_sync`, `send_node_discover_req` |
+| Keys, reset | `export_private_key`, `import_private_key`, `sign`, `request_factory_reset` with `confirm_factory_reset` |
+| Raw | `send_raw_packet`, `send_raw_data`, `send_control_data` |
+
+### Messages and channels
+
+```rust no_run
+use meshcore::{Event, MeshCore, Options, RetryOptions, SerialConfig};
 
 #[tokio::main]
-async fn main() -> Result<(), meshcore::Error> {
-    let mut client = MeshCore::serial("/dev/ttyUSB0");
-    client.connect().await?;
+async fn main() -> meshcore::Result<()> {
+    let mc = MeshCore::create_serial(SerialConfig::new("/dev/ttyUSB0"), Options::default()).await?;
+    mc.get_contacts(0).await?;
 
-    let contacts = client.get_contacts().await?;
-    let recipient = contacts.values()
-        .find(|c| c.name == "Alice")
-        .expect("Contact not found");
-
-    // Get current timestamp
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as u32;
-
-    // Send message with manual ACK handling
-    let event = client.commands()
-        .send_message(&recipient.public_key, "Hello!", 0, timestamp)
-        .await?;
-
-    if let meshcore::Event::MessageSent { expected_ack, timeout_ms } = event {
-        println!("Message sent, ACK code: {:08x}", expected_ack);
-
-        // Wait for acknowledgment
-        let timeout = Duration::from_millis(u64::from(timeout_ms));
-        client.commands().wait_for_ack(expected_ack, timeout).await?;
-        println!("Message acknowledged!");
+    // Sends up to three times and floods after two unanswered direct
+    // attempts; None if no ACK came back.
+    if let Some(alice) = mc.get_contact_by_name("Alice") {
+        let acked = mc.send_msg_with_retry(&alice, "Hello!", RetryOptions::default()).await?;
+        println!("acknowledged: {}", acked.is_some());
     }
 
-    client.disconnect().await?;
-    Ok(())
-}
-```
+    // A hashtag channel takes its key from the name; a private channel
+    // gets its 16 byte secret instead of None.
+    mc.set_channel(1, "#hamburg", None).await?;
+    mc.send_chan_msg(1, "Moin!", None).await?;
 
-### Event Subscription
-
-```rust
-use meshcore::{MeshCore, Event};
-use tokio::time::Duration;
-
-#[tokio::main]
-async fn main() -> Result<(), meshcore::Error> {
-    let mut client = MeshCore::serial("/dev/ttyUSB0");
-    client.connect().await?;
-
-    // Subscribe to all events
-    let mut subscription = client.subscribe();
-
-    // Process events in background
-    tokio::spawn(async move {
-        while let Some(event) = subscription.recv().await {
-            match event {
-                Event::ContactMessage(msg) => {
-                    println!("Message from {:02x?}: {}",
-                        &msg.sender_prefix[..3], msg.text);
-                }
-                Event::ChannelMessage(msg) => {
-                    println!("Channel {} message: {}", msg.channel_index, msg.text);
-                }
-                Event::Ack(ack) => {
-                    println!("ACK received: {:08x}", ack.code);
-                }
-                _ => {}
+    // Messages waiting on the device arrive as events.
+    let mut events = mc.subscribe();
+    mc.start_auto_message_fetching();
+    while let Some(event) = events.recv().await {
+        match event {
+            Event::ContactMessage(msg) => {
+                println!("{}: {}", meshcore::hex::encode(msg.pubkey_prefix), msg.text);
             }
+            Event::ChannelMessage(msg) => println!("channel {}: {}", msg.channel_idx, msg.text),
+            _ => {}
         }
-    });
-
-    // Keep running...
-    tokio::time::sleep(Duration::from_secs(3600)).await;
-
-    client.disconnect().await?;
+    }
     Ok(())
 }
 ```
 
-### Channel Operations
+### Remote nodes
 
-```rust
-use meshcore::MeshCore;
-use sha2::{Sha256, Digest};
+Requests to repeaters, rooms and sensors go out over the mesh. The `_sync`
+methods wait for the answer, which the device matches to the request by a tag;
+the other variants return the `SentInfo` and the answer arrives as an event. The
+firmware keeps track of one remote request at a time, so the client sends them
+one after the other. An answer that arrives while the client reconnects still
+reaches the waiting request.
+
+```rust no_run
+use meshcore::{MeshCore, Options, RequestOptions, SerialConfig};
 
 #[tokio::main]
-async fn main() -> Result<(), meshcore::Error> {
-    let mut client = MeshCore::serial("/dev/ttyUSB0");
-    client.connect().await?;
+async fn main() -> meshcore::Result<()> {
+    let mc = MeshCore::create_serial(SerialConfig::new("/dev/ttyUSB0"), Options::default()).await?;
+    mc.get_contacts(0).await?;
+    let Some(repeater) = mc.get_contact_by_name("Repeater 1") else {
+        return Ok(());
+    };
+    let key = repeater.public_key;
 
-    // Get channel info
-    let channel = client.get_channel(0).await?;
-    println!("Channel 0: {}", channel.name);
+    mc.send_login_sync(&key, "password", RequestOptions::default()).await?;
+    let status = mc.req_status_sync(&key, RequestOptions::default()).await?;
+    println!("battery {} mV, noise floor {} dBm", status.bat, status.noise_floor);
 
-    // Set up a new channel with SHA256-derived key
-    let mut hasher = Sha256::new();
-    hasher.update(b"#MyChannel");
-    let hash = hasher.finalize();
-    let mut key = [0u8; 16];
-    key.copy_from_slice(&hash[..16]);
-
-    // Use the commands handler for set operations
-    client.commands().set_channel(1, "MyChannel", &key).await?;
-
-    // Send a channel message
-    client.send_channel_message(1, "Hello channel!").await?;
-
-    client.disconnect().await?;
+    let telemetry = mc.req_telemetry_sync(&key, RequestOptions::default()).await?;
+    for reading in &telemetry.readings {
+        println!("{} {}: {:?}", reading.channel, reading.lpp_type.name(), reading.value);
+    }
     Ok(())
 }
 ```
 
-### Binary Protocol Requests
+## Events and state
 
-```rust
-use meshcore::MeshCore;
+Every frame from the device becomes an `Event`. `subscribe()` returns a
+`Subscription` for all events from then on, `wait_for()` and `wait_for_event()`
+wait for one. `event.kind().as_str()` gives meshcore_py's event type name
+(`contact_message`, `acknowledgement`, ...).
 
-#[tokio::main]
-async fn main() -> Result<(), meshcore::Error> {
-    let mut client = MeshCore::serial("/dev/ttyUSB0");
-    client.connect().await?;
+The client keeps what meshcore_py keeps:
 
-    let contacts = client.get_contacts().await?;
-    let repeater = contacts.values()
-        .find(|c| c.name.contains("Repeater"))
-        .expect("No repeater found");
+- the device's self info (`self_info()`), updated by the settings commands;
+- a contact cache (`contacts()`, `get_contact_by_name()`), replaced by a full
+  `get_contacts(0)` and merged by incremental fetches; with
+  `set_auto_update_contacts(true)` it follows adverts and path changes;
+- contacts the device heard but did not add (`pending_contacts()`);
+- channel secrets (from `get_channel` and `set_channel`), so that
+  `set_decrypt_channel_logs(true)` decrypts group packets in the RX log and
+  adds path and signal to received channel messages.
 
-    // Request status via binary protocol (using commands handler)
-    let status = client.commands()
-        .binary_status_request(&repeater.public_key)
-        .await?;
-    println!("Status request sent: {:?}", status);
+A command whose link drops fails at once with `Error::ConnectionLost`. Without
+automatic reconnecting the client then sends `Event::Disconnected`.
 
-    // Request telemetry
-    let telemetry = client.commands()
-        .binary_telemetry_request(&repeater.public_key)
-        .await?;
-    println!("Telemetry request sent: {:?}", telemetry);
+## Differences from meshcore_py
 
-    // Request neighbours list
-    let neighbours = client.commands()
-        .binary_neighbours_request(
-            &repeater.public_key,
-            20,  // max results
-            0,   // offset
-            0,   // order by
-            6,   // prefix length
-        )
-        .await?;
-    println!("Neighbours request sent: {:?}", neighbours);
+The library differs from meshcore_py in these points, most of them where the
+firmware behaves differently from what meshcore_py expects:
 
-    client.disconnect().await?;
-    Ok(())
-}
+- The TX power is a signed byte (the firmware takes -9 dBm and up); meshcore_py
+  reads 247 for -9.
+- `confirm_factory_reset` sends the command with the `reset` text the firmware
+  requires; meshcore_py sends the bare command, which the firmware rejects as
+  unsupported.
+- MMA readings from sensors use the firmware's LPP table (humidity has 2 bytes
+  in 0.1 % steps), not the CayenneLPP one.
+- `reboot` does not wait for an answer, the firmware sends none.
+- A full contact fetch replaces the cache instead of merging into it, so
+  contacts removed on the device disappear.
+- `start_auto_message_fetching` empties the device's message queue right away;
+  meshcore_py fetches one message at the start and the rest only after the
+  next `MESSAGES_WAITING`.
+- `send_login_sync` returns `Error::LoginFailed` as soon as the node rejects
+  the password; meshcore_py waits for a successful login only and runs into its
+  timeout.
+- `send_cmd` looks up the node type of a bare key in the contact cache to pick
+  the text type; meshcore_py assumes a repeater then.
+- An RX log packet that was logged before its channel was known is decrypted
+  when it comes again.
+- `set_channel` keeps the channel's secret for the RX log as `get_channel`
+  does; meshcore_py learns secrets from `get_channel` only.
+- A command fails at once when its link drops instead of waiting for its
+  timeout, and errors of other commands do not end a wait for a remote answer.
+- `send_trace` refuses an empty path before sending; the firmware only traces
+  along at least one hop.
+- `fetch_all_neighbours` stops when a page comes back empty; meshcore_py asks
+  again forever.
+- `get_self_telemetry` takes only the answer with the device's own key, not
+  a late answer to an earlier telemetry request of another node.
+- Names are cut to the 31 bytes the firmware keeps, at a character boundary:
+  contact names, which meshcore_py writes uncut (a name over 32 bytes shifts
+  the fields after it), and node and channel names, which the firmware would
+  cut in the middle of a character.
+- A command longer than the 176 bytes the firmware takes is refused before it
+  is sent; meshcore_py sends it, and the firmware cuts it short over serial and
+  drops it over BLE.
+- A text the firmware would not send whole is refused too: a private message
+  or CLI command over 160 bytes (`MAX_TEXT_LENGTH`), which the firmware answers
+  with `ERR_CODE_TABLE_FULL`, a channel message that does not fit 160 bytes
+  together with the node name and `": "`, and a login password over 15 bytes;
+  the firmware cuts these two short.
+- Input the firmware would answer as an unknown command is refused as well,
+  such as an empty message, node name or CLI command, a contact card under 98
+  bytes or a control type without its top bit. So is input it would read
+  differently: a NUL byte in a text, name or password (it ends them there) and
+  a `:` in a custom variable's name (it splits there).
+- A BLE scan or name search also finds a device this computer is still
+  connected to, for example right after another program let go of it;
+  meshcore_py finds only advertising devices and misses it for a few seconds.
+- Connecting over BLE to a device another program on this computer is
+  connected to fails with `Error::DeviceInUse`; meshcore_py joins that link,
+  and both programs then get each other's frames.
+- Over BLE, a device that is not paired needs the PIN, and one that forgot
+  its pairing (flashed anew) is paired again with it; meshcore_py leaves the
+  pairing to the desktop's agent and keeps reconnecting to a device that
+  forgot it for 60 s.
+- BLE works on Linux only (through BlueZ); meshcore_py's BLE (through bleak)
+  also runs on macOS and Windows.
+
+## Development
+
+```text
+cargo test --all-features   # unit, client, transport and parity tests, README examples
+                            # (--all-features includes ble, which needs libdbus)
+cargo clippy --all-targets --all-features
 ```
 
-## Data Types
+- `tests/client.rs` runs the client against a simulated device on paused time.
+- `tests/transports.rs` runs the TCP transport over a local socket and the
+  serial transport over a pseudo terminal (Unix).
+- `tests/parity.rs` (feature `serde`) compares with meshcore_py. After updating
+  meshcore_py, regenerate its fixtures as described in
+  `tests/fixtures/meshcore_py_reader.py`.
 
-### SelfInfo
+`examples/check.rs` checks a real device with read-only commands over any
+transport and prints each result with its time; `--watch` then stays connected
+until Ctrl-C and reports link losses and reconnects (it does not fetch
+messages):
 
-Returned by `connect()`:
-
-```rust
-pub struct SelfInfo {
-    pub advert_type: u8,
-    pub tx_power: u8,
-    pub max_tx_power: u8,
-    pub public_key: PublicKey,
-    pub latitude: Option<f64>,
-    pub longitude: Option<f64>,
-    pub radio: RadioConfig,
-    pub name: String,
-    // ... and more
-}
+```text
+cargo run --example check -- serial /dev/ttyUSB0
+cargo run --example check -- tcp 192.168.1.50:5000
+cargo run --example check --features ble -- scan
+cargo run --example check --features ble -- ble MeshCore-Hamburg --pin 123456 --watch
 ```
 
-### Contact
+`MESHCORE_LOG=debug` shows the library's log.
 
-```rust
-pub struct Contact {
-    pub public_key: PublicKey,
-    pub device_type: ContactType,  // Node, Repeater, Room, Unknown
-    pub flags: ContactFlags,        // Trusted, Hidden
-    pub out_path_len: i8,          // -1 = flood, 0+ = direct hops
-    pub out_path: Bytes,
-    pub name: String,
-    pub last_advert: u32,
-    pub latitude: Option<f64>,
-    pub longitude: Option<f64>,
-    pub last_modified: u32,
-}
-```
-
-### DeviceInfo
-
-Returned by `get_device_info()`:
-
-```rust
-pub struct DeviceInfo {
-    pub firmware_version: u8,
-    pub max_contacts: Option<u16>,
-    pub max_channels: Option<u8>,
-    pub ble_pin: Option<u32>,
-    pub build: Option<String>,
-    pub model: Option<String>,
-    pub version: Option<String>,
-}
-```
-
-### Telemetry
-
-Supports LPP-encoded telemetry with various sensor readings:
-
-- Temperature, Humidity, Barometric Pressure
-- GPS Location (Latitude, Longitude, Altitude)
-- Accelerometer, Gyroscope
-- Battery Voltage, Analog/Digital Inputs
-- Air Quality, Luminosity
-- And more...
-
-### Statistics
-
-Three types of device statistics:
-
-- **Core**: Battery voltage, uptime, error counts, queue lengths
-- **Radio**: Noise floor, last RSSI/SNR, TX/RX airtime
-- **Packets**: RX/TX totals, flood vs. direct breakdown
-
-## Requirements
-
-- Rust 1.85+ (Edition 2024)
-- Tokio async runtime
-- USB/Serial access to MeshCore companion device
+`nix flake check` builds the crate and runs clippy (pedantic, warnings denied)
+with and without the optional features, the tests with the newest stable Rust
+and with the declared minimum version, rustdoc with warnings denied, and
+rustfmt. `nix develop` gives a shell with the toolchain. The flake sees only
+files known to git, so new files need a `git add` first.
 
 ## License
 
@@ -414,7 +365,7 @@ MIT License - see [LICENSE](LICENSE) file.
 
 ## Related Projects
 
-- [meshcore_py](https://github.com/fdlamotte/meshcore_py) - Original Python library (reference implementation)
+- [meshcore_py](https://github.com/meshcore-dev/meshcore_py) - Python library (reference implementation)
 - [meshcore-cli-rs](https://github.com/chrstnwhlrt/meshcore-cli-rs) - Rust CLI for MeshCore (uses this library)
 - [meshcore-cli](https://github.com/meshcore-dev/meshcore-cli) - Original Python CLI
 
@@ -424,4 +375,4 @@ Contributions are welcome! Please note that this is an independent community pro
 
 ## Acknowledgments
 
-This project is inspired by and based on the protocol implementation in [meshcore_py](https://github.com/fdlamotte/meshcore_py) by fdlamotte.
+This project is inspired by and based on the protocol implementation in [meshcore_py](https://github.com/meshcore-dev/meshcore_py) by fdlamotte.

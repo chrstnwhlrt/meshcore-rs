@@ -1,0 +1,316 @@
+//! Contact commands. Successful changes are mirrored into the contact cache.
+
+use std::time::Duration;
+
+use super::{MeshCore, reply, wait_reply};
+use crate::error::{Error, Result};
+use crate::event::{Event, Subscription};
+use crate::protocol::codes::CommandType;
+use crate::protocol::path::{MAX_PATH_SIZE, PathLen};
+use crate::types::{AdvertPath, AutoAddConfig, Contact, ContactList, PublicKey};
+
+/// How long a contact list may pause between contacts (meshcore_py: 5 s).
+const CONTACTS_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Reads a contact list the device sends on the link with generation `link`:
+/// any number of contacts, then the end marker. The list may pause up to
+/// [`CONTACTS_IDLE_TIMEOUT`] between contacts.
+async fn read_contacts(sub: &mut Subscription, link: u64) -> Result<ContactList> {
+    let mut deadline = tokio::time::Instant::now() + CONTACTS_IDLE_TIMEOUT;
+    loop {
+        let event = tokio::time::timeout_at(deadline, sub.recv_on_link(link))
+            .await
+            .map_err(|_| Error::Timeout)??;
+        match event {
+            Event::ContactsStart { .. } | Event::NextContact(_) => {
+                deadline = tokio::time::Instant::now() + CONTACTS_IDLE_TIMEOUT;
+            }
+            Event::Contacts(list) => return Ok((*list).clone()),
+            Event::Error(info) => return Err(super::error_from_info(info)),
+            Event::Disconnected { .. } => return Err(Error::ConnectionLost),
+            _ => {}
+        }
+    }
+}
+
+fn key_frame(command: CommandType, key: &PublicKey) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(33);
+    frame.push(command.code());
+    frame.extend_from_slice(key.as_bytes());
+    frame
+}
+
+/// The `CMD_ADD_UPDATE_CONTACT` frame for a contact.
+pub(crate) fn update_contact_frame(contact: &Contact, lastmod: Option<u32>) -> Result<Vec<u8>> {
+    if contact.out_path.len() > MAX_PATH_SIZE {
+        return Err(Error::invalid(format!(
+            "path of {} bytes, at most {MAX_PATH_SIZE} fit",
+            contact.out_path.len()
+        )));
+    }
+    // The device would take the missing hops for zero hashes.
+    if !contact.out_path_len.is_none() && contact.out_path_len.byte_len() != contact.out_path.len()
+    {
+        return Err(Error::invalid(format!(
+            "the out path has {} bytes, its length byte announces {}",
+            contact.out_path.len(),
+            contact.out_path_len.byte_len()
+        )));
+    }
+    let mut frame = key_frame(CommandType::AddUpdateContact, &contact.public_key);
+    frame.push(contact.contact_type.code());
+    frame.push(contact.flags);
+    frame.push(contact.out_path_len.as_byte());
+    let mut path = [0u8; MAX_PATH_SIZE];
+    path[..contact.out_path.len()].copy_from_slice(&contact.out_path);
+    frame.extend_from_slice(&path);
+    frame.extend_from_slice(&contact.name_field());
+    frame.extend_from_slice(&contact.last_advert.to_le_bytes());
+    frame.extend_from_slice(&contact.latitude_e6.to_le_bytes());
+    frame.extend_from_slice(&contact.longitude_e6.to_le_bytes());
+    if let Some(lastmod) = lastmod {
+        frame.extend_from_slice(&lastmod.to_le_bytes());
+    }
+    Ok(frame)
+}
+
+impl MeshCore {
+    /// Reads the contact list: all contacts with `lastmod` 0, else those
+    /// changed since. A full list replaces the cache, a partial one is merged.
+    ///
+    /// When the device sends nothing for 5 s before the list ends, this fails
+    /// with [`Error::Timeout`].
+    pub async fn get_contacts(&self, lastmod: u32) -> Result<ContactList> {
+        let _guard = self.inner.cmd_lock.lock().await;
+        let mut sub = self.subscribe();
+        let link = self.send_contacts_request(lastmod).await?;
+        let result = read_contacts(&mut sub, link).await;
+        if result.is_err() {
+            self.state().contacts_request_since = None;
+        }
+        result
+    }
+
+    /// Asks for the contact list without waiting; the contacts arrive as
+    /// [`Event::NextContact`] and [`Event::Contacts`].
+    pub async fn get_contacts_async(&self, lastmod: u32) -> Result<()> {
+        let _guard = self.inner.cmd_lock.lock().await;
+        self.send_contacts_request(lastmod).await.map(|_| ())
+    }
+
+    /// Asks for the contacts; returns the generation of the link the request
+    /// went out on.
+    async fn send_contacts_request(&self, lastmod: u32) -> Result<u64> {
+        let mut frame = vec![CommandType::GetContacts.code()];
+        if lastmod > 0 {
+            frame.extend_from_slice(&lastmod.to_le_bytes());
+        }
+        self.state().contacts_request_since = Some(lastmod);
+        let sent = self.send_frame(&frame).await;
+        if sent.is_err() {
+            self.state().contacts_request_since = None;
+        }
+        sent
+    }
+
+    /// Forgets a contact's path, so messages to it are flooded.
+    pub async fn reset_path(&self, key: &PublicKey) -> Result<()> {
+        self.request_ok(&key_frame(CommandType::ResetPath, key))
+            .await?;
+        let mut state = self.state();
+        if let Some(contact) = state.contacts.iter_mut().find(|c| c.public_key == *key) {
+            contact.out_path_len = PathLen::NONE;
+            contact.out_path.clear();
+        }
+        Ok(())
+    }
+
+    /// Sends a contact's advert zero-hop, for nodes nearby to add it.
+    pub async fn share_contact(&self, key: &PublicKey) -> Result<()> {
+        self.request_ok(&key_frame(CommandType::ShareContact, key))
+            .await
+            .map(drop)
+    }
+
+    /// Exports a contact, or this node with `None`, as a `meshcore://` URI.
+    pub async fn export_contact(&self, key: Option<&PublicKey>) -> Result<String> {
+        let frame = match key {
+            Some(key) => key_frame(CommandType::ExportContact, key),
+            None => vec![CommandType::ExportContact.code()],
+        };
+        self.request(
+            &frame,
+            self.default_timeout(),
+            reply!(Event::ContactUri(uri) => uri.clone()),
+        )
+        .await
+    }
+
+    /// Imports a contact card (the bytes after `meshcore://`, 98 or more).
+    pub async fn import_contact(&self, card: &[u8]) -> Result<()> {
+        if card.len() < 98 {
+            return Err(Error::invalid(format!(
+                "contact card of {} bytes, the firmware takes 98 and more",
+                card.len()
+            )));
+        }
+        let mut frame = vec![CommandType::ImportContact.code()];
+        frame.extend_from_slice(card);
+        self.request_ok(&frame).await.map(drop)
+    }
+
+    /// Removes a contact from the device and the cache.
+    pub async fn remove_contact(&self, key: &PublicKey) -> Result<()> {
+        self.request_ok(&key_frame(CommandType::RemoveContact, key))
+            .await?;
+        self.state().remove_contact(key);
+        Ok(())
+    }
+
+    /// Writes a contact to the device (adding it if new) and the cache.
+    /// Without `lastmod` the device stamps the record with its clock.
+    pub async fn update_contact(&self, contact: &Contact, lastmod: Option<u32>) -> Result<()> {
+        let frame = update_contact_frame(contact, lastmod)?;
+        self.request_ok(&frame).await?;
+        // The cache holds what the device stored, the name as written.
+        let mut cached = contact.clone();
+        cached.name_raw = contact.name_field();
+        cached.name = crate::protocol::bytes::text_until_nul(&cached.name_raw);
+        if let Some(lastmod) = lastmod {
+            cached.lastmod = lastmod;
+        }
+        self.state().upsert_contact(cached);
+        Ok(())
+    }
+
+    /// Adds a contact (same as [`update_contact`](Self::update_contact)).
+    pub async fn add_contact(&self, contact: &Contact) -> Result<()> {
+        self.update_contact(contact, None).await
+    }
+
+    /// Sets a contact's path. Without a hash mode the device's mode is used
+    /// (one `DEVICE_QUERY`). Returns the contact as written.
+    pub async fn change_contact_path(
+        &self,
+        contact: &Contact,
+        path: &[u8],
+        hash_mode: Option<u8>,
+    ) -> Result<Contact> {
+        let hash_mode = match hash_mode {
+            Some(mode) => mode,
+            None => self.get_path_hash_mode().await?,
+        };
+        let hash_size = usize::from(hash_mode) + 1;
+        if !path.len().is_multiple_of(hash_size) {
+            return Err(Error::invalid(format!(
+                "path of {} bytes is not a whole number of {hash_size}-byte hops",
+                path.len()
+            )));
+        }
+        let hops =
+            u8::try_from(path.len() / hash_size).map_err(|_| Error::invalid("path too long"))?;
+        let mut changed = contact.clone();
+        changed.out_path_len = PathLen::new(hops, hash_mode)?;
+        changed.out_path = path.to_vec();
+        self.update_contact(&changed, None).await?;
+        Ok(changed)
+    }
+
+    /// Sets a contact's flags. Returns the contact as written.
+    pub async fn change_contact_flags(&self, contact: &Contact, flags: u8) -> Result<Contact> {
+        let mut changed = contact.clone();
+        changed.flags = flags;
+        self.update_contact(&changed, None).await?;
+        Ok(changed)
+    }
+
+    /// Sets which adverts the device adds as contacts by itself, and
+    /// optionally the hop limit: adverts that came over fewer hops are added
+    /// (1: direct ones only, 0: no limit; the firmware caps it at 64).
+    pub async fn set_autoadd_config(&self, flags: u8, max_hops: Option<u8>) -> Result<()> {
+        let mut frame = vec![CommandType::SetAutoaddConfig.code(), flags];
+        frame.extend(max_hops);
+        self.request_ok(&frame).await.map(drop)
+    }
+
+    /// The auto-add flags and, from firmware 1.14, the hop limit.
+    pub async fn get_autoadd_config(&self) -> Result<AutoAddConfig> {
+        let frame = [CommandType::GetAutoaddConfig.code()];
+        self.request(
+            &frame,
+            self.default_timeout(),
+            reply!(Event::AutoAddConfig(c) => *c),
+        )
+        .await
+    }
+
+    /// Reads one contact from the device (and refreshes it in the cache).
+    pub async fn get_contact_by_key(&self, key: &PublicKey) -> Result<Contact> {
+        let frame = key_frame(CommandType::GetContactByKey, key);
+        let wanted = *key;
+        let _guard = self.inner.cmd_lock.lock().await;
+        let mut sub = self.subscribe();
+        let link = self.send_frame(&frame).await?;
+        wait_reply(
+            &mut sub,
+            link,
+            self.default_timeout(),
+            reply!(Event::NextContact(c) if c.public_key == wanted => (**c).clone()),
+        )
+        .await
+    }
+
+    /// The path the last advert of a node arrived over.
+    pub async fn get_advert_path(&self, key: &PublicKey) -> Result<AdvertPath> {
+        let mut frame = vec![CommandType::GetAdvertPath.code(), 0];
+        frame.extend_from_slice(key.as_bytes());
+        self.request(
+            &frame,
+            self.default_timeout(),
+            reply!(Event::AdvertPath(p) => (**p).clone()),
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ContactType;
+
+    #[test]
+    fn update_frame_layout() {
+        let mut contact = Contact::new(PublicKey::new([3; 32]), ContactType::Repeater, "Rep");
+        contact.out_path_len = PathLen::new(2, 1).unwrap();
+        contact.out_path = vec![1, 2, 3, 4];
+        contact.latitude_e6 = 16_000_002;
+        contact.longitude_e6 = -2_097_148;
+        let frame = update_contact_frame(&contact, None).unwrap();
+        assert_eq!(frame.len(), 1 + 32 + 3 + 64 + 32 + 12);
+        assert_eq!(frame[33..36], [2, 0, 0x42]);
+        assert_eq!(frame[36..40], [1, 2, 3, 4]);
+        assert_eq!(&frame[100..103], b"Rep");
+        let lat_at = 1 + 32 + 3 + 64 + 32 + 4;
+        assert_eq!(frame[lat_at..lat_at + 4], 16_000_002i32.to_le_bytes());
+        let with_lastmod = update_contact_frame(&contact, Some(2000)).unwrap();
+        assert_eq!(with_lastmod[..frame.len()], frame[..]);
+        assert_eq!(with_lastmod[frame.len()..], 2000u32.to_le_bytes());
+    }
+
+    #[test]
+    fn path_and_length_byte_have_to_agree() {
+        let mut contact = Contact::new(PublicKey::new([3; 32]), ContactType::Repeater, "Rep");
+        contact.out_path_len = PathLen::new(3, 0).unwrap();
+        contact.out_path = vec![1, 2];
+        assert!(update_contact_frame(&contact, None).is_err());
+        contact.out_path.push(3);
+        assert!(update_contact_frame(&contact, None).is_ok());
+    }
+
+    #[test]
+    fn flood_contact_is_written_with_ff() {
+        let contact = Contact::new(PublicKey::new([3; 32]), ContactType::Chat, "x");
+        let frame = update_contact_frame(&contact, None).unwrap();
+        assert_eq!(frame[35], 0xff);
+    }
+}

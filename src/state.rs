@@ -1,0 +1,584 @@
+//! Turns frames from the device into events and keeps the client's state
+//! (meshcore_py's `MessageReader` plus the data tracking of `MeshCore`).
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use crate::error::{ErrorCode, Result};
+use crate::event::{ErrorInfo, Event};
+use crate::lpp::Telemetry;
+use crate::packet::{PacketParser, message_hash};
+use crate::protocol::bytes::{ByteReader, lossy_ignore};
+use crate::protocol::codes::{AnonReqType, BinaryReqType, PacketType};
+use crate::protocol::parse;
+use crate::types::{
+    AclResponse, BinaryResponse, ChannelRxInfo, Contact, ContactList, CustomVars, PrivateKey,
+    PublicKey, RxLogData, SelfInfo, SentInfo, TelemetryResponse,
+};
+
+/// The kind of a request whose answer is parsed by its tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestKind {
+    Binary(BinaryReqType),
+    Anon(AnonReqType),
+}
+
+/// A request about to be sent: bound to its tag when the `MSG_SENT` reply
+/// arrives, before any later frame is read.
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedRequest {
+    pub(crate) kind: RequestKind,
+    pub(crate) pubkey_prefix: [u8; 6],
+    pub(crate) timeout: Option<Duration>,
+    pub(crate) min_timeout: Duration,
+    /// The suggested timeout is multiplied by this (anonymous requests: hops + 1).
+    pub(crate) timeout_factor: u32,
+    pub(crate) neighbours_prefix_len: u8,
+}
+
+#[derive(Debug, Clone)]
+struct PendingRequest {
+    kind: RequestKind,
+    pubkey_prefix: [u8; 6],
+    /// `None` for a wait too long to count (no limit).
+    expires_at: Option<Instant>,
+    neighbours_prefix_len: u8,
+}
+
+#[derive(Debug, Default)]
+struct ContactsInProgress {
+    since: u32,
+    contacts: Vec<Contact>,
+}
+
+/// State shared by the reader task and the client.
+#[derive(Debug, Default)]
+pub(crate) struct State {
+    pub(crate) self_info: Option<SelfInfo>,
+    pub(crate) time: u32,
+    pub(crate) contacts: Vec<Contact>,
+    pub(crate) contacts_lastmod: u32,
+    pub(crate) contacts_dirty: bool,
+    pub(crate) pending_contacts: Vec<Contact>,
+    /// Set by `get_contacts` before it sends: the `since` it asked with.
+    pub(crate) contacts_request_since: Option<u32>,
+    building: Option<ContactsInProgress>,
+    pub(crate) prepared: Option<PreparedRequest>,
+    pending: HashMap<u32, PendingRequest>,
+    pub(crate) parser: PacketParser,
+}
+
+impl State {
+    pub(crate) fn new() -> Self {
+        Self {
+            contacts_dirty: true,
+            ..Self::default()
+        }
+    }
+
+    /// Handles one frame and returns the events it yields.
+    pub(crate) fn handle_frame(&mut self, frame: &[u8]) -> Vec<Event> {
+        let Some((&code, data)) = frame.split_first() else {
+            log::warn!(target: "meshcore", "received an empty frame");
+            return Vec::new();
+        };
+        let Some(packet_type) = PacketType::from_code(code) else {
+            log::debug!(target: "meshcore", "unhandled frame code 0x{code:02x} ({} bytes)", frame.len());
+            return vec![Event::Unknown {
+                code,
+                data: data.to_vec(),
+            }];
+        };
+        match self.handle(packet_type, data) {
+            Ok(events) => events,
+            Err(err) => {
+                // Not the frame itself: message frames carry decrypted text.
+                log::error!(
+                    target: "meshcore",
+                    "could not read frame 0x{code:02x} ({} bytes): {err}",
+                    frame.len()
+                );
+                // A reply answers the command in flight, so its caller learns
+                // at once. A push came unasked: an error for it would end an
+                // unrelated command, so it is only logged.
+                if packet_type.is_push() {
+                    Vec::new()
+                } else {
+                    let reason = match err {
+                        crate::Error::Protocol(reason) => reason,
+                        other => other.to_string(),
+                    };
+                    vec![Event::Error(ErrorInfo::unreadable(code, reason))]
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn handle(&mut self, packet_type: PacketType, data: &[u8]) -> Result<Vec<Event>> {
+        let event = match packet_type {
+            PacketType::Ok => Event::Ok {
+                value: (data.len() == 4)
+                    .then(|| u32::from_le_bytes([data[0], data[1], data[2], data[3]])),
+            },
+            PacketType::Error => Event::Error(ErrorInfo {
+                code: data.first().map(|&c| ErrorCode::from_code(c)),
+                reason: None,
+                packet_type: None,
+            }),
+            PacketType::ContactStart => {
+                let count = ByteReader::new(data).opt_u32().unwrap_or(0);
+                self.building = Some(ContactsInProgress {
+                    since: self.contacts_request_since.take().unwrap_or(0),
+                    contacts: Vec::new(),
+                });
+                Event::ContactsStart { count }
+            }
+            PacketType::Contact => {
+                let contact = parse::contact(data)?;
+                if let Some(building) = &mut self.building {
+                    building.contacts.push(contact.clone());
+                } else {
+                    // a single contact (CMD_GET_CONTACT_BY_KEY): the device holds it
+                    self.upsert_contact(contact.clone());
+                }
+                Event::NextContact(Box::new(contact))
+            }
+            PacketType::ContactEnd => {
+                let lastmod = ByteReader::new(data).opt_u32().unwrap_or(0);
+                let contacts = if let Some(building) = self.building.take() {
+                    if building.since == 0 {
+                        self.contacts.clone_from(&building.contacts);
+                    } else {
+                        for contact in &building.contacts {
+                            self.upsert_contact(contact.clone());
+                        }
+                    }
+                    self.contacts_lastmod = lastmod;
+                    self.contacts_dirty = false;
+                    building.contacts
+                } else {
+                    // Without its start the list is incomplete: the cache stays.
+                    log::warn!(target: "meshcore", "end of a contact list that did not start");
+                    Vec::new()
+                };
+                Event::Contacts(Arc::new(ContactList { contacts, lastmod }))
+            }
+            PacketType::NewAdvert => {
+                let contact = parse::contact(data)?;
+                upsert(&mut self.pending_contacts, contact.clone());
+                Event::NewContact(Box::new(contact))
+            }
+            PacketType::SelfInfo => {
+                let info = parse::self_info(data)?;
+                self.self_info = Some(info.clone());
+                Event::SelfInfo(Box::new(info))
+            }
+            PacketType::DeviceInfo => Event::DeviceInfo(Box::new(parse::device_info(data)?)),
+            PacketType::MsgSent => {
+                let sent = parse::sent(data)?;
+                self.bind_prepared(&sent);
+                Event::MessageSent(sent)
+            }
+            PacketType::ContactMsgRecv | PacketType::ContactMsgRecvV3 => {
+                let v3 = packet_type == PacketType::ContactMsgRecvV3;
+                Event::ContactMessage(Box::new(parse::contact_message(data, v3)?))
+            }
+            PacketType::ChannelMsgRecv | PacketType::ChannelMsgRecvV3 => {
+                let v3 = packet_type == PacketType::ChannelMsgRecvV3;
+                let (mut message, text) = parse::channel_message(data, v3)?;
+                if self.parser.decrypt_channels {
+                    let hash = message_hash(message.sender_timestamp, &text);
+                    message.txt_hash = Some(hash);
+                    if let Some(logged) = self.parser.find_by_msg_hash(hash) {
+                        message.rx_info = Some(ChannelRxInfo {
+                            path: logged.path.clone(),
+                            rssi: logged.rssi,
+                            snr: logged.snr,
+                            recv_time: logged.recv_time,
+                            attempt: logged.decrypted.as_ref().map_or(0, |d| d.attempt),
+                        });
+                    }
+                }
+                Event::ChannelMessage(Box::new(message))
+            }
+            PacketType::ChannelDataRecv => Event::ChannelData(Box::new(parse::channel_data(data)?)),
+            PacketType::CurrentTime => {
+                let time = ByteReader::new(data).u32()?;
+                self.time = time;
+                Event::CurrentTime(time)
+            }
+            PacketType::NoMoreMsgs => Event::NoMoreMessages,
+            PacketType::ContactUri => {
+                Event::ContactUri(format!("meshcore://{}", crate::hex::encode(data)))
+            }
+            PacketType::Battery => Event::Battery(parse::battery(data)?),
+            PacketType::CustomVars => Event::CustomVars(CustomVars::parse(&lossy_ignore(data))),
+            PacketType::Stats => match parse::stats(data)? {
+                parse::Stats::Core(core) => Event::StatsCore(core),
+                parse::Stats::Radio(radio) => Event::StatsRadio(radio),
+                parse::Stats::Packets(packets) => Event::StatsPackets(packets),
+            },
+            PacketType::AutoaddConfig => Event::AutoAddConfig(parse::autoadd_config(data)?),
+            PacketType::ChannelInfo => {
+                let channel = parse::channel_info(data)?;
+                self.parser.add_channel(&channel);
+                Event::ChannelInfo(Box::new(channel))
+            }
+            PacketType::Advertisement => {
+                self.contacts_dirty = true;
+                Event::Advertisement(read_key(data)?)
+            }
+            PacketType::PathUpdate => {
+                self.contacts_dirty = true;
+                Event::PathUpdate(read_key(data)?)
+            }
+            PacketType::Ack => Event::Ack(parse::ack(data)?),
+            PacketType::MessagesWaiting => Event::MessagesWaiting,
+            PacketType::RawData => Event::RawData(Box::new(parse::raw_data(data)?)),
+            PacketType::LoginSuccess => Event::LoginSuccess(parse::login_success(data)),
+            PacketType::LoginFailed => Event::LoginFailed(parse::login_failed(data)),
+            PacketType::StatusResponse => {
+                Event::StatusResponse(Box::new(parse::status_push(data)?))
+            }
+            PacketType::LogData => Event::RxLog(Box::new(self.rx_log(data))),
+            PacketType::TraceData => Event::TraceData(Box::new(parse::trace(data)?)),
+            PacketType::TelemetryResponse => {
+                let (pubkey_prefix, telemetry) = parse::telemetry_push(data)?;
+                Event::TelemetryResponse(Box::new(TelemetryResponse {
+                    pubkey_prefix,
+                    tag: None,
+                    telemetry,
+                }))
+            }
+            PacketType::AllowedRepeatFreq => Event::AllowedRepeatFreq(parse::repeat_freqs(data)),
+            PacketType::BinaryResponse => return self.binary_response(data),
+            PacketType::PathDiscoveryResponse => {
+                Event::PathResponse(Box::new(parse::path_discovery(data)?))
+            }
+            PacketType::PrivateKey => {
+                let key: [u8; 64] = ByteReader::new(data).array()?;
+                Event::PrivateKey(Box::new(PrivateKey::new(key)))
+            }
+            PacketType::SignStart => {
+                let mut r = ByteReader::new(data);
+                r.skip(1)?;
+                Event::SignStart {
+                    max_length: r.u32()?,
+                }
+            }
+            PacketType::Signature => Event::Signature(data.to_vec()),
+            PacketType::Disabled => Event::Disabled,
+            PacketType::ControlData => {
+                let (control, discover) = parse::control_data(data)?;
+                let mut events = vec![Event::ControlData(Box::new(control))];
+                if let Some(discover) = discover {
+                    events.push(Event::DiscoverResponse(Box::new(discover)));
+                }
+                return Ok(events);
+            }
+            PacketType::ContactDeleted => {
+                let key = read_key(data)?;
+                self.remove_contact(&key);
+                Event::ContactDeleted(key)
+            }
+            PacketType::ContactsFull => Event::ContactsFull,
+            PacketType::TuningParams => Event::TuningParams(parse::tuning_params(data)?),
+            PacketType::DefaultFloodScope => {
+                Event::DefaultFloodScope(parse::default_flood_scope(data)?)
+            }
+            PacketType::CliReply => Event::CliReply(lossy_ignore(data)),
+            PacketType::AdvertPath => Event::AdvertPath(Box::new(parse::advert_path(data)?)),
+        };
+        Ok(vec![event])
+    }
+
+    fn rx_log(&mut self, data: &[u8]) -> RxLogData {
+        let recv_time = crate::util::unix_now_u64();
+        let snr = data.first().map(|&b| f32::from(b.cast_signed()) / 4.0);
+        let rssi = data.get(1).map(|&b| b.cast_signed());
+        let payload = data.get(2..).unwrap_or_default().to_vec();
+        let packet = if payload.is_empty() {
+            None
+        } else {
+            self.parser
+                .parse(&payload, snr.unwrap_or(0.0), rssi.unwrap_or(0), recv_time)
+        };
+        RxLogData {
+            recv_time,
+            snr,
+            rssi,
+            raw: data.to_vec(),
+            payload,
+            packet,
+        }
+    }
+
+    /// A binary response: always the raw event, plus the typed one for a
+    /// tracked request.
+    fn binary_response(&mut self, data: &[u8]) -> Result<Vec<Event>> {
+        let mut r = ByteReader::new(data);
+        r.skip(1)?;
+        let tag = r.u32()?;
+        let body = r.rest();
+        let mut events = vec![Event::BinaryResponse(Box::new(BinaryResponse {
+            tag,
+            data: body.to_vec(),
+        }))];
+
+        let Some(request) = self.pending.remove(&tag) else {
+            log::debug!(target: "meshcore", "no tracked request for binary response tag {tag:08x}");
+            return Ok(events);
+        };
+        let prefix = request.pubkey_prefix;
+        let typed = match request.kind {
+            RequestKind::Binary(BinaryReqType::Status) if body.len() >= 52 => Some(
+                Event::StatusResponse(Box::new(parse::status(body, prefix, Some(tag))?)),
+            ),
+            RequestKind::Binary(BinaryReqType::Telemetry) => {
+                Some(Event::TelemetryResponse(Box::new(TelemetryResponse {
+                    pubkey_prefix: prefix,
+                    tag: Some(tag),
+                    telemetry: Telemetry::parse(body),
+                })))
+            }
+            RequestKind::Binary(BinaryReqType::Mma) => {
+                Some(Event::MmaResponse(Box::new(parse::mma(body, prefix, tag))))
+            }
+            RequestKind::Binary(BinaryReqType::Acl) => {
+                Some(Event::AclResponse(Box::new(AclResponse {
+                    pubkey_prefix: prefix,
+                    tag,
+                    entries: parse::acl(body),
+                })))
+            }
+            RequestKind::Binary(BinaryReqType::Neighbours) => {
+                match parse::neighbours(body, prefix, tag, request.neighbours_prefix_len) {
+                    Ok(neighbours) => Some(Event::NeighboursResponse(Box::new(neighbours))),
+                    Err(err) => {
+                        log::error!(target: "meshcore", "could not read neighbours response: {err}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        events.extend(typed);
+        Ok(events)
+    }
+
+    fn bind_prepared(&mut self, sent: &SentInfo) {
+        let Some(prepared) = self.prepared.take() else {
+            return;
+        };
+        let suggested = u64::from(sent.suggested_timeout) * u64::from(prepared.timeout_factor);
+        let wait = prepared
+            .timeout
+            .unwrap_or_else(|| Duration::from_micros(suggested * 1250))
+            .max(prepared.min_timeout);
+        let now = Instant::now();
+        self.pending
+            .retain(|_, request| request.expires_at.is_none_or(|at| at > now));
+        self.pending.insert(
+            sent.expected_ack,
+            PendingRequest {
+                kind: prepared.kind,
+                pubkey_prefix: prepared.pubkey_prefix,
+                expires_at: now.checked_add(wait),
+                neighbours_prefix_len: prepared.neighbours_prefix_len,
+            },
+        );
+    }
+
+    /// Inserts or replaces a contact in the cache.
+    pub(crate) fn upsert_contact(&mut self, contact: Contact) {
+        upsert(&mut self.contacts, contact);
+    }
+
+    /// Removes a contact from the cache.
+    pub(crate) fn remove_contact(&mut self, key: &PublicKey) -> Option<Contact> {
+        let index = self.contacts.iter().position(|c| c.public_key == *key)?;
+        Some(self.contacts.remove(index))
+    }
+
+    /// The first cached contact whose key starts with `prefix`.
+    pub(crate) fn contact_by_prefix(&self, prefix: &[u8]) -> Option<&Contact> {
+        if prefix.is_empty() {
+            return None;
+        }
+        self.contacts
+            .iter()
+            .find(|c| c.public_key.starts_with(prefix))
+    }
+}
+
+fn upsert(list: &mut Vec<Contact>, contact: Contact) {
+    if let Some(existing) = list.iter_mut().find(|c| c.public_key == contact.public_key) {
+        *existing = contact;
+    } else {
+        list.push(contact);
+    }
+}
+
+fn read_key(data: &[u8]) -> Result<PublicKey> {
+    Ok(PublicKey::new(ByteReader::new(data).array()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::EventKind;
+
+    fn contact_frame(code: u8, key: u8, name: &str) -> Vec<u8> {
+        let mut frame = vec![code];
+        frame.extend([key; 32]);
+        frame.extend([1, 0, 0xff]);
+        frame.extend([0; 64]);
+        let mut name_field = [0u8; 32];
+        name_field[..name.len()].copy_from_slice(name.as_bytes());
+        frame.extend(name_field);
+        frame.extend([0; 16]);
+        frame
+    }
+
+    fn end_frame(lastmod: u32) -> Vec<u8> {
+        let mut frame = vec![4];
+        frame.extend(lastmod.to_le_bytes());
+        frame
+    }
+
+    #[test]
+    fn full_contact_list_replaces_the_cache() {
+        let mut state = State::new();
+        state.upsert_contact(crate::Contact::new(
+            PublicKey::new([9; 32]),
+            crate::ContactType::Chat,
+            "gone",
+        ));
+        assert_eq!(
+            state.handle_frame(&[2, 2, 0, 0, 0])[0].kind(),
+            EventKind::ContactsStart
+        );
+        state.handle_frame(&contact_frame(3, 1, "a"));
+        state.handle_frame(&contact_frame(3, 2, "b"));
+        let events = state.handle_frame(&end_frame(77));
+        let Event::Contacts(list) = &events[0] else {
+            panic!()
+        };
+        assert_eq!(list.contacts.len(), 2);
+        assert_eq!(list.lastmod, 77);
+        assert_eq!(state.contacts.len(), 2);
+        assert!(!state.contacts_dirty);
+        assert_eq!(state.contacts_lastmod, 77);
+    }
+
+    #[test]
+    fn a_list_end_without_its_start_leaves_the_cache_alone() {
+        let mut state = State::new();
+        state.handle_frame(&contact_frame(3, 1, "a"));
+        state.contacts_lastmod = 5;
+        let events = state.handle_frame(&end_frame(99));
+        assert_eq!(events[0].kind(), EventKind::Contacts);
+        assert_eq!(state.contacts.len(), 1);
+        assert_eq!(state.contacts_lastmod, 5);
+    }
+
+    #[test]
+    fn incremental_contact_list_merges() {
+        let mut state = State::new();
+        state.handle_frame(&[2, 1, 0, 0, 0]);
+        state.handle_frame(&contact_frame(3, 1, "a"));
+        state.handle_frame(&end_frame(10));
+        state.contacts_request_since = Some(10);
+        state.handle_frame(&[2, 2, 0, 0, 0]);
+        state.handle_frame(&contact_frame(3, 2, "b"));
+        state.handle_frame(&end_frame(20));
+        assert_eq!(state.contacts.len(), 2);
+    }
+
+    #[test]
+    fn new_adverts_go_to_pending_contacts_not_the_cache() {
+        let mut state = State::new();
+        let events = state.handle_frame(&contact_frame(0x8a, 5, "new"));
+        assert_eq!(events[0].kind(), EventKind::NewContact);
+        assert_eq!(state.contacts, Vec::<Contact>::new());
+        assert_eq!(state.pending_contacts.len(), 1);
+    }
+
+    #[test]
+    fn contact_deleted_removes_from_the_cache() {
+        let mut state = State::new();
+        state.handle_frame(&contact_frame(3, 1, "a"));
+        assert_eq!(state.contacts.len(), 1);
+        let mut frame = vec![0x8f];
+        frame.extend([1; 32]);
+        state.handle_frame(&frame);
+        assert_eq!(state.contacts, Vec::<Contact>::new());
+    }
+
+    #[test]
+    fn error_frames_carry_the_code() {
+        let mut state = State::new();
+        let events = state.handle_frame(&[1, 6]);
+        let Event::Error(info) = &events[0] else {
+            panic!()
+        };
+        assert_eq!(info.code, Some(ErrorCode::IllegalArg));
+    }
+
+    #[test]
+    fn unreadable_replies_become_errors_and_pushes_are_dropped() {
+        let mut state = State::new();
+        // MSG_SENT cut short
+        let events = state.handle_frame(&[6, 0, 1, 2]);
+        let Event::Error(info) = &events[0] else {
+            panic!()
+        };
+        assert_eq!(info.packet_type, Some(6));
+        assert_eq!(info.reason.as_deref(), Some("invalid_frame_length"));
+        // a STATUS_RESPONSE push cut short
+        assert!(state.handle_frame(&[0x87, 0, 1, 2]).is_empty());
+        // an unknown code
+        assert_eq!(state.handle_frame(&[0x7f, 1])[0].kind(), EventKind::Unknown);
+    }
+
+    #[test]
+    fn binary_responses_are_parsed_by_their_tag() {
+        let mut state = State::new();
+        state.prepared = Some(PreparedRequest {
+            kind: RequestKind::Binary(BinaryReqType::Acl),
+            pubkey_prefix: [1, 2, 3, 4, 5, 6],
+            timeout: None,
+            min_timeout: Duration::ZERO,
+            timeout_factor: 1,
+            neighbours_prefix_len: 0,
+        });
+        let mut sent = vec![6, 0];
+        sent.extend(0xabcd_u32.to_le_bytes());
+        sent.extend(4000u32.to_le_bytes());
+        state.handle_frame(&sent);
+        assert!(state.prepared.is_none());
+
+        let mut response = vec![0x8c, 0];
+        response.extend(0xabcd_u32.to_le_bytes());
+        response.extend([7, 7, 7, 7, 7, 7, 2]);
+        response.extend([0; 9]);
+        let events = state.handle_frame(&response);
+        assert_eq!(events.len(), 2);
+        let Event::AclResponse(acl) = &events[1] else {
+            panic!()
+        };
+        assert_eq!(acl.pubkey_prefix, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(acl.entries.len(), 1);
+        // matched once
+        assert_eq!(state.handle_frame(&response).len(), 1);
+    }
+
+    #[test]
+    fn time_and_self_info_are_tracked() {
+        let mut state = State::new();
+        state.handle_frame(&[9, 0x10, 0, 0, 0]);
+        assert_eq!(state.time, 16);
+    }
+}

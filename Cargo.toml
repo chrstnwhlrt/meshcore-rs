@@ -2,50 +2,58 @@
 name = "meshcore"
 version = "0.9.1"
 edition = "2024"
-rust-version = "1.85"
+# The newest versions of aes (0.9.4) and, with the ble feature, uuid (1.29.3)
+# need Rust 1.89. With edition 2024 Cargo resolves dependencies against this
+# value, so it has to be at least what the newest dependency versions require.
+rust-version = "1.89"
 authors = ["Christian Wohlert <christian667@gmail.com>"]
-description = "A Rust client library for MeshCore mesh networking devices"
+description = "A Rust client library for MeshCore companion radios (serial, TCP and BLE)"
 license = "MIT"
 repository = "https://github.com/chrstnwhlrt/meshcore-rs"
-keywords = ["meshcore", "mesh", "networking", "serial", "lora"]
+keywords = ["meshcore", "mesh", "lora", "serial", "ble"]
 categories = ["network-programming", "embedded", "asynchronous"]
 
 [dependencies]
-# Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
+# Async runtime: tasks, channels, timers, async I/O and TCP
+tokio = { version = "1.54.1", features = ["rt", "sync", "time", "io-util", "net"] }
+# Serial port
+tokio-serial = "5.5.0"
+# Logging facade (target "meshcore"); the application picks the logger
+log = "0.4.35"
+# Channel keys, flood scope keys, packet and message hashes
+sha2 = "0.11.1"
+# Matching group packets in the RX log to their channel
+hmac = "0.13.0"
+# Decrypting group packets in the RX log
+aes = "0.9.4"
 
-# Serial port communication
-tokio-serial = "5"
+# Serialize impls with meshcore_py's payload layout (feature "serde")
+serde = { version = "1.0.229", optional = true }
 
-# Error handling
-thiserror = "2"
-
-# Buffer handling
-bytes = "1"
-
-# Logging/tracing
-tracing = "0.1"
-
-# Hex encoding for public keys
-hex = "0.4"
-
-# Futures utilities
-futures = "0.3"
-
-# Optional: SHA256 for flood scope topic hashing
-sha2 = { version = "0.10", optional = true }
+[target.'cfg(target_os = "linux")'.dependencies]
+# BLE through BlueZ (feature "ble")
+bluer = { version = "0.17.4", features = ["bluetoothd"], optional = true }
+# Reading the notification and event streams bluer hands out (feature "ble")
+futures-util = { version = "0.3.34", default-features = false, optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["test-util"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal", "test-util"] }
+serde_json = "1.0.154"
 
 [features]
 default = []
-# Enable SHA256-based flood scope topic hashing
-sha2 = ["dep:sha2"]
+# BLE companions over the Nordic UART service, through BlueZ (Linux only;
+# without effect elsewhere). Needs libdbus.
+ble = ["dep:bluer", "dep:futures-util"]
+# serde::Serialize for events and data types, field names as in meshcore_py
+serde = ["dep:serde"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [lints.rust]
 unsafe_code = "forbid"
+missing_docs = "warn"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }

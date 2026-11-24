@@ -1,96 +1,76 @@
-//! Statistics types for device monitoring.
+//! Device statistics and remote status.
 
-/// Statistics type identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum StatsType {
-    /// Core device statistics.
-    Core = 0,
-    /// Radio statistics.
-    Radio = 1,
-    /// Packet statistics.
-    Packets = 2,
-}
-
-impl StatsType {
-    /// Parses stats type from a byte.
-    #[must_use]
-    pub const fn from_byte(byte: u8) -> Option<Self> {
-        match byte {
-            0 => Some(Self::Core),
-            1 => Some(Self::Radio),
-            2 => Some(Self::Packets),
-            _ => None,
-        }
-    }
-}
-
-/// Core device statistics.
+/// Core statistics (`RESP_CODE_STATS`, type 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoreStats {
     /// Battery voltage in millivolts.
     pub battery_mv: u16,
     /// Uptime in seconds.
     pub uptime_secs: u32,
-    /// Error count.
+    /// Error flags.
     pub errors: u16,
-    /// TX queue length.
+    /// Packets waiting to be sent.
     pub queue_len: u8,
 }
 
-/// Radio statistics.
+/// Radio statistics (`RESP_CODE_STATS`, type 1).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RadioStats {
     /// Noise floor in dBm.
     pub noise_floor: i16,
-    /// Last RSSI in dBm.
-    pub rssi: i8,
-    /// Last SNR in dB (raw value divided by 4).
-    pub snr: f32,
-    /// Total TX airtime in seconds.
-    pub tx_airtime_secs: u32,
-    /// Total RX airtime in seconds.
-    pub rx_airtime_secs: u32,
+    /// RSSI of the last packet in dBm.
+    pub last_rssi: i8,
+    /// SNR of the last packet in dB.
+    pub last_snr: f32,
+    /// Total transmit airtime in seconds.
+    pub tx_air_secs: u32,
+    /// Total receive airtime in seconds.
+    pub rx_air_secs: u32,
 }
 
-/// Packet statistics.
+/// Packet statistics (`RESP_CODE_STATS`, type 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PacketStats {
-    /// Total packets received.
-    pub received: u32,
-    /// Total packets sent.
+    /// Packets received.
+    pub recv: u32,
+    /// Packets sent.
     pub sent: u32,
-    /// Flood packets transmitted.
+    /// Flood packets sent.
     pub flood_tx: u32,
-    /// Direct packets transmitted.
+    /// Direct packets sent.
     pub direct_tx: u32,
     /// Flood packets received.
     pub flood_rx: u32,
     /// Direct packets received.
     pub direct_rx: u32,
+    /// Packets received with errors (firmware 1.12 and later).
+    pub recv_errors: Option<u32>,
 }
 
-/// Full device status (from binary status request or status response).
+/// The status of a repeater, room server or sensor
+/// (`PUSH_CODE_STATUS_RESPONSE`, or a binary status request).
 #[derive(Debug, Clone, PartialEq)]
-pub struct DeviceStatus {
-    /// 6-byte public key prefix.
+pub struct StatusResponse {
+    /// The node's 6-byte key prefix.
     pub pubkey_prefix: [u8; 6],
+    /// The request tag, for answers to binary requests.
+    pub tag: Option<u32>,
     /// Battery voltage in millivolts.
-    pub battery_mv: u16,
-    /// TX queue length.
+    pub bat: u16,
+    /// Packets waiting to be sent.
     pub tx_queue_len: u16,
     /// Noise floor in dBm.
     pub noise_floor: i16,
-    /// Last RSSI in dBm.
+    /// RSSI of the last packet in dBm.
     pub last_rssi: i16,
-    /// Number of packets received.
-    pub packets_received: u32,
-    /// Number of packets sent.
-    pub packets_sent: u32,
-    /// Total airtime in seconds.
-    pub airtime_secs: u32,
+    /// Packets received.
+    pub nb_recv: u32,
+    /// Packets sent.
+    pub nb_sent: u32,
+    /// Total transmit airtime in seconds.
+    pub airtime: u32,
     /// Uptime in seconds.
-    pub uptime_secs: u32,
+    pub uptime: u32,
     /// Flood packets sent.
     pub sent_flood: u32,
     /// Direct packets sent.
@@ -99,14 +79,16 @@ pub struct DeviceStatus {
     pub recv_flood: u32,
     /// Direct packets received.
     pub recv_direct: u32,
-    /// Full events count.
-    pub full_events: u16,
-    /// Last SNR in dB.
+    /// Error flags.
+    pub full_evts: u16,
+    /// SNR of the last packet in dB.
     pub last_snr: f32,
-    /// Direct duplicate count.
+    /// Direct duplicates dropped.
     pub direct_dups: u16,
-    /// Flood duplicate count.
+    /// Flood duplicates dropped.
     pub flood_dups: u16,
-    /// RX airtime in seconds.
-    pub rx_airtime_secs: u32,
+    /// Total receive airtime in seconds.
+    pub rx_airtime: u32,
+    /// Packets received with errors (firmware 1.12 and later).
+    pub recv_errors: Option<u32>,
 }

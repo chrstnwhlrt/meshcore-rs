@@ -155,9 +155,9 @@ perf.data
 perf.data.old
 flamegraph.svg
 
-# Core dumps
-core
-core.*
+# Core dumps (only at the top: a source file may be called core.rs)
+/core
+/core.[0-9]*
 
 # =============================================================================
 # Environment & Secrets

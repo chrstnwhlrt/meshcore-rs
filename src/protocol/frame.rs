@@ -1,124 +1,106 @@
-//! Frame encoding and decoding for the `MeshCore` protocol.
+//! Framing of the serial and TCP byte stream.
 //!
-//! The wire format uses a simple framing protocol:
 //! ```text
-//! ┌──────────┬──────────────┬─────────────────┐
-//! │  0x3c    │  size (LE)   │    payload      │
-//! │  1 byte  │   2 bytes    │   size bytes    │
-//! └──────────┴──────────────┴─────────────────┘
+//! host -> device:  0x3c ('<')  len_lo  len_hi  payload...
+//! device -> host:  0x3e ('>')  len_lo  len_hi  payload...
 //! ```
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use crate::error::{Error, Result};
 
-use crate::error::FrameError;
+/// Start byte of frames the host sends (`'<'`).
+pub const FRAME_START_OUT: u8 = 0x3c;
 
-/// Frame header byte.
-pub const FRAME_HEADER: u8 = 0x3c;
+/// Start byte of frames the device sends (`'>'`).
+pub const FRAME_START_IN: u8 = 0x3e;
 
-/// Maximum frame payload size (64KB - 1).
-pub const MAX_FRAME_SIZE: usize = 65535;
+/// The largest frame the firmware sends or accepts (v1.18; older firmware: 172).
+pub const DEVICE_MAX_FRAME_SIZE: usize = 176;
 
-/// Minimum frame size (header + 2-byte length).
-pub const MIN_FRAME_SIZE: usize = 3;
+/// Frames announcing more than this are taken for noise and skipped, as in
+/// meshcore_py.
+pub const MAX_ACCEPTED_FRAME_SIZE: usize = 300;
 
-/// Encodes a payload into a framed message.
+/// Wraps a payload in a host-to-device frame.
 ///
-/// # Arguments
+/// # Errors
 ///
-/// * `payload` - The data to frame
-///
-/// # Returns
-///
-/// A `Bytes` containing the framed message.
-///
-/// # Panics
-///
-/// Panics if the payload exceeds `MAX_FRAME_SIZE`.
-#[must_use]
-pub fn encode(payload: &[u8]) -> Bytes {
-    assert!(
-        payload.len() <= MAX_FRAME_SIZE,
-        "payload exceeds maximum frame size"
-    );
-
-    let mut buf = BytesMut::with_capacity(MIN_FRAME_SIZE + payload.len());
-    buf.put_u8(FRAME_HEADER);
-    // SAFETY: assert above guarantees payload.len() <= MAX_FRAME_SIZE (65535)
-    buf.put_u16_le(u16::try_from(payload.len()).expect("length checked above"));
-    buf.put_slice(payload);
-    buf.freeze()
+/// [`Error::InvalidArgument`] when the payload does not fit a frame.
+pub fn encode(payload: &[u8]) -> Result<Vec<u8>> {
+    let len = u16::try_from(payload.len())
+        .map_err(|_| Error::invalid(format!("frame of {} bytes is too long", payload.len())))?;
+    if payload.len() > DEVICE_MAX_FRAME_SIZE {
+        log::warn!(
+            target: "meshcore",
+            "sending a {} byte frame, the firmware keeps only {DEVICE_MAX_FRAME_SIZE}",
+            payload.len()
+        );
+    }
+    let mut frame = Vec::with_capacity(3 + payload.len());
+    frame.push(FRAME_START_OUT);
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(payload);
+    Ok(frame)
 }
 
-/// Frame decoder that handles partial data.
+/// Splits the device's byte stream into frames.
+///
+/// Bytes before a start byte are skipped: some radios print console output on
+/// the same UART. A header announcing an empty frame or more than
+/// [`MAX_ACCEPTED_FRAME_SIZE`] bytes is dropped, and the search for the next
+/// start byte goes on after it.
 #[derive(Debug, Default)]
 pub struct FrameDecoder {
-    buffer: BytesMut,
+    buffer: Vec<u8>,
 }
 
 impl FrameDecoder {
-    /// Creates a new frame decoder.
+    /// Creates an empty decoder.
     #[must_use]
-    pub fn new() -> Self {
-        Self {
-            buffer: BytesMut::new(),
-        }
+    pub const fn new() -> Self {
+        Self { buffer: Vec::new() }
     }
 
-    /// Feeds data into the decoder.
-    pub fn feed(&mut self, data: &[u8]) {
+    /// Feeds received bytes and returns the frames they complete.
+    pub fn feed(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
         self.buffer.extend_from_slice(data);
+        let mut frames = Vec::new();
+        loop {
+            match self.buffer.iter().position(|&b| b == FRAME_START_IN) {
+                Some(0) => {}
+                Some(start) => {
+                    self.buffer.drain(..start);
+                }
+                None => {
+                    self.buffer.clear();
+                    break;
+                }
+            }
+            if self.buffer.len() < 3 {
+                break;
+            }
+            let len = usize::from(u16::from_le_bytes([self.buffer[1], self.buffer[2]]));
+            if len == 0 || len > MAX_ACCEPTED_FRAME_SIZE {
+                log::debug!(target: "meshcore", "skipping frame header announcing {len} bytes");
+                self.buffer.drain(..3);
+                continue;
+            }
+            if self.buffer.len() < 3 + len {
+                break;
+            }
+            let frame = self.buffer[3..3 + len].to_vec();
+            self.buffer.drain(..3 + len);
+            frames.push(frame);
+        }
+        frames
     }
 
-    /// Attempts to decode the next complete frame.
-    ///
-    /// Returns `Ok(Some(payload))` if a complete frame was decoded,
-    /// `Ok(None)` if more data is needed, or an error if the frame is invalid.
-    ///
-    /// The frame format is: `<header> <length_lo> <length_hi> <payload...>`
-    /// where header is typically `0x3c` but we accept any header byte
-    /// (matching Python library behavior).
-    ///
-    /// # Errors
-    ///
-    /// Returns a `FrameError` if:
-    /// - The frame size exceeds the maximum
-    pub fn decode(&mut self) -> Result<Option<Bytes>, FrameError> {
-        if self.buffer.len() < MIN_FRAME_SIZE {
-            return Ok(None);
-        }
-
-        // Read length (little-endian u16) from bytes 1-2
-        // Note: We don't validate the header byte (byte 0) - matching Python behavior
-        let length = u16::from_le_bytes([self.buffer[1], self.buffer[2]]) as usize;
-
-        if length > MAX_FRAME_SIZE {
-            return Err(FrameError::TooLarge {
-                size: length,
-                max: MAX_FRAME_SIZE,
-            });
-        }
-
-        let total_frame_size = MIN_FRAME_SIZE + length;
-
-        // Check if we have the complete frame
-        if self.buffer.len() < total_frame_size {
-            return Ok(None);
-        }
-
-        // Extract the frame
-        self.buffer.advance(MIN_FRAME_SIZE); // Skip header and length
-        let payload = self.buffer.split_to(length).freeze();
-
-        Ok(Some(payload))
-    }
-
-    /// Returns the number of bytes currently buffered.
+    /// Bytes held back waiting for the rest of a frame.
     #[must_use]
     pub fn buffered(&self) -> usize {
         self.buffer.len()
     }
 
-    /// Clears the internal buffer.
+    /// Drops any partial frame.
     pub fn clear(&mut self) {
         self.buffer.clear();
     }
@@ -128,62 +110,69 @@ impl FrameDecoder {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_encode_simple() {
-        let payload = b"hello";
-        let frame = encode(payload);
-
-        assert_eq!(frame[0], FRAME_HEADER);
-        assert_eq!(frame[1], 5); // length low byte
-        assert_eq!(frame[2], 0); // length high byte
-        assert_eq!(&frame[3..], b"hello");
+    fn device_frame(payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![FRAME_START_IN];
+        frame.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_le_bytes());
+        frame.extend_from_slice(payload);
+        frame
     }
 
     #[test]
-    fn test_decode_complete_frame() {
-        let mut decoder = FrameDecoder::new();
-        decoder.feed(&[0x3c, 0x05, 0x00, b'h', b'e', b'l', b'l', b'o']);
-
-        let result = decoder.decode().unwrap();
-        assert_eq!(result, Some(Bytes::from_static(b"hello")));
+    fn encodes_with_host_start_byte() {
+        assert_eq!(encode(b"hello").unwrap(), b"<\x05\x00hello");
+        assert!(encode(&vec![0; 70_000]).is_err());
     }
 
     #[test]
-    fn test_decode_partial_frame() {
+    fn decodes_complete_and_split_frames() {
         let mut decoder = FrameDecoder::new();
-
-        // Feed partial data
-        decoder.feed(&[0x3c, 0x05, 0x00, b'h', b'e']);
-        assert_eq!(decoder.decode().unwrap(), None);
-
-        // Feed remaining data
-        decoder.feed(b"llo");
-        let result = decoder.decode().unwrap();
-        assert_eq!(result, Some(Bytes::from_static(b"hello")));
+        let frame = device_frame(b"hello");
+        assert_eq!(decoder.feed(&frame[..4]), Vec::<Vec<u8>>::new());
+        assert_eq!(decoder.feed(&frame[4..]), vec![b"hello".to_vec()]);
+        assert_eq!(decoder.buffered(), 0);
     }
 
     #[test]
-    fn test_decode_any_header() {
-        // Any header byte should be accepted (matching Python behavior)
+    fn decodes_several_frames_in_one_read() {
         let mut decoder = FrameDecoder::new();
-        decoder.feed(&[0x3e, 0x02, 0x00, b'o', b'k']); // 0x3e instead of 0x3c
-
-        let result = decoder.decode().unwrap();
-        assert_eq!(result, Some(Bytes::from_static(b"ok")));
+        let mut data = device_frame(b"hi");
+        data.extend(device_frame(b"bye"));
+        assert_eq!(decoder.feed(&data), vec![b"hi".to_vec(), b"bye".to_vec()]);
     }
 
     #[test]
-    fn test_decode_multiple_frames() {
+    fn skips_junk_before_the_start_byte() {
         let mut decoder = FrameDecoder::new();
-        decoder.feed(&[
-            0x3c, 0x02, 0x00, b'h', b'i', // first frame
-            0x3c, 0x03, 0x00, b'b', b'y', b'e', // second frame
-        ]);
+        let mut data = b"DEBUG: boot ok\r\n".to_vec();
+        data.extend(device_frame(&[0x05, 0x01]));
+        assert_eq!(decoder.feed(&data), vec![vec![0x05, 0x01]]);
+    }
 
-        let first = decoder.decode().unwrap();
-        assert_eq!(first, Some(Bytes::from_static(b"hi")));
+    #[test]
+    fn frame_payload_may_contain_the_start_byte() {
+        let mut decoder = FrameDecoder::new();
+        let payload = [0x3e, 0x3e, 0x01];
+        assert_eq!(
+            decoder.feed(&device_frame(&payload)),
+            vec![payload.to_vec()]
+        );
+    }
 
-        let second = decoder.decode().unwrap();
-        assert_eq!(second, Some(Bytes::from_static(b"bye")));
+    #[test]
+    fn resyncs_after_an_oversized_header() {
+        let mut decoder = FrameDecoder::new();
+        // '>' followed by a length of 0xffff, then a real frame
+        let mut data = vec![FRAME_START_IN, 0xff, 0xff];
+        data.extend(device_frame(b"ok"));
+        assert_eq!(decoder.feed(&data), vec![b"ok".to_vec()]);
+    }
+
+    #[test]
+    fn host_frames_are_not_taken_for_device_frames() {
+        let mut decoder = FrameDecoder::new();
+        assert_eq!(
+            decoder.feed(&encode(b"echo").unwrap()),
+            Vec::<Vec<u8>>::new()
+        );
     }
 }
