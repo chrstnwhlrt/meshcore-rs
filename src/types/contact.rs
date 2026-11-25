@@ -177,7 +177,9 @@ pub struct Contact {
     pub flags: u8,
     /// The out path length byte; [`PathLen::NONE`] means flood.
     pub out_path_len: PathLen,
-    /// The out path: exactly `out_path_len.byte_len()` bytes.
+    /// The out path: the `out_path_len.byte_len()` bytes the length byte
+    /// announces, at most the 64 the device stores (it takes the length byte
+    /// unchecked, so another client may have written one announcing more).
     pub out_path: Vec<u8>,
     /// The advertised name.
     pub name: String,

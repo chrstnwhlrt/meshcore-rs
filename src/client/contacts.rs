@@ -14,19 +14,26 @@ use crate::types::{AdvertPath, AutoAddConfig, Contact, ContactList, PublicKey};
 const CONTACTS_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Reads a contact list the device sends on the link with generation `link`:
-/// any number of contacts, then the end marker. The list may pause up to
-/// [`CONTACTS_IDLE_TIMEOUT`] between contacts.
+/// its start, any number of contacts, then the end marker. The list may pause
+/// up to [`CONTACTS_IDLE_TIMEOUT`] between them. `sub` was taken before the
+/// request went out, so an end without a start since belongs to an earlier
+/// list that went on after its request gave up.
 async fn read_contacts(sub: &mut Subscription, link: u64) -> Result<ContactList> {
     let mut deadline = tokio::time::Instant::now() + CONTACTS_IDLE_TIMEOUT;
+    let mut started = false;
     loop {
         let event = tokio::time::timeout_at(deadline, sub.recv_on_link(link))
             .await
             .map_err(|_| Error::Timeout)??;
         match event {
-            Event::ContactsStart { .. } | Event::NextContact(_) => {
+            Event::ContactsStart { .. } => {
+                started = true;
                 deadline = tokio::time::Instant::now() + CONTACTS_IDLE_TIMEOUT;
             }
-            Event::Contacts(list) => return Ok((*list).clone()),
+            Event::NextContact(_) => {
+                deadline = tokio::time::Instant::now() + CONTACTS_IDLE_TIMEOUT;
+            }
+            Event::Contacts(list) if started => return Ok((*list).clone()),
             Event::Error(info) => return Err(super::error_from_info(info)),
             Event::Disconnected { .. } => return Err(Error::ConnectionLost),
             _ => {}
@@ -107,7 +114,11 @@ impl MeshCore {
     ///
     /// When the list stalls for 5 s (no start, contact or end), this fails
     /// with [`Error::Timeout`]; a list that only starts after that is merged
-    /// into the cache, as it may be partial.
+    /// into the cache, as it may be partial. A call takes only the end of a
+    /// list whose start came after its request: the end of an earlier list
+    /// that goes on late is not its answer, and the device refuses the
+    /// request with [`ErrorCode::BadState`](crate::ErrorCode::BadState) while
+    /// such a list is still coming.
     pub async fn get_contacts(&self, lastmod: u32) -> Result<ContactList> {
         let _guard = self.inner.cmd_lock.lock().await;
         let mut sub = self.subscribe();

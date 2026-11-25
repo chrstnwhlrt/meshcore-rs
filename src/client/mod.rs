@@ -480,8 +480,8 @@ impl MeshCore {
             .cloned()
     }
 
-    /// True when the contacts were not read yet, or adverts or path updates
-    /// arrived since the last contact list started.
+    /// True when no contact list was read yet, or adverts or path updates
+    /// arrived since the last one read started.
     #[must_use]
     pub fn contacts_dirty(&self) -> bool {
         self.state().contacts_dirty
@@ -505,11 +505,10 @@ impl MeshCore {
     }
 
     /// The first cached contact whose key starts with the hex `prefix`
-    /// (any length, case and surrounding whitespace ignored; an empty prefix
-    /// finds none).
+    /// (any length, case ignored; an empty prefix finds none).
     #[must_use]
     pub fn get_contact_by_key_prefix(&self, prefix: &str) -> Option<Contact> {
-        let prefix = prefix.trim().to_lowercase();
+        let prefix = prefix.to_lowercase();
         if prefix.is_empty() {
             return None;
         }

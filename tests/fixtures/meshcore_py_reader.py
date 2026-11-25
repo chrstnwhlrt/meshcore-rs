@@ -4,11 +4,13 @@ line per event, the reference the parity test (tests/parity.rs) compares with.
 Regenerate the fixtures after updating meshcore_py:
 
     python3 -I make_frames.py > frames.hex
-    python3 -I meshcore_py_reader.py <meshcore_py>/src <pycayennelpp source> frames.hex > meshcore_py.jsonl
+    python3 meshcore_py_reader.py <meshcore_py>/src <pycayennelpp source> frames.hex > meshcore_py.jsonl
 
-meshcore_py needs pycryptodome and pycayennelpp; its serial module is stubbed
-(it does without bleak), nothing is opened. RX log receive times are dropped
-(they are the time of the run).
+meshcore_py needs pycryptodome, which python3 has to find (installed or on
+PYTHONPATH, which -I would leave out), and pycayennelpp, whose source the
+second argument gives; its serial module is stubbed (it does without bleak),
+nothing is opened. RX log receive times are dropped (they are the time of the
+run).
 """
 import asyncio
 import json

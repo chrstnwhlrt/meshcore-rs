@@ -17,6 +17,24 @@ use crate::types::{
 /// the app name.
 const APP_START: &[u8] = b"\x01\x03      mccli";
 
+/// A coordinate in millionths of a degree as the firmware reports it after
+/// `CMD_SET_ADVERT_LATLON`: it keeps the degrees as a `double` and multiplies
+/// them back, cutting off the fraction, so some values come back a millionth
+/// closer to zero.
+fn reported_coordinate(millionths: i32) -> i32 {
+    (f64::from(millionths) / 1e6 * 1e6) as i32
+}
+
+/// A frequency in kHz or bandwidth in Hz as the firmware reports it after
+/// `CMD_SET_RADIO_PARAMS`: it keeps the value divided by 1000 as a `float`
+/// and multiplies it back in `float`, cutting off the fraction, so some
+/// values come back 1 lower (none of a LoRa band or bandwidth).
+#[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)] // the firmware's own conversions
+fn reported_radio_value(thousandths: u32) -> u32 {
+    let stored = (f64::from(thousandths as f32) / 1000.0) as f32;
+    (stored * 1000.0) as u32
+}
+
 impl MeshCore {
     /// Starts the session (`CMD_APP_START`) and returns the device's own
     /// information. Also stops a contact list the device is still sending.
@@ -112,6 +130,9 @@ impl MeshCore {
     /// with halves to even as meshcore_py rounds them. A latitude beyond -90
     /// to 90 or a longitude beyond -180 to 180 after rounding, which the
     /// firmware would refuse, is refused before sending.
+    /// [`self_info`](Self::self_info) takes the location as the device
+    /// reports it back: some values come back a millionth of a degree closer
+    /// to zero.
     pub async fn set_coords(&self, latitude: f64, longitude: f64) -> Result<()> {
         let lat = (latitude * 1e6).round_ties_even();
         let lon = (longitude * 1e6).round_ties_even();
@@ -127,8 +148,8 @@ impl MeshCore {
         frame.extend_from_slice(&0i32.to_le_bytes());
         self.request_ok(&frame).await?;
         if let Some(info) = &mut self.state().self_info {
-            info.latitude_e6 = lat;
-            info.longitude_e6 = lon;
+            info.latitude_e6 = reported_coordinate(lat);
+            info.longitude_e6 = reported_coordinate(lon);
         }
         Ok(())
     }
@@ -182,7 +203,9 @@ impl MeshCore {
     /// Sets the radio: frequency in MHz, bandwidth in kHz, spreading factor,
     /// coding rate (5-8) and, on firmware code 9 and later, whether to repeat.
     /// The frequency goes out in whole kHz and the bandwidth in whole Hz,
-    /// rounded (meshcore_py cuts off the rest).
+    /// rounded (meshcore_py cuts off the rest). [`self_info`](Self::self_info)
+    /// takes them as the device reports them back: a few values, none of a
+    /// LoRa band or bandwidth, come back 1 kHz or 1 Hz lower.
     pub async fn set_radio(
         &self,
         freq_mhz: f64,
@@ -212,8 +235,8 @@ impl MeshCore {
         self.request_ok(&frame).await?;
         // The firmware switches the radio at once.
         if let Some(info) = &mut self.state().self_info {
-            info.radio_freq = f64::from(freq) / 1000.0;
-            info.radio_bw = f64::from(bw) / 1000.0;
+            info.radio_freq = f64::from(reported_radio_value(freq)) / 1000.0;
+            info.radio_bw = f64::from(reported_radio_value(bw)) / 1000.0;
             info.radio_sf = sf;
             info.radio_cr = cr;
         }

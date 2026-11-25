@@ -634,6 +634,15 @@ mod tests {
     }
 
     #[test]
+    fn contact_path_announced_longer_than_stored() {
+        // another client wrote 40 hops of 2 bytes; the device keeps 64 bytes
+        let c = contact(&contact_bytes(b"Rep", 0x68, &[7; 64])).unwrap();
+        assert_eq!(c.out_path_len.byte_len(), 80);
+        assert_eq!(c.out_path, vec![7; 64]);
+        assert_eq!(c.name, "Rep");
+    }
+
+    #[test]
     fn contact_flood_path() {
         let c = contact(&contact_bytes(b"Node", 0xff, &[])).unwrap();
         assert!(c.is_flood());

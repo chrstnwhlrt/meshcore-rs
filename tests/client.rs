@@ -207,6 +207,14 @@ async fn contact_list_fills_and_replaces_the_cache() {
     assert_eq!(mc.contacts().len(), 2);
     assert_eq!(mc.get_contact_by_name("alice").unwrap().public_key, key());
     assert!(mc.get_contact_by_key_prefix("2222").is_some());
+    // case is ignored, anything else is matched as given (as meshcore_py)
+    let ab = PublicKey::new([0xab; 32]);
+    mc.cache_contact(Contact::new(ab, ContactType::Chat, "Ab"));
+    let found = |prefix: &str| mc.get_contact_by_key_prefix(prefix).map(|c| c.public_key);
+    assert_eq!(found("ABab"), Some(ab));
+    assert_eq!(found(" abab"), None);
+    assert_eq!(found(""), None);
+    mc.uncache_contact(&ab);
     assert!(!mc.contacts_dirty());
 
     // a full list replaces the cache: Alice is gone
@@ -1144,6 +1152,61 @@ async fn an_advert_during_a_contact_list_has_the_contacts_read_again() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn the_end_of_a_list_given_up_on_is_not_the_next_answer() {
+    // the first list stalls after one contact, so its request gives up; its
+    // rest comes behind the next request, then the device's new list
+    let requests = AtomicU32::new(0);
+    let (mc, _device) = client(Options::default(), move |cmd| match cmd[0] {
+        4 if requests.fetch_add(1, Ordering::SeqCst) == 0 => vec![
+            vec![2, 2, 0, 0, 0],
+            contact_frame(3, KEY, "Alice", 0xff, &[]),
+        ],
+        4 => {
+            let end = |lastmod: u32| [&[4u8][..], &lastmod.to_le_bytes()].concat();
+            vec![
+                contact_frame(3, [0x22; 32], "Rep", 0xff, &[]),
+                end(1000),
+                vec![2, 1, 0, 0, 0],
+                contact_frame(3, [0x33; 32], "Bob", 0xff, &[]),
+                end(2000),
+            ]
+        }
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    assert!(matches!(mc.get_contacts(0).await, Err(Error::Timeout)));
+    let list = mc.get_contacts(0).await.unwrap();
+    assert_eq!(list.lastmod, 2000);
+    assert_eq!(list.contacts.len(), 1);
+    assert_eq!(list.contacts[0].name, "Bob");
+    assert_eq!(mc.contacts().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_busy_device_refuses_a_second_contact_list() {
+    // the old list is still coming when the next request arrives
+    let requests = AtomicU32::new(0);
+    let (mc, _device) = client(Options::default(), move |cmd| match cmd[0] {
+        4 if requests.fetch_add(1, Ordering::SeqCst) == 0 => vec![
+            vec![2, 2, 0, 0, 0],
+            contact_frame(3, KEY, "Alice", 0xff, &[]),
+        ],
+        4 => vec![
+            contact_frame(3, [0x22; 32], "Rep", 0xff, &[]),
+            err(4),
+            [&[4u8][..], &1000u32.to_le_bytes()].concat(),
+        ],
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    assert!(matches!(mc.get_contacts(0).await, Err(Error::Timeout)));
+    assert!(matches!(
+        mc.get_contacts(0).await,
+        Err(Error::Device(ErrorCode::BadState))
+    ));
+}
+
+#[tokio::test(start_paused = true)]
 async fn commands_while_a_contact_list_comes_in_keep_their_changes() {
     // the list ends only when the test pushes its end, so commands run while
     // it comes in, after it brought the contacts they change
@@ -1403,6 +1466,15 @@ async fn coordinates_and_frequencies_are_rounded_and_checked() {
     }
     assert_eq!(device.commands_with(14).len(), 1);
 
+    // the self info takes the location as the device reports it back: it
+    // keeps the degrees as a double, and 249 millionths come back as 248
+    mc.set_coords(0.000_249, -0.000_249).await.unwrap();
+    let sent = &device.commands_with(14)[1];
+    assert_eq!(sent[1..5], 249i32.to_le_bytes());
+    assert_eq!(sent[5..9], (-249i32).to_le_bytes());
+    let info = mc.self_info().unwrap();
+    assert_eq!((info.latitude_e6, info.longitude_e6), (248, -248));
+
     // rounded to whole kHz: meshcore_py cuts 512.002 MHz (512001.99999999994
     // kHz as a float) to 512001 kHz and 869.4625 MHz to 869462 kHz
     mc.set_radio(512.002, 62.5, 9, 8, None).await.unwrap();
@@ -1417,6 +1489,16 @@ async fn coordinates_and_frequencies_are_rounded_and_checked() {
         ));
     }
     assert_eq!(device.commands_with(11).len(), 2);
+
+    // the self info takes frequency and bandwidth as the device reports them
+    // back: it keeps them as floats, and 512001 kHz and 8004 Hz come back 1
+    // lower (no LoRa band or bandwidth does)
+    mc.set_radio(512.001, 8.004, 9, 8, None).await.unwrap();
+    let sent = &device.commands_with(11)[2];
+    assert_eq!(sent[1..5], 512_001u32.to_le_bytes());
+    assert_eq!(sent[5..9], 8_004u32.to_le_bytes());
+    let info = mc.self_info().unwrap();
+    assert_eq!((info.radio_freq, info.radio_bw), (512.0, 8.003));
 }
 
 #[tokio::test(start_paused = true)]

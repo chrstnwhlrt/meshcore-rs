@@ -306,7 +306,9 @@ meshcore_py leaves a gap:
   brings as many contacts as the device reports to hold; a shorter one may
   be the late answer to an earlier request since a time and is merged.
 - `get_contacts` fails when the list stalls for 5 s; meshcore_py looks every
-  5 s whether a contact came, so it waits 5 to 10 s.
+  5 s whether a contact came, so it waits 5 to 10 s. When such a list goes on
+  later, the next `get_contacts` does not take its end for its own answer;
+  meshcore_py takes the first end of a list that comes after its request.
 - The contact cache follows what the client does to the device's contacts
   (`add_contact`, `update_contact`, `remove_contact`, `reset_path`,
   `change_contact_path`, `change_contact_flags`, `get_contact_by_key`) and
@@ -322,7 +324,11 @@ meshcore_py leaves a gap:
   of the list; its automatic update reads the list again on every advert and
   path update anyway.
 - `self_info()` follows the name, location, TX power and radio settings the
-  client sets; meshcore_py updates its self info only for the settings of
+  client sets, in the form the device reports them back: the firmware keeps
+  the location as a double and frequency and bandwidth as floats, so some
+  coordinates come back a millionth of a degree closer to zero (and a few
+  frequencies and bandwidths LoRa does not use 1 kHz or 1 Hz lower).
+  meshcore_py updates its self info only for the settings of
   `CMD_SET_OTHER_PARAMS` and takes the others from the next `APP_START`.
 - `start_auto_message_fetching` empties the device's message queue right away
   and again after every `connect` and automatic reconnect, as the device
