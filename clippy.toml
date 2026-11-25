@@ -1,2 +1,2 @@
 # Names used in prose that the doc_markdown lint would otherwise want in backticks.
-doc-valid-idents = ["MeshCore", "WiFi", "BlueZ", "LoRa", "meshcore_py", ".."]
+doc-valid-idents = ["MeshCore", "WiFi", "BlueZ", "LoRa", "LilyGO", "meshcore_py", ".."]

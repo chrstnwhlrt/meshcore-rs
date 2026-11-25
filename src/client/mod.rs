@@ -215,6 +215,17 @@ impl MeshCore {
     /// device does not answer `APP_START`, it retries with DTR set (if DTR was
     /// not configured), then with DTR inverted.
     ///
+    /// On boards with the usual ESP32 auto-reset circuit, such as the LilyGO
+    /// T-LoRa V2.1-1.6, a try with DTR off holds the chip in reset while RTS
+    /// is on, and Linux turns both lines on when it opens a port. That try
+    /// gets no answer, and the board starts again when the port closes,
+    /// without the messages waiting in its queue and, if it has no real-time
+    /// clock, without its time. The try with DTR set changes nothing on
+    /// Linux, where DTR is on already; meshcore_py's tries have the same
+    /// effects. [`connect`](Self::connect) on a client made with
+    /// [`new`](Self::new) from a [`SerialTransport`](crate::SerialTransport)
+    /// tries once, with the lines as configured.
+    ///
     /// # Errors
     ///
     /// The port cannot be opened, or the device does not answer.

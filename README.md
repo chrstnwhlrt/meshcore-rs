@@ -82,11 +82,18 @@ async fn main() -> meshcore::Result<()> {
 
 `MeshCore::create_serial` opens the port and starts the session. When the node
 does not answer, it tries again with DTR set and then with DTR inverted, as
-meshcore_py does; a port that cannot be opened fails at once. `SerialConfig`
-sets the baud rate (115200), DTR and RTS (left alone by default), the wait after
-opening (`settle_delay`, 300 ms, for boards that reset on open) and how long old
-bytes are read and dropped (`drain_duration`, 500 ms). `list_ports()` lists the
-serial ports of the system.
+meshcore_py does; a port that cannot be opened fails at once. On boards with the
+usual ESP32 auto-reset circuit, such as the LilyGO T-LoRa V2.1-1.6, a try with
+DTR off holds the chip in reset while RTS is on, and Linux turns both lines on
+when it opens a port. That try gets no answer, and the board starts again when
+the port closes, without the messages waiting in its queue and, if it has no
+real-time clock, without its time. The try with DTR set changes nothing on
+Linux, where DTR is on already; meshcore_py's tries have the same effects.
+`connect` on `MeshCore::new(SerialTransport::new(config), options)` tries once,
+with the lines as configured. `SerialConfig` sets the baud rate (115200), DTR
+and RTS (left alone by default), the wait after opening (`settle_delay`, 300 ms,
+for boards that reset on open) and how long old bytes are read and dropped
+(`drain_duration`, 500 ms). `list_ports()` lists the serial ports of the system.
 
 `MeshCore::create_tcp` connects to a WiFi companion (the firmware listens on
 port 5000 unless built otherwise):
