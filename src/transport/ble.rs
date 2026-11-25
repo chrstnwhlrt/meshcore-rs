@@ -275,21 +275,38 @@ pub async fn scan(timeout: Duration) -> Result<Vec<BleDevice>> {
 /// Finds the device the settings ask for. A known address is used as is,
 /// everything else needs the device in range (advertising or connected).
 async fn find_device(adapter: &Adapter, target: &Target, timeout: Duration) -> Result<Device> {
-    if let Target::Address(address) = target
-        && adapter.device_addresses().await?.contains(address)
-    {
-        return Ok(adapter.device(*address)?);
+    // The log texts are meshcore_py's, which scans only without an address.
+    let by_name = matches!(target, Target::Name(_));
+    if let Target::Address(address) = target {
+        log::debug!(target: "meshcore", "Connecting using provided address");
+        if adapter.device_addresses().await?.contains(address) {
+            return Ok(adapter.device(*address)?);
+        }
+        log::debug!(target: "meshcore", "scanning for {target}");
+    } else {
+        log::info!(target: "meshcore", "Scanning for devices...");
     }
-    log::info!(target: "meshcore", "scanning for a {target}");
+    let mut name = String::new();
     let found = discover(adapter, timeout, |device| {
-        Address::from_str(&device.address)
-            .is_ok_and(|address| target.matches(address, Some(&device.name)))
+        let wanted = Address::from_str(&device.address)
+            .is_ok_and(|address| target.matches(address, Some(&device.name)));
+        if wanted {
+            name.clone_from(&device.name);
+        }
+        wanted
     })
     .await?;
-    match found {
-        Some(address) => Ok(adapter.device(address)?),
-        None => Err(Error::DeviceNotFound(format!("no {target} in range"))),
+    let Some(address) = found else {
+        if by_name {
+            log::warn!(target: "meshcore", "No MeshCore device found during scan.");
+        }
+        return Err(Error::DeviceNotFound(format!("no {target} in range")));
+    };
+    if by_name {
+        // As bleak prints a device.
+        log::info!(target: "meshcore", "Found device: {address}: {name}");
     }
+    Ok(adapter.device(address)?)
 }
 
 /// Pairs with an agent that answers the device's passkey request with the PIN.
@@ -303,16 +320,21 @@ async fn pair(session: &Session, device: &Device, pin: u32) -> Result<()> {
     };
     // Registered only while pairing; the handle unregisters it when dropped.
     let _agent = session.register_agent(agent).await?;
-    log::info!(target: "meshcore", "pairing with {}", device.address());
-    device.pair().await.map_err(|err| match err.kind {
-        ErrorKind::AuthenticationFailed | ErrorKind::AuthenticationRejected => {
-            Error::PairingFailed(format!(
-                "{} did not take the PIN, is it the right one? ({err})",
-                device.address()
-            ))
-        }
-        _ => Error::Ble(err),
-    })
+    log::debug!(target: "meshcore", "Attempting BLE pairing with PIN");
+    if let Err(err) = device.pair().await {
+        log::error!(target: "meshcore", "BLE pairing failed: {err}");
+        return Err(match err.kind {
+            ErrorKind::AuthenticationFailed | ErrorKind::AuthenticationRejected => {
+                Error::PairingFailed(format!(
+                    "{} did not take the PIN, is it the right one? ({err})",
+                    device.address()
+                ))
+            }
+            _ => Error::Ble(err),
+        });
+    }
+    log::info!(target: "meshcore", "BLE pairing successful");
+    Ok(())
 }
 
 /// Connects, or keeps the link BlueZ already has.
@@ -504,7 +526,17 @@ impl BleTransport {
                 device.address()
             ))
         };
-        let (rx, tx) = uart_characteristics(device).await?;
+        let (rx, tx) = match uart_characteristics(device).await {
+            Ok(characteristics) => characteristics,
+            Err(err) => {
+                // meshcore_py's text. A link that was there may be one BlueZ
+                // is taking down, which the caller connects anew.
+                if !existing && matches!(err, Error::DeviceNotFound(_)) {
+                    log::error!(target: "meshcore", "Could not find UART service");
+                }
+                return Err(err);
+            }
+        };
         if existing && tx.notifying().await? == Some(true) {
             return Err(in_use());
         }
@@ -535,7 +567,7 @@ impl BleTransport {
         let device_events = device.events().await?;
         let (sender, events) = mpsc::channel(LINK_CAPACITY);
         let reader_task = tokio::spawn(read_link(notifications, device_events, sender.clone()));
-        log::info!(target: "meshcore", "BLE connection started");
+        log::info!(target: "meshcore", "BLE Connection started");
         Ok(Link {
             info: device.address().to_string(),
             events,
@@ -559,7 +591,7 @@ impl Transport for BleTransport {
             let session = self.session.get_or_try_init(Session::new).await?;
             let adapter = powered_adapter(session).await?;
             let device = find_device(&adapter, &target, config.scan_timeout).await?;
-            log::info!(target: "meshcore", "connecting to {}", device.address());
+            log::debug!(target: "meshcore", "connecting to {}", device.address());
             // Armed for a link this call makes, not for one that was there.
             let mut guard = CancelGuard::default();
             let setup = async {
@@ -665,13 +697,23 @@ impl FrameWriter for BleWriter {
                     .await
                 {
                     Ok(Ok(())) => return Ok(()),
-                    Ok(Err(err)) => (format!("ble_write_failed: {err}"), Error::Ble(err)),
-                    Err(_) => ("ble_write_timeout".to_string(), Error::ConnectionLost),
+                    Ok(Err(err)) => {
+                        log::warn!(target: "meshcore", "BLE write failed: {err}");
+                        (format!("ble_write_failed: {err}"), Error::Ble(err))
+                    }
+                    Err(_) => {
+                        // meshcore_py's text, with the seconds as a float.
+                        log::warn!(
+                            target: "meshcore",
+                            "BLE write timed out after {:?}s",
+                            self.write_timeout.as_secs_f64()
+                        );
+                        ("ble_write_timeout".to_string(), Error::ConnectionLost)
+                    }
                 };
             // A write that failed or stalled leaves the link unusable (a second
             // write racing a stalled one drops it anyway): report it closed so
             // the client can reconnect.
-            log::warn!(target: "meshcore", "{reason}");
             if let Some(task) = self.reader_task.take() {
                 task.abort();
             }

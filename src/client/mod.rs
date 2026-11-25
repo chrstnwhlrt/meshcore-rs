@@ -209,35 +209,48 @@ impl MeshCore {
     ) -> Result<Self> {
         use crate::transport::serial::SerialTransport;
         // Only a node that does not answer is retried; a port that cannot be
-        // opened fails at once.
-        let no_answer = |result: &Result<SelfInfo>| {
-            matches!(
-                result,
-                Err(Error::Timeout | Error::Device(_) | Error::Protocol(_) | Error::ConnectionLost)
-            )
-        };
+        // opened fails at once. The log texts are meshcore_py's.
         let mut config = config;
         let mut client = Self::new(SerialTransport::new(config.clone()), options.clone());
         let mut result = client.connect().await;
-        if no_answer(&result) && config.dtr.is_none() {
-            log::info!(target: "meshcore", "no response from the node, trying with DTR set");
+        if client.no_answer(&result) && config.dtr.is_none() {
+            log::info!(target: "meshcore", "No response from meshcore node, trying to force DTR = True");
             config.dtr = Some(true);
             tokio::time::sleep(Duration::from_secs(1)).await;
             client = Self::new(SerialTransport::new(config.clone()), options.clone());
             result = client.connect().await;
         }
-        if no_answer(&result) {
+        if client.no_answer(&result) {
             let dtr = !config.dtr.unwrap_or(false);
-            log::info!(target: "meshcore", "no response from the node, trying with DTR {dtr}");
+            log::info!(
+                target: "meshcore",
+                "No response from meshcore node, trying to invert dtr (now {})",
+                if dtr { "True" } else { "False" }
+            );
             config.dtr = Some(dtr);
             tokio::time::sleep(Duration::from_secs(1)).await;
             client = Self::new(SerialTransport::new(config), options);
             result = client.connect().await;
         }
-        if no_answer(&result) {
-            log::error!(target: "meshcore", "no response from the node, is it a serial companion?");
+        if client.no_answer(&result) {
+            log::error!(target: "meshcore", "No response from meshcore node, disconnecting");
+            log::error!(target: "meshcore", "Are you sure your node is a serial companion ?");
         }
         result.map(|_| client)
+    }
+
+    /// Whether connecting failed after the link was up: the node did not
+    /// answer `APP_START`, where meshcore_py's `connect` gives `None`. Only
+    /// for a client that was never connected before.
+    fn no_answer(&self, result: &Result<SelfInfo>) -> bool {
+        result.is_err() && self.connection_info().is_some()
+    }
+
+    /// Logs meshcore_py's message for a node that did not answer.
+    fn report_no_answer(&self, result: &Result<SelfInfo>) {
+        if self.no_answer(result) {
+            log::error!(target: "meshcore", "No response from meshcore node, disconnecting");
+        }
     }
 
     /// A client for a BLE companion (not connected yet).
@@ -266,8 +279,9 @@ impl MeshCore {
         options: Options,
     ) -> Result<Self> {
         let client = Self::new(crate::transport::ble::BleTransport::new(config), options);
-        client.connect().await?;
-        Ok(client)
+        let result = client.connect().await;
+        client.report_no_answer(&result);
+        result.map(|_| client)
     }
 
     /// Connects over TCP (meshcore_py's `create_tcp`).
@@ -280,8 +294,9 @@ impl MeshCore {
             crate::transport::tcp::TcpTransport::new(host, port),
             options,
         );
-        client.connect().await?;
-        Ok(client)
+        let result = client.connect().await;
+        client.report_no_answer(&result);
+        result.map(|_| client)
     }
 
     /// Opens the link and starts the session with `APP_START`. A link that is
@@ -820,7 +835,7 @@ async fn reconnect(weak: Weak<Inner>, lost: u64, reason: String) {
                 let client = MeshCore { inner };
                 // The firmware needs APP_START on every new connection.
                 if let Err(err) = client.send_appstart_timeout(APPSTART_TIMEOUT).await {
-                    log::warn!(target: "meshcore", "APP_START after reconnect failed: {err}");
+                    log::warn!(target: "meshcore", "Reconnect callback failed: {err}");
                 }
                 let slot = client.inner.link.lock().await;
                 if slot
@@ -911,6 +926,19 @@ async fn wait_event(
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => return None,
         }
+    }
+}
+
+/// The payload meshcore_py logs for a command that failed with `err`: the
+/// device's error code, or `no_event_received` for anything else (a timeout
+/// or a link that dropped, which meshcore_py only sees as missing replies).
+fn python_payload(err: &Error) -> String {
+    match err {
+        Error::Device(code) => match code.name() {
+            Some(name) => format!("{{'error_code': {}, 'code_string': '{name}'}}", code.code()),
+            None => format!("{{'error_code': {}}}", code.code()),
+        },
+        _ => "{'reason': 'no_event_received'}".to_string(),
     }
 }
 

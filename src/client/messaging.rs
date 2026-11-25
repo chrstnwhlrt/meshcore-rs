@@ -258,9 +258,17 @@ impl MeshCore {
         let dst = dst.into();
         let dst_type = dst_type
             .or_else(|| dst.contact_type())
-            .or_else(|| self.state().contact_by_prefix(dst.key_bytes()).map(|c| c.contact_type))
+            .or_else(|| {
+                self.state()
+                    .contact_by_prefix(dst.key_bytes())
+                    .map(|c| c.contact_type)
+            })
             .unwrap_or_else(|| {
-                log::warn!(target: "meshcore", "unknown destination type, sending the command as to a repeater");
+                log::warn!(
+                    target: "meshcore",
+                    "Can't determine destination type, please ensure contacts first or specify \
+                     dst_type when calling `send_cmd`. Assuming it's a repeater."
+                );
                 ContactType::Repeater
             });
         let txt_type = if dst_type == ContactType::Chat {
@@ -315,11 +323,16 @@ impl MeshCore {
         while attempts < options.max_attempts
             && (!flood || flood_attempts < options.max_flood_attempts)
         {
+            // The log texts at info and above are meshcore_py's, spelling
+            // included, so that both read the same.
             if attempts == options.flood_after && !flood {
                 if full_key.is_none() {
-                    log::info!(target: "meshcore", "no full key, reading contacts to reset the path");
+                    log::info!(
+                        target: "meshcore",
+                        "Don't have full key, retreiving contacts so we can reset path"
+                    );
                     if let Err(err) = self.get_contacts(0).await {
-                        log::warn!(target: "meshcore", "could not read contacts: {err}");
+                        log::debug!(target: "meshcore", "could not read contacts: {err}");
                     }
                     full_key = self
                         .state()
@@ -327,19 +340,28 @@ impl MeshCore {
                         .map(|c| c.public_key);
                 }
                 match full_key {
-                    Some(key) => match self.reset_path(&key).await {
-                        Ok(()) => flood = true,
-                        Err(err) => {
-                            log::error!(target: "meshcore", "could not reset path: {err}, continuing");
+                    Some(key) => {
+                        log::info!(target: "meshcore", "Resetting path");
+                        match self.reset_path(&key).await {
+                            Ok(()) => flood = true,
+                            Err(err) => {
+                                log::debug!(target: "meshcore", "could not reset path: {err}");
+                                log::error!(
+                                    target: "meshcore",
+                                    "Couldn't reset path Event(type=<EventType.ERROR: \
+                                     'command_error'>, payload={}, attributes={{}}) continuing ...",
+                                    super::python_payload(&err)
+                                );
+                            }
                         }
-                    },
+                    }
                     None => {
                         log::error!(target: "meshcore", "no full key to reset the path, continuing");
                     }
                 }
             }
             if attempts > 0 {
-                log::info!(target: "meshcore", "retry sending message: attempt {}", attempts + 1);
+                log::info!(target: "meshcore", "Retry sending msg: {}", attempts + 1);
             }
             let attempt = u8::try_from(attempts).unwrap_or(u8::MAX);
             match self
@@ -348,7 +370,14 @@ impl MeshCore {
             {
                 // A text that does not fit will not fit on the next attempt.
                 Err(err @ Error::InvalidArgument(_)) => return Err(err),
-                Err(err) => log::error!(target: "meshcore", "failed to send message: {err}"),
+                Err(err) => {
+                    log::debug!(target: "meshcore", "could not send the message: {err}");
+                    log::error!(
+                        target: "meshcore",
+                        "Failed to send message: {}",
+                        super::python_payload(&err)
+                    );
+                }
                 Ok(info) => {
                     flood = info.flood;
                     sent.push(info);

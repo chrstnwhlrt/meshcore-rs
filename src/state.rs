@@ -80,7 +80,8 @@ impl State {
     /// Handles one frame and returns the events it yields.
     pub(crate) fn handle_frame(&mut self, frame: &[u8]) -> Vec<Event> {
         let Some((&code, data)) = frame.split_first() else {
-            log::warn!(target: "meshcore", "received an empty frame");
+            // meshcore_py's text: it logs the IndexError of reading the code.
+            log::warn!(target: "meshcore", "Received empty packet: index out of range");
             return Vec::new();
         };
         let Some(packet_type) = PacketType::from_code(code) else {
@@ -357,7 +358,10 @@ impl State {
                 match parse::neighbours(body, prefix, tag, request.neighbours_prefix_len) {
                     Ok(neighbours) => Some(Event::NeighboursResponse(Box::new(neighbours))),
                     Err(err) => {
-                        log::error!(target: "meshcore", "could not read neighbours response: {err}");
+                        log::error!(
+                            target: "meshcore",
+                            "Error parsing binary NEIGHBOURS response: {err}"
+                        );
                         None
                     }
                 }

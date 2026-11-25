@@ -130,8 +130,15 @@ impl<W: AsyncWrite + Unpin + Send> FrameWriter for StreamWriter<W> {
     fn write_frame<'a>(&'a mut self, frame: &'a [u8]) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let framed = encode(frame)?;
-            self.writer.write_all(&framed).await?;
-            self.writer.flush().await?;
+            let written = match self.writer.write_all(&framed).await {
+                Ok(()) => self.writer.flush().await,
+                Err(err) => Err(err),
+            };
+            // Only the serial transport writes through here.
+            if let Err(err) = written {
+                log::warn!(target: "meshcore", "Serial write failed: {err}");
+                return Err(err.into());
+            }
             Ok(())
         })
     }

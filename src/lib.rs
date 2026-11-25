@@ -34,6 +34,9 @@
 //!   to their request by tag; the `*_sync` methods wait for them.
 //! - The client keeps the device's self info, a contact cache, contacts heard
 //!   but not added, and the channel secrets for decoding the RX log.
+//! - It logs through the `log` crate with the target `meshcore`; where
+//!   meshcore_py logs the same case at info level or above, the message has
+//!   its wording.
 //!
 //! ## Transports
 //!

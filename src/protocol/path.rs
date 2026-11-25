@@ -175,7 +175,10 @@ pub fn parse_path_hex(text: &str) -> Result<(Vec<u8>, Option<u8>)> {
 pub fn encode_reply_path(out_path_len: PathLen, out_path: &[u8]) -> Vec<u8> {
     let hash_mode = out_path_len.hash_mode().unwrap_or(0);
     if hash_mode > 2 {
-        log::warn!(target: "meshcore", "unsupported path hash mode {hash_mode}, asking for a zero-hop reply");
+        log::warn!(
+            target: "meshcore",
+            "Unsupported out_path_hash_mode {hash_mode}; requesting a zero-hop reply path instead"
+        );
         return vec![0];
     }
     let hash_size = usize::from(hash_mode) + 1;
@@ -183,7 +186,11 @@ pub fn encode_reply_path(out_path_len: PathLen, out_path: &[u8]) -> Vec<u8> {
     hops = hops.min(out_path.len() / hash_size);
     let max_hops = 63.min(MAX_PATH_SIZE / hash_size);
     if hops > max_hops {
-        log::warn!(target: "meshcore", "reply path of {hops} hops does not fit, keeping {max_hops}");
+        log::warn!(
+            target: "meshcore",
+            "Reply path of {hops} hops x {hash_size}B exceeds the {MAX_PATH_SIZE}B the server \
+             can hold; truncating to {max_hops}"
+        );
         hops = max_hops;
     }
     let mut out = Vec::with_capacity(1 + hops * hash_size);

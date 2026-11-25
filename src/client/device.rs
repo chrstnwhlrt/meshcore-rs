@@ -467,7 +467,11 @@ impl MeshCore {
             .await
         {
             Err(Error::Timeout) => {
-                log::warn!(target: "meshcore", "no reply to sign data, continuing");
+                log::warn!(
+                    target: "meshcore",
+                    "sign_data OK response not received (timeout), but continuing - data may \
+                     have been processed by device"
+                );
                 Ok(())
             }
             other => other,
@@ -516,8 +520,17 @@ impl MeshCore {
                 data.len()
             )));
         }
-        for chunk in data.chunks(chunk_size) {
-            self.sign_data(chunk).await?;
+        let total = data.len().div_ceil(chunk_size);
+        for (index, chunk) in data.chunks(chunk_size).enumerate() {
+            if let Err(err) = self.sign_data(chunk).await {
+                log::error!(
+                    target: "meshcore",
+                    "Error sending chunk {}/{total}: {}",
+                    index + 1,
+                    super::python_payload(&err)
+                );
+                return Err(err);
+            }
         }
         self.sign_finish(timeout, data.len()).await
     }
@@ -544,7 +557,11 @@ impl MeshCore {
             crate::util::random_u32(),
             crate::util::random_u32()
         );
-        log::warn!(target: "meshcore", "factory reset requested; confirming erases all data on the device");
+        log::warn!(
+            target: "meshcore",
+            "Factory reset requested. Call confirm_factory_reset('{token}') to proceed. This \
+             will ERASE ALL DATA on the device."
+        );
         *super::lock(&self.inner.factory_reset_token) = Some(token.clone());
         token
     }
@@ -563,7 +580,8 @@ impl MeshCore {
             }
             *stored = None;
         }
-        log::warn!(target: "meshcore", "factory reset: erasing the device");
+        // meshcore_py's text, dash included.
+        log::warn!(target: "meshcore", "Executing factory reset — all device data will be erased");
         match self
             .request(
                 b"\x33reset",

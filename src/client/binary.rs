@@ -445,7 +445,11 @@ impl MeshCore {
                 Ok(device_contact) => contact = Some(device_contact),
                 Err(Error::Device(crate::ErrorCode::NotFound)) => contact = None,
                 Err(err) => {
-                    log::error!(target: "meshcore", "could not read the contact from the device: {err}");
+                    log::debug!(target: "meshcore", "could not read the contact: {err}");
+                    log::error!(
+                        target: "meshcore",
+                        "Could not read the contact from the device, aborting anon request"
+                    );
                     return Err(err);
                 }
             }
@@ -458,10 +462,14 @@ impl MeshCore {
                 encode_reply_path(PathLen::ZERO_HOP, &[])
             }
             Some(contact) if contact.is_flood() => {
-                log::info!(target: "meshcore", "no path set, trying zero hop");
+                log::info!(target: "meshcore", "No path set trying zero hop");
                 if let Err(err) = self.change_contact_path(contact, &[], None).await {
                     // Flooded, the server would drop the request: fail now.
-                    log::error!(target: "meshcore", "could not set a zero-hop path: {err}");
+                    log::debug!(target: "meshcore", "could not set a zero-hop path: {err}");
+                    log::error!(
+                        target: "meshcore",
+                        "Could not set zero-hop path, aborting anon request"
+                    );
                     return Err(err);
                 }
                 zero_hop = true;

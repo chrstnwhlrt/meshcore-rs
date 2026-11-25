@@ -262,6 +262,11 @@ The client keeps what meshcore_py keeps:
 A command whose link drops fails at once with `Error::ConnectionLost`. Without
 automatic reconnecting the client then sends `Event::Disconnected`.
 
+The library logs through the `log` crate with the target `meshcore`. Where
+meshcore_py logs the same case at info level or above, the message has its
+wording (spelling included), so a program shows the lines a meshcore_py
+program would show.
+
 ## Differences from meshcore_py
 
 The library differs from meshcore_py in these points, most of them where the

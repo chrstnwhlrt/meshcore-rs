@@ -107,7 +107,7 @@ impl Transport for SerialTransport {
     fn open(&self) -> BoxFuture<'_, Result<Link>> {
         Box::pin(async move {
             let config = &self.config;
-            log::info!(target: "meshcore", "opening serial port {}", config.port);
+            log::debug!(target: "meshcore", "opening serial port {}", config.port);
             let mut stream =
                 tokio_serial::new(&config.port, config.baud_rate).open_native_async()?;
             if let Some(dtr) = config.dtr {
@@ -135,7 +135,7 @@ impl Transport for SerialTransport {
             let (reader, writer) = tokio::io::split(stream);
             let (sender, events) = mpsc::channel(LINK_CAPACITY);
             let reader_task = spawn_stream_reader(reader, sender, "serial", None);
-            log::info!(target: "meshcore", "serial connection started");
+            log::info!(target: "meshcore", "Serial Connection started");
             Ok(Link {
                 info: config.port.clone(),
                 events,

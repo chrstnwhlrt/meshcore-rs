@@ -51,7 +51,7 @@ impl Transport for TcpTransport {
     fn open(&self) -> BoxFuture<'_, Result<Link>> {
         Box::pin(async move {
             let target = self.describe();
-            log::info!(target: "meshcore", "connecting to {target}");
+            log::debug!(target: "meshcore", "connecting to {target}");
             let stream = tokio::time::timeout(
                 self.connect_timeout,
                 TcpStream::connect((self.host.as_str(), self.port)),
@@ -64,7 +64,7 @@ impl Transport for TcpTransport {
             let received = Arc::new(AtomicU32::new(0));
             let reader_task =
                 spawn_stream_reader(reader, sender.clone(), "tcp", Some(Arc::clone(&received)));
-            log::info!(target: "meshcore", "TCP connection started");
+            log::info!(target: "meshcore", "TCP Connection started");
             Ok(Link {
                 info: target,
                 events,
@@ -114,7 +114,10 @@ impl FrameWriter for TcpWriter {
                 return Err(Error::ConnectionLost);
             }
             let framed = encode(frame)?;
-            self.writer.write_all(&framed).await?;
+            if let Err(err) = self.writer.write_all(&framed).await {
+                log::warn!(target: "meshcore", "TCP write failed: {err}");
+                return Err(err.into());
+            }
             Ok(())
         })
     }
