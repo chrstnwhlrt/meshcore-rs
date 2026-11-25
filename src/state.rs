@@ -63,7 +63,7 @@ pub(crate) struct State {
     pub(crate) contacts_lastmod: u32,
     pub(crate) contacts_dirty: bool,
     pub(crate) pending_contacts: Vec<Contact>,
-    /// Set by `get_contacts` before it sends: the `since` it asked with.
+    /// Set before a contact list request goes out: the `since` it asks with.
     pub(crate) contacts_request_since: Option<u32>,
     building: Option<ContactsInProgress>,
     pub(crate) prepared: Option<PreparedRequest>,
@@ -145,7 +145,10 @@ impl State {
             PacketType::Contact => {
                 let contact = parse::contact(data)?;
                 if let Some(building) = &mut self.building {
-                    building.contacts.push(contact.clone());
+                    // By key, as in meshcore_py: a contact that comes twice
+                    // (the answer to CMD_GET_CONTACT_BY_KEY in the middle of
+                    // a list) is listed once.
+                    upsert(&mut building.contacts, contact.clone());
                 } else {
                     // a single contact (CMD_GET_CONTACT_BY_KEY): the device holds it
                     self.upsert_contact(contact.clone());
@@ -180,6 +183,16 @@ impl State {
                 Event::NewContact(Box::new(contact))
             }
             PacketType::SelfInfo => {
+                // It answers APP_START, which stops a contact list the device
+                // is sending. That list never ends: what came of it stays out
+                // of the cache, and single contacts go to the cache again.
+                if let Some(stopped) = self.building.take() {
+                    log::debug!(
+                        target: "meshcore",
+                        "contact list stopped by APP_START after {} contacts",
+                        stopped.contacts.len()
+                    );
+                }
                 let info = parse::self_info(data)?;
                 self.self_info = Some(info.clone());
                 Event::SelfInfo(Box::new(info))
@@ -503,6 +516,18 @@ mod tests {
         frame
     }
 
+    fn self_info_frame() -> Vec<u8> {
+        let mut frame = vec![5, 1, 22, 22];
+        frame.extend([7; 32]);
+        // location, multi ACKs, location policy, telemetry modes, manual add
+        frame.extend([0; 12]);
+        frame.extend(869_525u32.to_le_bytes());
+        frame.extend(250_000u32.to_le_bytes());
+        frame.extend([11, 5]);
+        frame.extend(b"Node");
+        frame
+    }
+
     #[test]
     fn full_contact_list_replaces_the_cache() {
         let mut state = State::new();
@@ -539,6 +564,39 @@ mod tests {
         state.handle_frame(&end_frame(30));
         assert_eq!(state.contacts.len(), 2);
         assert_eq!(state.contacts_lastmod, 30);
+    }
+
+    #[test]
+    fn a_contact_sent_twice_in_a_list_is_listed_once() {
+        // the answer to CMD_GET_CONTACT_BY_KEY in the middle of a full list
+        let mut state = State::new();
+        state.contacts_request_since = Some(0);
+        state.handle_frame(&[2, 2, 0, 0, 0]);
+        state.handle_frame(&contact_frame(3, 1, "a"));
+        state.handle_frame(&contact_frame(3, 2, "b"));
+        state.handle_frame(&contact_frame(3, 1, "a2"));
+        let events = state.handle_frame(&end_frame(7));
+        let Event::Contacts(list) = &events[0] else {
+            panic!()
+        };
+        let names: Vec<&str> = list.contacts.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["a2", "b"]);
+        assert_eq!(state.contacts, list.contacts);
+    }
+
+    #[test]
+    fn app_start_stops_a_contact_list() {
+        let mut state = State::new();
+        state.contacts_request_since = Some(0);
+        state.handle_frame(&[2, 2, 0, 0, 0]);
+        state.handle_frame(&contact_frame(3, 1, "a"));
+        // APP_START (as after a reconnect) stops the list, it never ends
+        state.handle_frame(&self_info_frame());
+        assert_eq!(state.contacts, Vec::<Contact>::new());
+        // the answer to CMD_GET_CONTACT_BY_KEY goes to the cache again
+        state.handle_frame(&contact_frame(3, 2, "b"));
+        assert_eq!(state.contacts.len(), 1);
+        assert_eq!(state.contacts[0].name, "b");
     }
 
     #[test]
@@ -649,15 +707,10 @@ mod tests {
         state.handle_frame(&[9, 0x10, 0, 0, 0]);
         assert_eq!(state.time, 16);
 
-        let mut frame = vec![5, 1, 22, 22];
-        frame.extend([7; 32]);
-        // location, multi ACKs, location policy, telemetry modes, manual add
-        frame.extend([0; 12]);
-        frame.extend(869_525u32.to_le_bytes());
-        frame.extend(250_000u32.to_le_bytes());
-        frame.extend([11, 5]);
-        frame.extend(b"Node");
-        assert_eq!(state.handle_frame(&frame)[0].kind(), EventKind::SelfInfo);
+        assert_eq!(
+            state.handle_frame(&self_info_frame())[0].kind(),
+            EventKind::SelfInfo
+        );
         let info = state.self_info.as_ref().unwrap();
         assert_eq!(info.public_key, PublicKey::new([7; 32]));
         assert_eq!((info.radio_sf, info.radio_cr), (11, 5));

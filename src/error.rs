@@ -107,7 +107,8 @@ pub enum Error {
     /// The connection was lost before the reply came (also when the transport
     /// took it for dead before sending).
     ConnectionLost,
-    /// No reply came in time.
+    /// No reply came in time, or a link did not open within its connect
+    /// timeout (TCP, BLE).
     Timeout,
     /// The device answered with an error code.
     Device(ErrorCode),
@@ -161,7 +162,7 @@ impl fmt::Display for Error {
             Self::PairingFailed(message) => write!(f, "pairing failed: {message}"),
             Self::NotConnected => f.write_str("not connected"),
             Self::ConnectionLost => f.write_str("connection lost"),
-            Self::Timeout => f.write_str("timed out waiting for a reply"),
+            Self::Timeout => f.write_str("timed out"),
             Self::Device(code) => write!(f, "device error {code}"),
             Self::Disabled => f.write_str("feature disabled on the device"),
             Self::LoginFailed => f.write_str("login failed"),

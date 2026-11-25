@@ -219,8 +219,9 @@ impl Contact {
     }
 
     /// Sets the name and its raw field. The name is cut to 31 bytes at a
-    /// character boundary: the firmware stores the 32-byte field as it comes
-    /// and hands back at most 31 bytes of it.
+    /// character boundary, and at a NUL byte: the firmware stores the 32-byte
+    /// field as it comes and hands back at most 31 bytes of it, up to the
+    /// first NUL.
     pub fn set_name(&mut self, name: &str) {
         self.name_raw = name_field_of(name);
         self.name = crate::protocol::bytes::text_until_nul(&self.name_raw);

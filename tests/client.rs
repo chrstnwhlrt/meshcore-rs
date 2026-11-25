@@ -285,6 +285,9 @@ async fn contact_changes_are_written_and_cached() {
     assert_eq!(&frame[100..131], "r".repeat(31).as_bytes());
     assert_eq!(frame[131], 0);
     assert_eq!(mc.contact(&key()).unwrap().name, "r".repeat(31));
+    // and returned so by the changes
+    let flagged = mc.change_contact_flags(&renamed, 2).await.unwrap();
+    assert_eq!(flagged.name, "r".repeat(31));
 }
 
 #[tokio::test(start_paused = true)]
@@ -1474,6 +1477,9 @@ async fn texts_longer_than_the_firmware_takes_are_refused() {
     assert!(refused(mc.set_channel(1, "#a\0b", None).await));
     assert!(refused(mc.set_custom_var("gps", "1\0").await));
     assert!(refused(mc.set_default_flood_scope(Some("a\0b")).await));
+    let mut contact = Contact::new(key(), ContactType::Chat, "x");
+    contact.name = "a\0b".into();
+    assert!(refused(mc.update_contact(&contact, None).await));
     // the firmware sends at most 15 bytes of a password
     assert!(refused(
         mc.send_login(&key(), &"p".repeat(16)).await.map(drop)
@@ -1503,7 +1509,7 @@ async fn texts_longer_than_the_firmware_takes_are_refused() {
     assert_eq!(device.commands_with(8).len(), 0);
     assert_eq!(device.commands_with(66).len(), 0);
     assert_eq!(device.commands_with(41).len(), 0);
-    for code in [55, 65, 18, 26, 32, 63] {
+    for code in [55, 65, 18, 26, 32, 63, 9] {
         assert_eq!(device.commands_with(code).len(), 0);
     }
 }

@@ -472,7 +472,8 @@ impl MeshCore {
             .cloned()
     }
 
-    /// True when adverts or path updates arrived since the contacts were read.
+    /// True when the contacts were not read yet, or adverts or path updates
+    /// arrived since they were.
     #[must_use]
     pub fn contacts_dirty(&self) -> bool {
         self.state().contacts_dirty

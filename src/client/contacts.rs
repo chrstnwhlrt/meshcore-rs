@@ -57,6 +57,10 @@ pub(crate) fn update_contact_frame(contact: &Contact, lastmod: Option<u32>) -> R
             contact.out_path_len.byte_len()
         )));
     }
+    // The device would keep the name up to the NUL.
+    if contact.name.contains('\0') {
+        return Err(Error::invalid("the contact name holds a NUL byte"));
+    }
     let mut frame = key_frame(CommandType::AddUpdateContact, &contact.public_key);
     frame.push(contact.contact_type.code());
     frame.push(contact.flags);
@@ -72,6 +76,19 @@ pub(crate) fn update_contact_frame(contact: &Contact, lastmod: Option<u32>) -> R
         frame.extend_from_slice(&lastmod.to_le_bytes());
     }
     Ok(frame)
+}
+
+/// A contact as the device stores it from [`update_contact_frame`]: the name
+/// as written (cut to the field). Without `lastmod` the device stamps the
+/// record with its clock, which is not known here.
+fn as_stored(contact: &Contact, lastmod: Option<u32>) -> Contact {
+    let mut stored = contact.clone();
+    stored.name_raw = contact.name_field();
+    stored.name = crate::protocol::bytes::text_until_nul(&stored.name_raw);
+    if let Some(lastmod) = lastmod {
+        stored.lastmod = lastmod;
+    }
+    stored
 }
 
 impl MeshCore {
@@ -169,18 +186,12 @@ impl MeshCore {
     }
 
     /// Writes a contact to the device (adding it if new) and the cache.
-    /// Without `lastmod` the device stamps the record with its clock.
+    /// Without `lastmod` the device stamps the record with its clock, which
+    /// the cache does not learn: it keeps the contact's `lastmod` then.
     pub async fn update_contact(&self, contact: &Contact, lastmod: Option<u32>) -> Result<()> {
         let frame = update_contact_frame(contact, lastmod)?;
         self.request_ok(&frame).await?;
-        // The cache holds what the device stored, the name as written.
-        let mut cached = contact.clone();
-        cached.name_raw = contact.name_field();
-        cached.name = crate::protocol::bytes::text_until_nul(&cached.name_raw);
-        if let Some(lastmod) = lastmod {
-            cached.lastmod = lastmod;
-        }
-        self.state().upsert_contact(cached);
+        self.state().upsert_contact(as_stored(contact, lastmod));
         Ok(())
     }
 
@@ -216,7 +227,7 @@ impl MeshCore {
         changed.out_path_len = PathLen::new(hops, hash_mode)?;
         changed.out_path = path.to_vec();
         self.update_contact(&changed, None).await?;
-        Ok(changed)
+        Ok(as_stored(&changed, None))
     }
 
     /// Sets a contact's flags. Returns the contact as written.
@@ -224,7 +235,7 @@ impl MeshCore {
         let mut changed = contact.clone();
         changed.flags = flags;
         self.update_contact(&changed, None).await?;
-        Ok(changed)
+        Ok(as_stored(&changed, None))
     }
 
     /// Sets which adverts the device adds as contacts by itself, and

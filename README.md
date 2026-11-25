@@ -279,7 +279,8 @@ to send and logs that the transport is not connected.
 ## Differences from meshcore_py
 
 The library differs from meshcore_py in these points, most of them where the
-firmware behaves differently from what meshcore_py expects:
+firmware behaves differently from what meshcore_py expects or where
+meshcore_py leaves a gap:
 
 - The TX power is a signed byte (the firmware takes -9 dBm and up); meshcore_py
   reads 247 for -9, and its `set_tx_power` raises an error for a negative
@@ -297,8 +298,15 @@ firmware behaves differently from what meshcore_py expects:
 - `reboot` does not wait for an answer, the firmware sends none.
 - A full contact fetch replaces the cache instead of merging into it, so
   contacts removed on the device disappear.
-- `get_contact_by_key` puts the contact it reads into the cache; meshcore_py's
-  cache takes contacts from contact lists only.
+- The contact cache follows what the client does to the device's contacts
+  (`add_contact`, `update_contact`, `remove_contact`, `reset_path`,
+  `change_contact_path`, `change_contact_flags`, `get_contact_by_key`) and
+  drops the contacts the device deletes to make room (`ContactDeleted`);
+  meshcore_py's cache takes contacts from contact lists only, and its commands
+  change at most the contact they are given.
+- `self_info()` follows the name, location, TX power and radio settings the
+  client sets; meshcore_py updates its self info only for the settings of
+  `CMD_SET_OTHER_PARAMS` and takes the others from the next `APP_START`.
 - `start_auto_message_fetching` empties the device's message queue right away
   and again after every `connect` and automatic reconnect, as the device
   reports only messages that arrive while an app is connected; meshcore_py
@@ -313,6 +321,20 @@ firmware behaves differently from what meshcore_py expects:
 - `send_msg_with_retry` to a key prefix whose contact is not found, not even
   in the contacts read for the path reset, goes on without the reset;
   meshcore_py raises an error there.
+- A command fails at once when its link drops instead of waiting for its
+  timeout, and errors of other commands do not end a wait for a remote answer.
+- `send_trace` refuses an empty path before sending; the firmware only traces
+  along at least one hop.
+- `fetch_all_neighbours` stops when a page comes back empty; meshcore_py asks
+  again forever.
+- A neighbours answer to a request sent with `send_binary_req` is read too,
+  with the prefix length from the request; meshcore_py logs an error for it.
+  Prefixes asked for longer than 32 bytes are read at the 32 the repeater
+  sends, where meshcore_py misreads the entries.
+- `get_self_telemetry` takes only the answer with the device's own key, not
+  a late answer to an earlier telemetry request of another node.
+- `set_channel` keeps the channel's secret for the RX log as `get_channel`
+  does; meshcore_py learns secrets from `get_channel` only.
 - An RX log packet that was logged before its channel was known is decrypted
   when it comes again.
 - A group text in the RX log that ends within its channel hash and MAC, or an
@@ -329,20 +351,6 @@ firmware behaves differently from what meshcore_py expects:
   so a frame that starts right behind it (after console output ending in `>`)
   is still read; meshcore_py drops the whole three byte header and loses that
   frame.
-- `set_channel` keeps the channel's secret for the RX log as `get_channel`
-  does; meshcore_py learns secrets from `get_channel` only.
-- A command fails at once when its link drops instead of waiting for its
-  timeout, and errors of other commands do not end a wait for a remote answer.
-- `send_trace` refuses an empty path before sending; the firmware only traces
-  along at least one hop.
-- `fetch_all_neighbours` stops when a page comes back empty; meshcore_py asks
-  again forever.
-- A neighbours answer to a request sent with `send_binary_req` is read too,
-  with the prefix length from the request; meshcore_py logs an error for it.
-  Prefixes asked for longer than 32 bytes are read at the 32 the repeater
-  sends, where meshcore_py misreads the entries.
-- `get_self_telemetry` takes only the answer with the device's own key, not
-  a late answer to an earlier telemetry request of another node.
 - Names are cut to the 31 bytes the firmware keeps, at a character boundary:
   contact names, which meshcore_py writes uncut (a name over 32 bytes shifts
   the fields after it), and node and channel names, which the firmware would
@@ -351,10 +359,11 @@ firmware behaves differently from what meshcore_py expects:
   is sent; meshcore_py sends it, and the firmware cuts it short over serial and
   drops it over BLE.
 - A text the firmware would not send whole is refused too: a private message
-  or CLI command to a node over 160 bytes (`MAX_TEXT_LENGTH`), which the
-  firmware answers with `ERR_CODE_TABLE_FULL`, a channel message that does not
-  fit 160 bytes together with the node name and `": "`, and a login password
-  over 15 bytes; the firmware cuts these two short.
+  or CLI command to a node over 160 bytes (`MAX_TEXT_LENGTH`; a private
+  message from its fifth attempt on over 158), which the firmware answers
+  with `ERR_CODE_TABLE_FULL`, a channel message that does not fit 160 bytes
+  together with the node name and `": "`, and a login password over 15 bytes;
+  the firmware cuts these two short.
 - Input the firmware would answer as an unknown command is refused as well:
   an empty private message, node name or CLI command to a node, a CLI command
   on the device (`run_cli_command`) under 2 bytes, a custom variable whose
@@ -372,13 +381,14 @@ firmware behaves differently from what meshcore_py expects:
 - A path its length byte cannot describe is refused before sending: one that
   is not a whole number of hops, has more than 63 hops or more than 64 bytes,
   or uses hash mode 3 (reserved) or above (`change_contact_path`,
-  `send_channel_data`, `send_raw_data` and `parse_path_hex`), and a contact
-  path that does not match its length byte or is longer than 64 bytes
-  (`update_contact`). meshcore_py sends such a path. It counts only whole
-  hops, so the firmware takes fewer and, in channel data, reads the rest as
-  the data type. It packs hop count and hash mode into one byte unchecked, so
-  more hops spill into the mode bits, and mode 4 and above raise an error. A
-  contact path over 64 bytes goes out uncut and shifts the fields after it.
+  `send_channel_data` and `send_raw_data`; `parse_path_hex` refuses such a
+  hash mode too), and a contact path that does not match its length byte or
+  is longer than 64 bytes (`update_contact`). meshcore_py sends such a path.
+  It counts only whole hops, so the firmware takes fewer and, in channel
+  data, reads the rest as the data type. It packs hop count and hash mode
+  into one byte unchecked, so more hops spill into the mode bits, and mode 4
+  and above raise an error. A contact path over 64 bytes goes out uncut and
+  shifts the fields after it.
 - Over serial, the client waits 300 ms after opening the port, then reads and
   drops for 500 ms what the board sent before (boot output, an answer of an
   earlier session); meshcore_py reads from the first byte on, where a stale
