@@ -387,7 +387,7 @@ impl MeshCore {
     /// The device's own telemetry.
     pub async fn get_self_telemetry(&self) -> Result<TelemetryResponse> {
         let frame = [CommandType::SendTelemetryReq.code(), 0, 0, 0];
-        let turn = self.turn().await;
+        let mut turn = self.turn().await;
         // The answer carries the device's own key prefix; an answer to an
         // earlier send_telemetry_req carries the other node's.
         let own = self.state().own_key.map(|key| key.prefix());
@@ -669,7 +669,7 @@ impl MeshCore {
         }
         // meshcore_py's text, dash included.
         log::warn!(target: "meshcore", "Executing factory reset — all device data will be erased");
-        let turn = self.turn().await;
+        let mut turn = self.turn().await;
         let reset: Change = Box::new(|state, answer| {
             if answer != Answer::Refused {
                 state.forget_device();

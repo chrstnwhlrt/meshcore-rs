@@ -26,6 +26,7 @@ pub struct Device {
     closes: Arc<AtomicUsize>,
     write_hangs: Arc<AtomicBool>,
     write_takes: Arc<Mutex<Duration>>,
+    write_drops_link: Arc<AtomicBool>,
     during_open: Arc<Mutex<Option<BoxFuture<'static, ()>>>>,
     exclusive: Arc<AtomicBool>,
     in_use: Arc<AtomicBool>,
@@ -84,6 +85,12 @@ impl Device {
     /// Makes writing a frame never finish, as when the device takes no bytes.
     pub fn hang_on_write(&self) {
         self.write_hangs.store(true, Ordering::SeqCst);
+    }
+
+    /// Makes the link drop with the next frame that is written, as over BLE
+    /// with one that restarts the device.
+    pub fn drop_link_on_write(&self) {
+        self.write_drops_link.store(true, Ordering::SeqCst);
     }
 
     /// Every frame the client sent, in order.
@@ -173,7 +180,11 @@ impl FrameWriter for MockWriter {
             }
             self.frames
                 .send(frame.to_vec())
-                .map_err(|_| meshcore::Error::NotConnected)
+                .map_err(|_| meshcore::Error::NotConnected)?;
+            if self.device.write_drops_link.swap(false, Ordering::SeqCst) {
+                self.device.drop_link().await;
+            }
+            Ok(())
         })
     }
 
@@ -274,6 +285,7 @@ pub fn client_on_device(
         closes: Arc::default(),
         write_hangs: Arc::default(),
         write_takes: Arc::default(),
+        write_drops_link: Arc::default(),
         during_open: Arc::default(),
         exclusive: Arc::default(),
         in_use: Arc::default(),

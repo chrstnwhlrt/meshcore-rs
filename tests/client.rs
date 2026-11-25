@@ -357,6 +357,36 @@ async fn a_frame_is_written_to_its_end_when_its_command_is_given_up() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_command_that_is_not_sent_changes_nothing() {
+    // given up while its frame waits behind one that is being written, or its
+    // link drops meanwhile
+    for lost in [false, true] {
+        let (mc, device) = client(Options::default(), one_contact);
+        let alice = key();
+        mc.connect().await.unwrap();
+        mc.get_contacts(0).await.unwrap();
+        let token = mc.request_factory_reset();
+        device.slow_write(Duration::from_secs(1));
+        let time = tokio::time::timeout(Duration::from_millis(50), mc.get_time());
+        assert!(time.await.is_err());
+        let path = tokio::time::timeout(Duration::from_millis(50), mc.reset_path(&alice));
+        assert!(path.await.is_err());
+        let reset = tokio::time::timeout(Duration::from_millis(50), async {
+            if lost {
+                device.drop_link().await;
+            }
+            mc.confirm_factory_reset(&token).await
+        });
+        assert!(!matches!(reset.await, Ok(Ok(()))));
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(mc.self_info().is_some() && mc.contact(&alice).is_some());
+        assert!(!mc.contacts_dirty());
+        assert_eq!(device.commands_with(13), Vec::<Vec<u8>>::new());
+        assert_eq!(device.commands_with(51), Vec::<Vec<u8>>::new());
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_connect_without_an_answer_leaves_a_later_one_alone() {
     // APP_START is answered only on the second link
     let answered = Arc::new(AtomicU32::new(0));
@@ -640,6 +670,28 @@ async fn reboot_does_not_wait_for_an_answer() {
     mc.reboot().await.unwrap();
     device.settle().await;
     assert_eq!(device.commands_with(19), vec![b"\x13reboot".to_vec()]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_command_the_link_drops_with_counts_as_sent() {
+    // over BLE the device restarts before it confirms the write
+    let (mc, device) = client(Options::default(), |_| vec![]);
+    mc.connect().await.unwrap();
+    device.drop_link_on_write();
+    mc.reboot().await.unwrap();
+    device.settle().await;
+    assert!(!mc.is_connected());
+
+    mc.connect().await.unwrap();
+    let token = mc.request_factory_reset();
+    device.drop_link_on_write();
+    mc.confirm_factory_reset(&token).await.unwrap();
+    assert_eq!(mc.self_info(), None);
+
+    // one that waits for a reply gets none
+    mc.connect().await.unwrap();
+    device.drop_link_on_write();
+    assert!(matches!(mc.get_bat().await, Err(Error::ConnectionLost)));
 }
 
 #[tokio::test(start_paused = true)]
@@ -1341,35 +1393,43 @@ async fn an_anonymous_request_given_up_halfway_still_resets_the_path() {
 
 #[tokio::test(start_paused = true)]
 async fn a_zero_hop_change_without_an_answer_is_set_back_to_flood() {
-    // the device may have taken the change whose answer never came
-    let options = Options {
-        default_timeout: Duration::from_secs(1),
-        ..Options::default()
-    };
-    let (mc, device) = client(options, |cmd| match cmd[0] {
-        30 => vec![contact_frame(3, KEY, "Rep", 0xff, &[])],
-        13 => vec![ok()],
-        _ => vec![],
-    });
-    mc.connect().await.unwrap();
-    mc.cache_contact(Contact::new(key(), ContactType::Repeater, "Rep"));
-    let result = mc
-        .send_anon_req(
-            &key(),
-            meshcore::AnonReqType::Owner,
-            RequestOptions::default(),
-        )
-        .await;
-    assert!(matches!(result, Err(Error::Timeout)));
-    let codes: Vec<u8> = device
-        .commands()
-        .iter()
-        .map(|c| c[0])
-        .filter(|&c| c != 1)
-        .collect();
-    // read the device's record, query the hash mode, set zero-hop, reset
-    assert_eq!(codes, vec![30, 22, 9, 13]);
-    assert!(mc.contact(&key()).unwrap().is_flood());
+    // the device may have taken the change whose answer never came, or could
+    // not be read
+    for unreadable in [false, true] {
+        let options = Options {
+            default_timeout: Duration::from_secs(1),
+            ..Options::default()
+        };
+        let (mc, device) = client(options, move |cmd| match cmd[0] {
+            30 => vec![contact_frame(3, KEY, "Rep", 0xff, &[])],
+            9 if unreadable => vec![vec![24]],
+            13 => vec![ok()],
+            _ => vec![],
+        });
+        mc.connect().await.unwrap();
+        mc.cache_contact(Contact::new(key(), ContactType::Repeater, "Rep"));
+        let result = mc
+            .send_anon_req(
+                &key(),
+                meshcore::AnonReqType::Owner,
+                RequestOptions::default(),
+            )
+            .await;
+        if unreadable {
+            assert!(matches!(result, Err(Error::Protocol(_))));
+        } else {
+            assert!(matches!(result, Err(Error::Timeout)));
+        }
+        let codes: Vec<u8> = device
+            .commands()
+            .iter()
+            .map(|c| c[0])
+            .filter(|&c| c != 1)
+            .collect();
+        // read the device's record, query the hash mode, set zero-hop, reset
+        assert_eq!(codes, vec![30, 22, 9, 13]);
+        assert!(mc.contact(&key()).unwrap().is_flood());
+    }
 }
 
 #[tokio::test(start_paused = true)]

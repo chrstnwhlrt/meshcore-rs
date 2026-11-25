@@ -447,7 +447,7 @@ impl MeshCore {
         text: &str,
         timestamp: Option<u32>,
     ) -> Result<()> {
-        let turn = self.turn().await;
+        let mut turn = self.turn().await;
         // An empty channel message is fine with the firmware ("<name>: "). The
         // node name is known once connected; before, the limit is the one for
         // the shortest name.

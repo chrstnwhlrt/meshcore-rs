@@ -96,8 +96,8 @@ pub enum Error {
     /// range, the device lacks the UART service, or the adapter is off.
     DeviceNotFound(String),
     /// Another program on this computer has a BLE connection to the device and
-    /// gets its frames; using that connection too would mix both programs'
-    /// frames.
+    /// gets its frames (using that connection too would mix both programs'
+    /// frames), or is making one.
     DeviceInUse(String),
     /// BLE pairing failed: the device did not take the PIN, or it needs one
     /// that was not given (it is not paired, or it forgot the pairing).

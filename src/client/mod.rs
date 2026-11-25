@@ -85,6 +85,9 @@ struct LinkHandle {
 /// A frame to write, and where to tell how that went.
 struct Outgoing {
     frame: Vec<u8>,
+    /// Told right before it is written. The command was given up when nobody
+    /// listens any more.
+    begun: oneshot::Sender<()>,
     written: oneshot::Sender<Result<()>>,
 }
 
@@ -294,26 +297,33 @@ impl std::fmt::Debug for MeshCore {
     }
 }
 
-/// A command's turn: frames go out only in one, so replies can be matched to
-/// the command in flight. When it ends, also because the command is given up,
-/// the reader expects no reply to it any more.
+/// A command's turn: its frame goes out only in one, so replies can be matched
+/// to the command in flight. When it ends, also because the command is given
+/// up, the reader expects no reply to it any more.
 struct Turn<'a> {
     client: &'a MeshCore,
+    /// Told when the frame goes out.
+    begun: Option<oneshot::Receiver<()>>,
     _lock: tokio::sync::MutexGuard<'a, ()>,
 }
 
 impl Drop for Turn<'_> {
     fn drop(&mut self) {
-        self.client.state().end_command();
+        let went_out = self.begun.take().is_some_and(|mut begun| {
+            // From here on the frame does not go out any more.
+            begun.close();
+            begun.try_recv().is_ok()
+        });
+        self.client.state().end_command(went_out);
     }
 }
 
 impl Turn<'_> {
-    /// Sends a frame; returns the generation of the link it went out on and
+    /// Sends the frame; returns the generation of the link it went out on and
     /// the events from right before. `prepare` tells the reader what the reply
     /// is for, when there is a link to send on.
     async fn send(
-        &self,
+        &mut self,
         frame: &[u8],
         prepare: impl FnOnce(&mut State) + Send,
     ) -> Result<(u64, Subscription)> {
@@ -338,10 +348,17 @@ impl Turn<'_> {
                 self.client.subscribe(),
             )
         };
+        let (begun, begins) = oneshot::channel();
         let (written, outcome) = oneshot::channel();
+        self.begun = Some(begins);
         let frame = frame.to_vec();
+        let outgoing = Outgoing {
+            frame,
+            begun,
+            written,
+        };
         // The other ends go when the link is taken down.
-        let sent = frames.send(Outgoing { frame, written }).await;
+        let sent = frames.send(outgoing).await;
         sent.map_err(|_| Error::ConnectionLost)?;
         outcome.await.map_err(|_| Error::ConnectionLost)??;
         Ok((generation, events))
@@ -350,7 +367,7 @@ impl Turn<'_> {
     /// Sends a command and waits for the reply `extract` accepts; returns it
     /// and the events from then on.
     async fn request<T>(
-        &self,
+        &mut self,
         frame: &[u8],
         timeout: Duration,
         extract: impl FnMut(&Event) -> Option<T>,
@@ -363,9 +380,9 @@ impl Turn<'_> {
     /// Sends a command that changes what the client holds. The reader notes the
     /// change when the device's answer comes, whenever this future is polled
     /// next; without one, it is noted when the turn ends that the answer is not
-    /// known.
+    /// known, if the frame went out.
     async fn request_change<T>(
-        &self,
+        &mut self,
         frame: &[u8],
         change: Change,
         extract: impl FnMut(&Event) -> Option<T>,
@@ -515,10 +532,10 @@ impl MeshCore {
     ///
     /// [`Error::DeviceNotFound`] when no matching device is in range,
     /// [`Error::DeviceInUse`] when another program on this computer is
-    /// connected to it, [`Error::PairingFailed`] when the device does not
-    /// take the PIN or needs one that was not given, [`Error::Ble`] when
-    /// connecting fails otherwise, [`Error::Timeout`] when it takes too long
-    /// or the device does not answer.
+    /// connected or connecting to it, [`Error::PairingFailed`] when the device
+    /// does not take the PIN or needs one that was not given, [`Error::Ble`]
+    /// when connecting fails otherwise, [`Error::Timeout`] when it takes too
+    /// long or the device does not answer.
     #[cfg(all(feature = "ble", target_os = "linux"))]
     pub async fn create_ble(
         config: crate::transport::ble::BleConfig,
@@ -763,7 +780,8 @@ impl MeshCore {
     /// cache with other contacts than the device holds, or since it started an
     /// advert or path update arrived, a link was opened (the device reports
     /// those only while an app is connected), or a command that changes a
-    /// contact got no answer or was refused for one the cache holds.
+    /// contact went out and got no answer, or was refused for one the cache
+    /// holds.
     #[must_use]
     pub fn contacts_dirty(&self) -> bool {
         self.state().contacts_dirty
@@ -984,6 +1002,7 @@ impl MeshCore {
         let lock = self.inner.cmd_lock.lock().await;
         Turn {
             client: self,
+            begun: None,
             _lock: lock,
         }
     }
@@ -1010,7 +1029,7 @@ impl MeshCore {
         timeout: Duration,
         extract: impl FnMut(&Event) -> Option<T>,
     ) -> Result<(T, Subscription)> {
-        let turn = self.turn().await;
+        let mut turn = self.turn().await;
         turn.request(frame, timeout, extract).await
     }
 
@@ -1022,7 +1041,7 @@ impl MeshCore {
         change: Change,
         extract: impl FnMut(&Event) -> Option<T>,
     ) -> Result<T> {
-        let turn = self.turn().await;
+        let mut turn = self.turn().await;
         turn.request_change(frame, change, extract).await
     }
 
@@ -1047,7 +1066,7 @@ impl MeshCore {
 
     /// Sends a command the device does not answer.
     async fn send_only(&self, frame: &[u8]) -> Result<()> {
-        let turn = self.turn().await;
+        let mut turn = self.turn().await;
         turn.send(frame, |_| ()).await.map(drop)
     }
 }
@@ -1150,15 +1169,16 @@ async fn write_link(
     mut close: oneshot::Receiver<()>,
     closing: watch::Sender<()>,
 ) {
-    while let Some(Some(Outgoing { frame, written })) = until(&mut close, outgoing.recv()).await {
+    while let Some(Some(next)) = until(&mut close, outgoing.recv()).await {
         // A command given up before its turn is not sent any more.
-        if written.is_closed() {
+        if next.begun.send(()).is_err() {
             continue;
         }
-        let Some(result) = until(&mut close, writer.write_frame(&frame)).await else {
+        let write = writer.write_frame(&next.frame);
+        let Some(result) = until(&mut close, write).await else {
             break;
         };
-        let _ = written.send(result);
+        let _ = next.written.send(result);
     }
     // The commands that wait end now, however long closing takes.
     drop(outgoing);

@@ -112,7 +112,7 @@ impl Turn<'_> {
     /// Asks for the contacts and waits for the list to start; returns the
     /// generation of its link and the events from then on. An end before the
     /// start belongs to an earlier list that went on after its request gave up.
-    async fn start_contacts(&self, lastmod: u32) -> Result<(u64, Subscription)> {
+    async fn start_contacts(&mut self, lastmod: u32) -> Result<(u64, Subscription)> {
         let mut frame = vec![CommandType::GetContacts.code()];
         if lastmod > 0 {
             frame.extend_from_slice(&lastmod.to_le_bytes());
@@ -149,7 +149,7 @@ impl MeshCore {
     /// [`ErrorCode::BadState`](crate::ErrorCode::BadState) while such a list
     /// is still coming.
     pub async fn get_contacts(&self, lastmod: u32) -> Result<ContactList> {
-        let turn = self.turn().await;
+        let mut turn = self.turn().await;
         let (link, mut events) = turn.start_contacts(lastmod).await?;
         read_contacts(link, &mut events).await
     }
@@ -159,7 +159,7 @@ impl MeshCore {
     /// [`Event::Contacts`], and the cache takes them as with
     /// [`get_contacts`](Self::get_contacts).
     pub async fn get_contacts_async(&self, lastmod: u32) -> Result<()> {
-        let turn = self.turn().await;
+        let mut turn = self.turn().await;
         turn.start_contacts(lastmod).await.map(drop)
     }
 
@@ -214,7 +214,7 @@ impl MeshCore {
         let key = *key;
         let frame = key_frame(CommandType::RemoveContact, &key);
         let change = contact_change(key, move |state| drop(state.remove_contact(&key)));
-        let turn = self.turn().await;
+        let mut turn = self.turn().await;
         self.state().removing_contact();
         turn.request_change(&frame, change, reply!(Event::Ok { .. } => ()))
             .await

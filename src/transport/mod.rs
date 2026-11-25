@@ -33,7 +33,8 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub enum LinkEvent {
     /// A complete frame from the device.
     Frame(Vec<u8>),
-    /// The link is down; no further events follow.
+    /// The link is down; no further events follow. A write that is not done
+    /// by then is given up.
     Closed(String),
 }
 
@@ -41,8 +42,10 @@ pub enum LinkEvent {
 pub trait FrameWriter: Send {
     /// Writes one frame (the payload; the transport adds any framing). When
     /// it cannot, it also reports the link [closed](LinkEvent::Closed), so that
-    /// the client takes it down. The future is dropped unfinished only when the
-    /// link is taken down.
+    /// the client takes it down. When the link drops with a frame that went
+    /// out, as with a command that restarts the device, it reports that too,
+    /// but no error. The future is dropped unfinished only when the link is
+    /// taken down.
     fn write_frame<'a>(&'a mut self, frame: &'a [u8]) -> BoxFuture<'a, Result<()>>;
 
     /// Closes the link: when the client disconnects or is dropped, and after

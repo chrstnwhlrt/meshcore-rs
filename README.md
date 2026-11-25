@@ -143,16 +143,19 @@ PIN the library writes nothing to an unpaired device, because MeshCore takes
 frames only over a paired link and leaving the pairing to the desktop's agent
 can leave BlueZ stuck. A missing or wrong PIN ends in `Error::PairingFailed`.
 After the device was flashed anew, it has forgotten the pairing BlueZ still
-keeps; with the PIN the library removes the old pairing and pairs again.
+keeps. BlueZ then only tells that the link drops while it is being made, as it
+may also do when the radio link is bad. When that happens three times in a row,
+the library removes the old pairing and pairs again if it has the PIN; without
+it, connecting ends in `Error::PairingFailed`.
 
 A device this computer is still connected to does not advertise, but the scan
 lists it (without RSSI) and a name search finds it. The library uses such a
 link when no program uses it, as after a program ended without disconnecting.
 While another program on this computer gets the device's frames over it,
 connecting fails with `Error::DeviceInUse` rather than mixing the frames of both
-programs. When a program has just let go of the device, BlueZ shows the link as
-connected for 2 s more but no longer serves it, so the library waits for that
-link to go and connects anew.
+programs, and so it does while another program is connecting. When a program has
+just let go of the device, BlueZ shows the link as connected for 2 s more but no
+longer serves it, so the library waits for that link to go and connects anew.
 
 BlueZ keeps a link up after its program is gone, and the device does not
 advertise meanwhile. So call `disconnect` before the program ends; it waits the
@@ -353,10 +356,11 @@ meshcore_py leaves a gap:
   drops the contacts the device deletes to make room (`ContactDeleted`).
   A contact list coming in meanwhile (as with `get_contacts_async`) does not
   undo such a change with the older copy it brought before. When such a command
-  ends without an answer (its link drops, it runs into its timeout or is given
-  up), the device may have taken it, so the contact counts as changed until a
-  list brings it or a full one was read. So does a cached contact for which the
-  device refuses one, as it may not hold the contact any more.
+  went out and ends without an answer (its link drops, it runs into its timeout
+  or is given up), the device may have taken it, so the contact counts as
+  changed until a list brings it or a full one was read. So does a cached
+  contact for which the device refuses one, as it may not hold the contact any
+  more.
   meshcore_py's cache gains contacts only through contact lists and never
   loses one; its commands change at most the path and flags of a contact it
   holds.

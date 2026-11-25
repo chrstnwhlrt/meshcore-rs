@@ -148,7 +148,7 @@ impl MeshCore {
         frame: &[u8],
         prepared: PreparedRequest,
     ) -> Result<(SentInfo, Subscription)> {
-        let turn = self.turn().await;
+        let mut turn = self.turn().await;
         let expect = |state: &mut State| state.prepared = Some(prepared);
         let (link, mut events) = turn.send(frame, expect).await?;
         let sent = reply!(Event::MessageSent(sent) => *sent);
@@ -495,9 +495,12 @@ impl MeshCore {
                 log::info!(target: "meshcore", "No path set trying zero hop");
                 flood_again.client = Some(self.clone());
                 if let Err(err) = self.change_contact_path(contact, &[], None).await {
-                    // Without an answer the device may have taken the change.
-                    if matches!(err, Error::Timeout | Error::ConnectionLost)
-                        && let Err(reset_err) = self.reset_path(dst).await
+                    // Without an answer that could be read the device may have
+                    // taken the change.
+                    if matches!(
+                        err,
+                        Error::Timeout | Error::ConnectionLost | Error::Protocol(_)
+                    ) && let Err(reset_err) = self.reset_path(dst).await
                     {
                         log::warn!(
                             target: "meshcore",

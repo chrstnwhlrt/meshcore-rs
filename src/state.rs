@@ -116,7 +116,8 @@ pub(crate) struct State {
     pub(crate) contacts_request_since: Option<u32>,
     building: Option<ContactsInProgress>,
     /// What the command in flight changes: noted when the device answers,
-    /// before any later frame is read, or when the command ends.
+    /// before any later frame is read, or when the command ends after it went
+    /// out.
     pub(crate) change: Option<Change>,
     pub(crate) prepared: Option<PreparedRequest>,
     pending: HashMap<u32, PendingRequest>,
@@ -570,10 +571,14 @@ impl State {
     }
 
     /// The command in flight has ended, or was given up: a reply to it that
-    /// comes later is not taken for it.
-    pub(crate) fn end_command(&mut self) {
+    /// comes later is not taken for it. One that did not go out changes
+    /// nothing.
+    pub(crate) fn end_command(&mut self, went_out: bool) {
         self.contacts_request_since = None;
         self.prepared = None;
+        if !went_out {
+            self.change = None;
+        }
         self.note_change(Answer::Unknown);
     }
 
@@ -1170,7 +1175,7 @@ mod tests {
                 state.handle_frame(&[2, 1, 0, 0, 0]);
             }
             // the list's request was given up, the import has come since
-            state.end_command();
+            state.end_command(true);
             state.own_key_imported();
             if !started {
                 state.handle_frame(&[2, 1, 0, 0, 0]);
@@ -1199,12 +1204,17 @@ mod tests {
             state.handle_frame(answer);
             // once, before the command ends, if it is one of the answers
             assert_eq!(state.change.is_none(), noted < 3);
-            state.end_command();
+            state.end_command(true);
             assert_eq!(state.time, noted);
         }
+        // nothing, if the command did not go out
+        state.change = Some(change());
+        state.time = 0;
+        state.end_command(false);
+        assert_eq!((state.time, state.change.is_none()), (0, true));
         // an OK that comes later is no answer to it
         state.handle_frame(&[0]);
-        assert_eq!(state.time, 3);
+        assert_eq!(state.time, 0);
         // another device's self info leaves the command in flight alone
         state.handle_frame(&self_info_frame());
         state.change = Some(change());
