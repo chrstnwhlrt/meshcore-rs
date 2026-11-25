@@ -46,9 +46,11 @@ pub fn encode(payload: &[u8]) -> Result<Vec<u8>> {
 /// Splits the device's byte stream into frames.
 ///
 /// Bytes before a start byte are skipped: some radios print console output on
-/// the same UART. A header announcing an empty frame or more than
-/// [`MAX_ACCEPTED_FRAME_SIZE`] bytes is dropped, and the search for the next
-/// start byte goes on after it.
+/// the same UART. A start byte whose header announces more than
+/// [`MAX_ACCEPTED_FRAME_SIZE`] bytes is skipped alone, as a frame may start
+/// inside that header, and the search goes on right after it. A header
+/// announcing no bytes gives an empty frame, which the client logs as
+/// meshcore_py does.
 #[derive(Debug, Default)]
 pub struct FrameDecoder {
     buffer: Vec<u8>,
@@ -80,9 +82,9 @@ impl FrameDecoder {
                 break;
             }
             let len = usize::from(u16::from_le_bytes([self.buffer[1], self.buffer[2]]));
-            if len == 0 || len > MAX_ACCEPTED_FRAME_SIZE {
-                log::debug!(target: "meshcore", "skipping frame header announcing {len} bytes");
-                self.buffer.drain(..3);
+            if len > MAX_ACCEPTED_FRAME_SIZE {
+                log::debug!(target: "meshcore", "skipping a start byte announcing {len} bytes");
+                self.buffer.drain(..1);
                 continue;
             }
             if self.buffer.len() < 3 + len {
@@ -166,6 +168,24 @@ mod tests {
         let mut data = vec![FRAME_START_IN, 0xff, 0xff];
         data.extend(device_frame(b"ok"));
         assert_eq!(decoder.feed(&data), vec![b"ok".to_vec()]);
+    }
+
+    #[test]
+    fn a_frame_right_behind_a_stray_start_byte_is_kept() {
+        let mut decoder = FrameDecoder::new();
+        // console text ending in '>', then a frame: the bogus header takes the
+        // frame's start byte and length
+        let mut data = b"tx -->".to_vec();
+        data.extend(device_frame(&[0xaa, 0xbb]));
+        assert_eq!(decoder.feed(&data), vec![vec![0xaa, 0xbb]]);
+    }
+
+    #[test]
+    fn empty_frames_are_passed_on() {
+        let mut decoder = FrameDecoder::new();
+        let mut data = vec![FRAME_START_IN, 0, 0];
+        data.extend(device_frame(b"ok"));
+        assert_eq!(decoder.feed(&data), vec![Vec::new(), b"ok".to_vec()]);
     }
 
     #[test]

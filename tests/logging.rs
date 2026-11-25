@@ -84,12 +84,14 @@ async fn hints_at_sync_variants(mc: &MeshCore, key: &PublicKey) {
     );
 }
 
-/// Replies the reader cannot read: stats and the private key have lines of
-/// their own, the others share meshcore_py's line for an exception (here a
-/// self info cut short, where meshcore_py runs out of bytes).
+/// Frames the reader cannot read: an empty one, stats and the private key
+/// have lines of their own, the others share meshcore_py's line for an
+/// exception (here a self info cut short, where meshcore_py runs out of
+/// bytes).
 async fn unreadable_replies(device: &Device) {
     let lines = lines_of(async {
         for frame in [
+            vec![],
             vec![24],
             vec![24, 0, 1],
             vec![24, 9],
@@ -104,6 +106,7 @@ async fn unreadable_replies(device: &Device) {
     assert_eq!(
         lines,
         [
+            "WARN:Received empty packet: index out of range",
             "ERROR:Stats response too short: 1 bytes, need at least 2 for header",
             "ERROR:Stats core response too short: 3 bytes, expected 11",
             "ERROR:Unknown stats type: 9, data: 1809",

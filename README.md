@@ -325,6 +325,10 @@ firmware behaves differently from what meshcore_py expects:
   `parse_error` where a missing byte raises an exception. A neighbours or
   node discovery answer cut short likewise comes only as its raw
   `BinaryResponse` or `ControlData`.
+- A start byte whose header announces more than 300 bytes is skipped alone,
+  so a frame that starts right behind it (after console output ending in `>`)
+  is still read; meshcore_py drops the whole three byte header and loses that
+  frame.
 - `set_channel` keeps the channel's secret for the RX log as `get_channel`
   does; meshcore_py learns secrets from `get_channel` only.
 - A command fails at once when its link drops instead of waiting for its
@@ -375,6 +379,14 @@ firmware behaves differently from what meshcore_py expects:
   the data type. It packs hop count and hash mode into one byte unchecked, so
   more hops spill into the mode bits, and mode 4 and above raise an error. A
   contact path over 64 bytes goes out uncut and shifts the fields after it.
+- Over serial, the client waits 300 ms after opening the port, then reads and
+  drops for 500 ms what the board sent before (boot output, an answer of an
+  earlier session); meshcore_py reads from the first byte on, where a stale
+  answer can pass for the reply to `APP_START`.
+- Over TCP the connection info (`connection_info()`, the `connected` event) is
+  `host:port`, where meshcore_py gives the host only, and connecting gives up
+  after 10 s (`TcpTransport::connect_timeout`), where meshcore_py waits as
+  long as the system does.
 - A BLE scan or name search also finds a device this computer is still
   connected to, for example right after another program let go of it;
   meshcore_py finds only advertising devices and misses it for a few seconds.
