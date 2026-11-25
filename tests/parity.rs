@@ -52,6 +52,36 @@ fn connection_events_serialize_like_meshcore_py() {
     );
 }
 
+#[test]
+fn unreadable_replies_serialize_like_meshcore_py() {
+    let json = |packet_type, reason: &str| {
+        serde_json::to_string(&Event::Error(meshcore::ErrorInfo {
+            code: None,
+            reason: Some(reason.into()),
+            packet_type: Some(packet_type),
+        }))
+        .unwrap()
+    };
+    // reader.py reports MSG_SENT, TUNING_PARAMS and STATS replies it cannot
+    // read without the packet type, the others with it
+    assert_eq!(
+        json(6, "invalid_frame_length"),
+        r#"{"reason":"invalid_frame_length"}"#
+    );
+    assert_eq!(
+        json(23, "invalid_frame_length"),
+        r#"{"reason":"invalid_frame_length"}"#
+    );
+    assert_eq!(
+        json(24, "unknown_stats_type: 9"),
+        r#"{"reason":"unknown_stats_type: 9"}"#
+    );
+    assert_eq!(
+        json(27, "invalid_frame_length"),
+        r#"{"reason":"invalid_frame_length","packet_type":27}"#
+    );
+}
+
 /// Removes the receive time, which is the time of the run.
 fn without_recv_time(line: &str) -> String {
     let Some(start) = line.find(r#""recv_time":"#) else {

@@ -11,6 +11,7 @@ use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
 use crate::event::{ErrorInfo, Event};
 use crate::hex::encode as hex;
 use crate::lpp::{LppReading, LppType, LppValue, Telemetry};
+use crate::protocol::codes::PacketType;
 use crate::protocol::path::PathLen;
 use crate::types::{
     Ack, AclEntry, AclResponse, AdvertPath, AnonOwner, AutoAddConfig, BatteryStatus,
@@ -172,7 +173,15 @@ impl Serialize for ErrorInfo {
         if let Some(reason) = &self.reason {
             m.serialize_entry("reason", reason)?;
         }
-        if let Some(packet_type) = self.packet_type {
+        // meshcore_py reports a MSG_SENT, TUNING_PARAMS or STATS reply it
+        // cannot read without the packet type, the others with it.
+        let without_type = |code| {
+            matches!(
+                PacketType::from_code(code),
+                Some(PacketType::MsgSent | PacketType::TuningParams | PacketType::Stats)
+            )
+        };
+        if let Some(packet_type) = self.packet_type.filter(|&code| !without_type(code)) {
             m.serialize_entry("packet_type", &packet_type)?;
         }
         m.end()

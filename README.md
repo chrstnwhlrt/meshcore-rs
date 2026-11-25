@@ -294,16 +294,17 @@ meshcore_py leaves a gap:
 - MMA readings from sensors use the firmware's LPP table (humidity has 2 bytes
   in 0.1 % steps), not the CayenneLPP one. A series of a type meshcore_py does
   not know, or one cut short, ends the reading, and the series before it are
-  kept; meshcore_py drops the whole answer then.
-- `reboot` does not wait for an answer, the firmware sends none.
+  kept; meshcore_py then reports no series (`mma_data` is null for an unknown
+  type, and an answer cut short is dropped).
 - A full contact fetch replaces the cache instead of merging into it, so
   contacts removed on the device disappear.
 - The contact cache follows what the client does to the device's contacts
   (`add_contact`, `update_contact`, `remove_contact`, `reset_path`,
   `change_contact_path`, `change_contact_flags`, `get_contact_by_key`) and
   drops the contacts the device deletes to make room (`ContactDeleted`);
-  meshcore_py's cache takes contacts from contact lists only, and its commands
-  change at most the contact they are given.
+  meshcore_py's cache takes contacts from contact lists only, its
+  `reset_path` resets the cached path, and its other commands change at most
+  the contact dict they are given.
 - `self_info()` follows the name, location, TX power and radio settings the
   client sets; meshcore_py updates its self info only for the settings of
   `CMD_SET_OTHER_PARAMS` and takes the others from the next `APP_START`.
@@ -322,7 +323,7 @@ meshcore_py leaves a gap:
   in the contacts read for the path reset, goes on without the reset;
   meshcore_py raises an error there.
 - A command fails at once when its link drops instead of waiting for its
-  timeout, and errors of other commands do not end a wait for a remote answer.
+  timeout.
 - `send_trace` refuses an empty path before sending; the firmware only traces
   along at least one hop.
 - `fetch_all_neighbours` stops when a page comes back empty; meshcore_py asks
@@ -333,6 +334,11 @@ meshcore_py leaves a gap:
   sends, where meshcore_py misreads the entries.
 - `get_self_telemetry` takes only the answer with the device's own key, not
   a late answer to an earlier telemetry request of another node.
+- A contact set to zero-hop for an anonymous request (`send_anon_req`, used
+  by `req_regions_sync`, `req_owner_sync`, `req_basic_sync` and their
+  `_async` variants) is set back to flood also when the request is given up
+  halfway, as by a timeout around it; meshcore_py leaves it at zero-hop when
+  its request is cancelled there.
 - `set_channel` keeps the channel's secret for the RX log as `get_channel`
   does; meshcore_py learns secrets from `get_channel` only.
 - An RX log packet that was logged before its channel was known is decrypted

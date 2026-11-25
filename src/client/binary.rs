@@ -61,6 +61,37 @@ impl RequestOptions {
     }
 }
 
+/// Sets a contact that went zero-hop for an anonymous request back to flood
+/// when the request is given up halfway (its future dropped, as by a timeout
+/// around it): the device would keep the zero-hop path. Armed while `client`
+/// is set.
+struct FloodAgain {
+    client: Option<MeshCore>,
+    key: PublicKey,
+}
+
+impl Drop for FloodAgain {
+    fn drop(&mut self) {
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        let key = self.key;
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    if let Err(err) = client.reset_path(&key).await {
+                        log::warn!(target: "meshcore", "could not reset the path to flood: {err}");
+                    }
+                });
+            }
+            Err(_) => log::warn!(
+                target: "meshcore",
+                "no runtime to reset the path of {key} to flood"
+            ),
+        }
+    }
+}
+
 impl MeshCore {
     /// Sends a binary request (`CMD_SEND_BINARY_REQ`). The answer arrives as
     /// [`Event::BinaryResponse`] and, for status, telemetry, MMA, ACL and
@@ -376,7 +407,7 @@ impl MeshCore {
             .binary_answer(dst, BinaryReqType::Subscribe, &data, options)
             .await?;
         if answer.len() < 2 {
-            return Err(Error::protocol("subscription answer too short"));
+            return Err(Error::protocol("invalid_frame_length"));
         }
         Ok(SensorSubscription {
             expiry_secs: u16::from_le_bytes([answer[0], answer[1]]),
@@ -403,7 +434,8 @@ impl MeshCore {
     /// The request carries the reply path: the contact's out path, or
     /// zero-hop. A contact the cache holds as flood is read from the device
     /// first; if the device holds it as flood too, it is set to zero-hop for
-    /// the request and reset to flood afterwards.
+    /// the request and reset to flood afterwards, also when the request is
+    /// given up halfway (the reset then runs in the background).
     pub async fn send_anon_req(
         &self,
         dst: &PublicKey,
@@ -430,7 +462,12 @@ impl MeshCore {
             }
         }
 
-        let mut zero_hop = false;
+        // Set when the contact goes zero-hop for the request: it goes back to
+        // flood afterwards, in the background if the request is given up.
+        let mut flood_again = FloodAgain {
+            client: None,
+            key: *dst,
+        };
         let reply_path = match &contact {
             None => {
                 log::debug!(target: "meshcore", "no contact, asking for a zero-hop reply");
@@ -438,7 +475,9 @@ impl MeshCore {
             }
             Some(contact) if contact.is_flood() => {
                 log::info!(target: "meshcore", "No path set trying zero hop");
+                flood_again.client = Some(self.clone());
                 if let Err(err) = self.change_contact_path(contact, &[], None).await {
+                    flood_again.client = None;
                     // Flooded, the server would drop the request: fail now.
                     log::debug!(target: "meshcore", "could not set a zero-hop path: {err}");
                     log::error!(
@@ -447,7 +486,6 @@ impl MeshCore {
                     );
                     return Err(err);
                 }
-                zero_hop = true;
                 encode_reply_path(PathLen::ZERO_HOP, &[])
             }
             Some(contact) => encode_reply_path(contact.out_path_len, &contact.out_path),
@@ -471,8 +509,11 @@ impl MeshCore {
                 },
             )
             .await;
-        if zero_hop && let Err(err) = self.reset_path(dst).await {
-            log::warn!(target: "meshcore", "could not reset the path to flood: {err}");
+        if flood_again.client.is_some() {
+            if let Err(err) = self.reset_path(dst).await {
+                log::warn!(target: "meshcore", "could not reset the path to flood: {err}");
+            }
+            flood_again.client = None;
         }
         let mut sent = result?;
         // the reply comes back over every hop of the reply path

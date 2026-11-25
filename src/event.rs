@@ -397,8 +397,10 @@ impl Event {
         }
     }
 
-    /// The 6-byte key prefix of the node an event is about
-    /// (meshcore_py's `pubkey_prefix` attribute).
+    /// The 6-byte key prefix of the node an event is about: meshcore_py's
+    /// `pubkey_prefix` attribute, and also for path discovery answers,
+    /// contacts, adverts, path updates and deleted contacts, whose events in
+    /// meshcore_py carry the key under another name.
     #[must_use]
     pub fn pubkey_prefix(&self) -> Option<[u8; 6]> {
         match self {

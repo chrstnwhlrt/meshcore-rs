@@ -681,6 +681,39 @@ async fn anonymous_request_to_a_flood_contact_goes_zero_hop_and_back() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn an_anonymous_request_given_up_halfway_still_resets_the_path() {
+    // the device never confirms the request, so a timeout around it drops it
+    // while the contact is zero-hop
+    let (mc, device) = client(Options::default(), |cmd| match cmd[0] {
+        30 => vec![contact_frame(3, KEY, "Rep", 0xff, &[])],
+        9 | 13 => vec![ok()],
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    mc.cache_contact(Contact::new(key(), ContactType::Repeater, "Rep"));
+    let key = key();
+    let request = mc.send_anon_req(
+        &key,
+        meshcore::AnonReqType::Owner,
+        RequestOptions::default(),
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), request)
+            .await
+            .is_err()
+    );
+    device.settle().await;
+    let codes: Vec<u8> = device
+        .commands()
+        .iter()
+        .map(|c| c[0])
+        .filter(|&c| c != 1)
+        .collect();
+    assert_eq!(codes, vec![30, 22, 9, 57, 13]);
+    assert!(mc.contact(&key).unwrap().is_flood());
+}
+
+#[tokio::test(start_paused = true)]
 async fn login_success_and_failure() {
     let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let fail_flag = Arc::clone(&fail);
@@ -1324,6 +1357,25 @@ async fn remote_answers_are_read_like_meshcore_py() {
     assert_eq!(trace.hops.len(), 1);
     assert_eq!(trace.hops[0].snr, 2.0);
     assert_eq!(trace.final_snr, Some(3.0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_subscription_answer_cut_short_is_an_error() {
+    let (mc, _device) = client(Options::default(), |cmd| match cmd[0] {
+        50 => vec![sent_frame(false, 0x610, 1000), binary_response(0x610, &[1])],
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    let answer = mc
+        .req_subscribe_sync(
+            &key(),
+            [1, 2, 3, 4],
+            60,
+            &[1, 103, 10],
+            RequestOptions::default(),
+        )
+        .await;
+    assert!(matches!(answer, Err(Error::Protocol(reason)) if reason == "invalid_frame_length"));
 }
 
 #[tokio::test(start_paused = true)]

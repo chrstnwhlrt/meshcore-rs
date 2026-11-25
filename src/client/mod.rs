@@ -497,7 +497,8 @@ impl MeshCore {
     }
 
     /// The first cached contact whose key starts with the hex `prefix`
-    /// (any length, case ignored).
+    /// (any length, case and surrounding whitespace ignored; an empty prefix
+    /// finds none).
     #[must_use]
     pub fn get_contact_by_key_prefix(&self, prefix: &str) -> Option<Contact> {
         let prefix = prefix.trim().to_lowercase();
