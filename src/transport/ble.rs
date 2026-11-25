@@ -36,12 +36,13 @@ use bluer::{
     DiscoveryTransport, ErrorKind, Session, Uuid,
 };
 use futures_util::{FutureExt, Stream, StreamExt, stream};
-use tokio::sync::{Mutex, OnceCell, mpsc};
+use tokio::sync::{OnceCell, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::error::{Error, Result};
 use crate::transport::{BoxFuture, FrameWriter, LINK_CAPACITY, Link, LinkEvent, Transport};
+use crate::util::until;
 
 /// The Nordic UART service.
 pub const UART_SERVICE_UUID: Uuid = Uuid::from_u128(0x6E40_0001_B5A3_F393_E0A9_E50E_24DC_CA9E);
@@ -79,9 +80,10 @@ const RETRY_PAUSE: Duration = Duration::from_millis(500);
 /// on a device that is not there (after about 40 s), in the same words.
 const DROP_TIME: Duration = Duration::from_secs(10);
 
-/// How long a write may take to end after the device disconnected. BlueZ ends
-/// it with the link.
-const LAST_WRITE_WAIT: Duration = Duration::from_secs(1);
+/// How long a write may take to end after the device disconnected, and how long
+/// after a write that failed for that the disconnect may be told. BlueZ does
+/// both at once, in either order.
+const LINK_END_WAIT: Duration = Duration::from_secs(1);
 
 /// BLE settings.
 #[derive(Clone, PartialEq, Eq)]
@@ -634,13 +636,8 @@ impl BleTransport {
         };
         let device_events = device.events().await?;
         let (sender, events) = mpsc::channel(LINK_CAPACITY);
-        let writing = Arc::new(Mutex::new(()));
-        let reader_task = tokio::spawn(read_link(
-            notifications,
-            device_events,
-            sender.clone(),
-            Arc::clone(&writing),
-        ));
+        let (writing, writes) = watch::channel(Writing::Nothing);
+        let reader_task = tokio::spawn(read_link(notifications, device_events, sender, writes));
         log::info!(target: "meshcore", "BLE Connection started");
         Ok(Link {
             info: device.address().to_string(),
@@ -649,7 +646,6 @@ impl BleTransport {
                 device: Some(device.clone()),
                 rx,
                 reader_task: Some(reader_task),
-                events: sender,
                 writing,
                 write_timeout: self.config.write_timeout,
             }),
@@ -718,29 +714,44 @@ enum Input {
     Device(DeviceEvent),
 }
 
-/// Forwards notified frames until the device disconnects, and reports the link
-/// closed. A frame that is being written then (`writing` is locked) may have
-/// gone out, and only the end of the write tells, so this waits for it.
+/// What the writer of a link does, for the link's reader.
+#[derive(Debug)]
+enum Writing {
+    Nothing,
+    /// It writes a frame.
+    Frame,
+    /// It could not write one, which ends the link: why, and how long it may
+    /// take until BlueZ tells that the device disconnected.
+    Failed(String, Duration),
+}
+
+/// Forwards notified frames until the device disconnects or a frame cannot be
+/// written, and reports the link closed. BlueZ ends a write the link drops with
+/// and tells that the device disconnected in either order. A frame that is being
+/// written when the device disconnects may have gone out, and only the end of the
+/// write tells, so this waits for it. After a write that ended first, this waits
+/// for the disconnect, as the frames from before may come until then.
 async fn read_link(
     notifications: impl Stream<Item = Vec<u8>> + Send,
     device_events: impl Stream<Item = DeviceEvent> + Send,
     events: mpsc::Sender<LinkEvent>,
-    writing: Arc<Mutex<()>>,
+    mut writes: watch::Receiver<Writing>,
 ) {
     let inputs = stream::select(
         notifications.map(Input::Frame),
         device_events.map(Input::Device),
     );
     let mut inputs = pin!(inputs);
+    let mut failed = pin!(write_failed(writes.clone()));
     let mut connected = true;
     loop {
         let input = if connected {
-            inputs.next().await
+            until(failed.as_mut(), inputs.next()).await
         } else {
             // What came before the device disconnected.
-            inputs.next().now_or_never().flatten()
+            inputs.next().now_or_never()
         };
-        match input {
+        match input.flatten() {
             Some(Input::Frame(frame)) => {
                 log::trace!(target: "meshcore", "received a {} byte frame", frame.len());
                 if events.send(LinkEvent::Frame(frame)).await.is_err() {
@@ -754,11 +765,32 @@ async fn read_link(
             None => break,
         }
     }
-    let _ = tokio::time::timeout(LAST_WRITE_WAIT, writing.lock()).await;
-    log::debug!(target: "meshcore", "link closed: ble_disconnect");
-    let _ = events
-        .send(LinkEvent::Closed("ble_disconnect".into()))
-        .await;
+    let ended = writes.wait_for(|writing| !matches!(writing, Writing::Frame));
+    let _ = tokio::time::timeout(LINK_END_WAIT, ended).await;
+    let reason = match &*writes.borrow() {
+        Writing::Failed(reason, _) => reason.clone(),
+        _ => "ble_disconnect".to_string(),
+    };
+    log::debug!(target: "meshcore", "link closed: {reason}");
+    let _ = events.send(LinkEvent::Closed(reason)).await;
+}
+
+/// Waits until a write has failed, and then as long as it may take until BlueZ
+/// tells that the device disconnected.
+async fn write_failed(mut writes: watch::Receiver<Writing>) {
+    let mut wait = None;
+    let failed = |writing: &Writing| {
+        if let Writing::Failed(_, time) = writing {
+            wait = Some(*time);
+        }
+        wait.is_some()
+    };
+    let _ = writes.wait_for(failed).await;
+    match wait {
+        Some(wait) => tokio::time::sleep(wait).await,
+        // The writer is gone.
+        None => std::future::pending().await,
+    }
 }
 
 /// Whether a write failed because the link dropped before the device confirmed
@@ -768,57 +800,65 @@ fn unconfirmed(err: &bluer::Error) -> bool {
     err.kind == ErrorKind::Failed && err.message == "Operation failed with ATT error: 0x0e"
 }
 
+/// Whether a write failed because the link had dropped before.
+fn not_connected(err: &bluer::Error) -> bool {
+    err.kind == ErrorKind::Failed && err.message == "Not connected"
+}
+
 struct BleWriter {
     /// `None` once closed.
     device: Option<Device>,
     rx: Characteristic,
     reader_task: Option<JoinHandle<()>>,
-    events: mpsc::Sender<LinkEvent>,
-    /// Locked while a frame is written.
-    writing: Arc<Mutex<()>>,
+    /// For the reader, which reports the link closed when a write fails.
+    writing: watch::Sender<Writing>,
     write_timeout: Duration,
 }
 
 impl FrameWriter for BleWriter {
     fn write_frame<'a>(&'a mut self, frame: &'a [u8]) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let _writing = self.writing.lock().await;
+            // A write that failed or stalled leaves the link unusable (a second
+            // write racing a stalled one drops it anyway).
+            if matches!(*self.writing.borrow(), Writing::Failed(..)) {
+                return Err(Error::ConnectionLost);
+            }
+            self.writing.send_replace(Writing::Frame);
             // With response, as meshcore_py writes.
             let request = CharacteristicWriteRequest {
                 op_type: WriteOp::Request,
                 ..CharacteristicWriteRequest::default()
             };
-            let (reason, result) =
-                match tokio::time::timeout(self.write_timeout, self.rx.write_ext(frame, &request))
-                    .await
-                {
-                    Ok(Ok(())) => return Ok(()),
-                    Ok(Err(err)) => {
-                        log::warn!(target: "meshcore", "BLE write failed: {err}");
-                        let reason = format!("ble_write_failed: {err}");
-                        if unconfirmed(&err) {
-                            (reason, Ok(()))
-                        } else {
-                            (reason, Err(Error::Ble(err)))
-                        }
+            let write = self.rx.write_ext(frame, &request);
+            let (reason, wait, result) = match tokio::time::timeout(self.write_timeout, write).await
+            {
+                Ok(Ok(())) => {
+                    self.writing.send_replace(Writing::Nothing);
+                    return Ok(());
+                }
+                Ok(Err(err)) => {
+                    log::warn!(target: "meshcore", "BLE write failed: {err}");
+                    let reason = format!("ble_write_failed: {err}");
+                    if unconfirmed(&err) {
+                        (reason, LINK_END_WAIT, Ok(()))
+                    } else if not_connected(&err) {
+                        (reason, LINK_END_WAIT, Err(Error::ConnectionLost))
+                    } else {
+                        (reason, Duration::ZERO, Err(Error::Ble(err)))
                     }
-                    Err(_) => {
-                        // meshcore_py's text, with the seconds as a float.
-                        log::warn!(
-                            target: "meshcore",
-                            "BLE write timed out after {:?}s",
-                            self.write_timeout.as_secs_f64()
-                        );
-                        ("ble_write_timeout".to_string(), Err(Error::ConnectionLost))
-                    }
-                };
-            // A write that failed or stalled leaves the link unusable (a second
-            // write racing a stalled one drops it anyway): report it closed so
-            // the client can reconnect.
-            let _ = self.events.send(LinkEvent::Closed(reason)).await;
-            if let Some(task) = self.reader_task.take() {
-                task.abort();
-            }
+                }
+                Err(_) => {
+                    // meshcore_py's text, with the seconds as a float.
+                    log::warn!(
+                        target: "meshcore",
+                        "BLE write timed out after {:?}s",
+                        self.write_timeout.as_secs_f64()
+                    );
+                    let reason = "ble_write_timeout".to_string();
+                    (reason, Duration::ZERO, Err(Error::ConnectionLost))
+                }
+            };
+            self.writing.send_replace(Writing::Failed(reason, wait));
             result
         })
     }
@@ -909,11 +949,19 @@ mod tests {
     }
 
     #[test]
-    fn a_write_the_device_did_not_confirm_is_told_apart() {
-        let tell = |message| unconfirmed(&error(ErrorKind::Failed, message));
-        assert!(tell("Operation failed with ATT error: 0x0e"));
-        assert!(!tell("Operation failed with ATT error: 0x03"));
-        assert!(!tell("Not connected"));
+    fn writes_that_fail_with_the_link_are_told_apart() {
+        let failed = |message| error(ErrorKind::Failed, message);
+        assert!(unconfirmed(&failed(
+            "Operation failed with ATT error: 0x0e"
+        )));
+        assert!(!unconfirmed(&failed(
+            "Operation failed with ATT error: 0x03"
+        )));
+        assert!(!unconfirmed(&failed("Not connected")));
+        assert!(not_connected(&failed("Not connected")));
+        assert!(!not_connected(&failed(
+            "Operation failed with ATT error: 0x0e"
+        )));
     }
 
     /// The device disconnects, and BlueZ tells no more.
@@ -926,7 +974,8 @@ mod tests {
     async fn frames_from_before_the_device_disconnects_are_read() {
         let frames = stream::iter([vec![1], vec![2], vec![3]]).chain(stream::pending());
         let (sender, mut events) = mpsc::channel(8);
-        read_link(frames, gone(), sender, Arc::default()).await;
+        let (_writing, writes) = watch::channel(Writing::Nothing);
+        read_link(frames, gone(), sender, writes).await;
         let mut read = Vec::new();
         while let Some(event) = events.recv().await {
             read.push(event);
@@ -942,21 +991,58 @@ mod tests {
     async fn the_link_is_lost_once_the_write_in_flight_is_over() {
         // BlueZ may tell that the device disconnected before it ends the write
         for ends in [true, false] {
-            let writing = Arc::new(Mutex::new(()));
-            let write = Arc::clone(&writing).lock_owned().await;
+            let (writing, writes) = watch::channel(Writing::Frame);
             let (sender, mut events) = mpsc::channel(8);
-            let reader = read_link(stream::pending(), gone(), sender, writing);
+            let reader = read_link(stream::pending(), gone(), sender, writes);
             let reader = tokio::spawn(reader);
-            tokio::time::sleep(LAST_WRITE_WAIT / 2).await;
+            tokio::time::sleep(LINK_END_WAIT / 2).await;
             assert!(events.try_recv().is_err());
             if ends {
-                drop(write);
+                writing.send_replace(Writing::Failed("failed".into(), LINK_END_WAIT));
             }
             let lost = events.recv();
-            let lost = tokio::time::timeout(LAST_WRITE_WAIT / 4, lost).await;
-            assert_eq!(lost.is_ok(), ends);
+            let lost = tokio::time::timeout(LINK_END_WAIT / 4, lost).await;
+            let reason = ends.then(|| LinkEvent::Closed("failed".into()));
+            assert_eq!(lost.ok().flatten(), reason);
             // not held up for long by a write that does not end
             reader.await.unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_that_failed_ends_the_link_after_the_frames_from_before() {
+        async fn after<T>(time: Duration, what: T) -> T {
+            tokio::time::sleep(time).await;
+            what
+        }
+        let quarter = LINK_END_WAIT / 4;
+        // whether BlueZ may still tell that the device disconnected, whether it
+        // does, and when the link is reported closed
+        for (wait, told, closed) in [
+            (LINK_END_WAIT, true, 2 * quarter),
+            (LINK_END_WAIT, false, LINK_END_WAIT),
+            (Duration::ZERO, false, Duration::ZERO),
+        ] {
+            let frame = stream::once(after(quarter, vec![1]));
+            let gone = DeviceEvent::PropertyChanged(DeviceProperty::Connected(false));
+            let gone = stream::once(after(2 * quarter, told.then_some(gone)));
+            let gone = gone.filter_map(std::future::ready);
+            let (_writing, writes) = watch::channel(Writing::Failed("failed".into(), wait));
+            let (sender, mut events) = mpsc::channel(8);
+            let start = Instant::now();
+            let reader = read_link(
+                frame.chain(stream::pending()),
+                gone.chain(stream::pending()),
+                sender,
+                writes,
+            );
+            reader.await;
+            assert_eq!(start.elapsed().as_millis(), closed.as_millis());
+            if !wait.is_zero() {
+                assert_eq!(events.recv().await, Some(LinkEvent::Frame(vec![1])));
+            }
+            let reason = LinkEvent::Closed("failed".into());
+            assert_eq!(events.recv().await, Some(reason));
         }
     }
 

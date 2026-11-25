@@ -322,6 +322,10 @@ impl Random {
         Duration::from_millis(self.below(limit))
     }
 
+    pub fn micros(&mut self, limit: u64) -> Duration {
+        Duration::from_micros(self.below(limit))
+    }
+
     /// One of 16 keys.
     pub fn key(&mut self) -> PublicKey {
         PublicKey::new([self.below(16) as u8; 32])

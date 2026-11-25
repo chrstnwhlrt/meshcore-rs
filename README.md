@@ -27,9 +27,9 @@ on; before, it took 172, so there a private message holds at most 159 bytes
 (see `MAX_TEXT_LENGTH`).
 
 Serial and TCP are tested end to end against a simulated device on a pseudo
-terminal and on a local socket. BLE (feature `ble`) runs through BlueZ and is
-available on Linux only. Serial and BLE were tested on a LilyGO T-LoRa V2.1-1.6
-with the companion firmware 1.18.0, through meshcore-cli-rs and
+terminal and on a local socket, BLE (feature `ble`, through BlueZ and on Linux
+only) against a stand-in for BlueZ. Serial and BLE were also tested on a LilyGO
+T-LoRa V2.1-1.6 with the companion firmware 1.18.0, through meshcore-cli-rs and
 `examples/check.rs`: scanning, pairing (also after flashing the device anew),
 connecting by name and by address, the read commands, channel messages, login,
 trace, reboot, reconnecting, and links BlueZ still held. `examples/check.rs`
@@ -552,6 +552,8 @@ cargo clippy --all-targets --all-features
   contact table, with random events and commands.
 - `tests/transports.rs` runs the TCP transport over a local socket and the
   serial transport over a pseudo terminal (Unix).
+- `tests/ble.rs` (feature `ble`, Linux) runs the BLE transport against a stand-in
+  for BlueZ, on a D-Bus bus within the test.
 - `tests/parity.rs` (feature `serde`) compares with meshcore_py. After updating
   meshcore_py, regenerate its fixtures as described in
   `tests/fixtures/meshcore_py_reader.py`.
