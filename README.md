@@ -297,9 +297,14 @@ firmware behaves differently from what meshcore_py expects:
 - `reboot` does not wait for an answer, the firmware sends none.
 - A full contact fetch replaces the cache instead of merging into it, so
   contacts removed on the device disappear.
-- `start_auto_message_fetching` empties the device's message queue right away;
-  meshcore_py fetches one message at the start and the rest only after the
-  next `MESSAGES_WAITING`.
+- `get_contact_by_key` puts the contact it reads into the cache; meshcore_py's
+  cache takes contacts from contact lists only.
+- `start_auto_message_fetching` empties the device's message queue right away
+  and again after every `connect` and automatic reconnect, as the device
+  reports only messages that arrive while an app is connected; meshcore_py
+  fetches one message at the start and the rest only after the next
+  `MESSAGES_WAITING`, so messages that came during a reconnect wait for the
+  next new one.
 - `send_login_sync` returns `Error::LoginFailed` as soon as the node rejects
   the password; meshcore_py waits for a successful login only and runs into its
   timeout.

@@ -1755,59 +1755,111 @@ async fn waiting_for_a_remote_answer_passes_over_errors_of_other_commands() {
     assert_eq!(pending.await.unwrap().unwrap().bat, 4100);
 }
 
-#[tokio::test(start_paused = true)]
-async fn auto_fetch_picks_up_waiting_messages() {
+/// A private message from `KEY` as the device hands it out.
+fn private_message(text: &[u8]) -> Vec<u8> {
+    let mut frame = vec![7];
+    frame.extend(&KEY[..6]);
+    frame.extend([0xff, 0]);
+    frame.extend(9u32.to_le_bytes());
+    frame.extend(text);
+    frame
+}
+
+/// The text of the next private message among the events; fails when none
+/// comes (on paused time the wait ends as soon as nothing else happens).
+async fn next_message(events: &mut meshcore::Subscription) -> String {
+    let message = async {
+        loop {
+            if let Event::ContactMessage(message) = events.recv().await.unwrap() {
+                return message.text;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(60), message)
+        .await
+        .expect("no message was fetched")
+}
+
+/// A device whose message queue the test fills, answering
+/// `CMD_SYNC_NEXT_MESSAGE` from it.
+fn device_with_queue(
+    options: Options,
+) -> (
+    meshcore::MeshCore,
+    common::Device,
+    Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+) {
     let queue = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
     let queue_ref = Arc::clone(&queue);
-    let (mc, device) = client(Options::default(), move |cmd| match cmd[0] {
+    let (mc, device) = client(options, move |cmd| match cmd[0] {
         10 => vec![queue_ref.lock().unwrap().pop().unwrap_or_else(|| vec![10])],
         _ => vec![],
     });
+    (mc, device, queue)
+}
+
+#[tokio::test(start_paused = true)]
+async fn auto_fetch_picks_up_waiting_messages() {
+    let (mc, device, queue) = device_with_queue(Options::default());
     mc.connect().await.unwrap();
     let mut events = mc.subscribe();
     mc.start_auto_message_fetching();
-    let mut msg = vec![7];
-    msg.extend(&KEY[..6]);
-    msg.extend([0xff, 0]);
-    msg.extend(9u32.to_le_bytes());
-    msg.extend(b"ping");
-    queue.lock().unwrap().push(msg);
+    queue.lock().unwrap().push(private_message(b"ping"));
     device.push(vec![0x83]).await;
-    let message = loop {
-        if let Event::ContactMessage(m) = events.recv().await.unwrap() {
-            break m;
-        }
-    };
-    assert_eq!(message.text, "ping");
+    assert_eq!(next_message(&mut events).await, "ping");
     mc.stop_auto_message_fetching();
 }
 
 #[tokio::test(start_paused = true)]
 async fn auto_fetch_goes_on_after_connecting_again() {
-    let queue = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
-    let queue_ref = Arc::clone(&queue);
-    let (mc, device) = client(Options::default(), move |cmd| match cmd[0] {
-        10 => vec![queue_ref.lock().unwrap().pop().unwrap_or_else(|| vec![10])],
-        _ => vec![],
-    });
+    let (mc, device, queue) = device_with_queue(Options::default());
     mc.connect().await.unwrap();
     mc.start_auto_message_fetching();
-    // a new connect on a link that is up, as meshcore_py's connect()
-    mc.connect().await.unwrap();
+    device.settle().await;
     let mut events = mc.subscribe();
-    let mut msg = vec![7];
-    msg.extend(&KEY[..6]);
-    msg.extend([0xff, 0]);
-    msg.extend(9u32.to_le_bytes());
-    msg.extend(b"after");
-    queue.lock().unwrap().push(msg);
+    // a message the device did not report, as one that came while no app was
+    // connected: a new connect (here on a link that is up, as meshcore_py's
+    // connect() allows) reads it
+    queue.lock().unwrap().push(private_message(b"waiting"));
+    mc.connect().await.unwrap();
+    assert_eq!(next_message(&mut events).await, "waiting");
+    // and the next MESSAGES_WAITING is still followed
+    queue.lock().unwrap().push(private_message(b"after"));
     device.push(vec![0x83]).await;
-    let message = loop {
-        if let Event::ContactMessage(m) = events.recv().await.unwrap() {
-            break m;
+    assert_eq!(next_message(&mut events).await, "after");
+}
+
+#[tokio::test(start_paused = true)]
+async fn auto_fetch_reads_what_came_during_a_reconnect() {
+    let options = Options {
+        auto_reconnect: true,
+        ..Options::default()
+    };
+    let (mc, device, queue) = device_with_queue(options);
+    mc.connect().await.unwrap();
+    mc.start_auto_message_fetching();
+    device.settle().await;
+    let mut events = mc.subscribe();
+    device.drop_link().await;
+    // the message comes while the link is down: the device never reports it
+    queue.lock().unwrap().push(private_message(b"missed"));
+    let reconnected = async {
+        loop {
+            if let Event::Connected {
+                reconnected: true, ..
+            } = events.recv().await.unwrap()
+            {
+                return;
+            }
         }
     };
-    assert_eq!(message.text, "after");
+    tokio::time::timeout(Duration::from_secs(60), reconnected)
+        .await
+        .expect("no reconnect");
+    assert_eq!(next_message(&mut events).await, "missed");
+    // the session was started anew before the queue was read
+    let codes: Vec<u8> = device.commands().iter().map(|c| c[0]).collect();
+    assert_eq!(codes[..4], [1, 10, 1, 10]);
 }
 
 #[tokio::test(start_paused = true)]

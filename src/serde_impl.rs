@@ -811,7 +811,6 @@ fn empty<S: Serializer>(s: S) -> Result<S::Ok, S::Error> {
 
 /// An event serializes as meshcore_py's payload of the same event.
 impl Serialize for Event {
-    #[allow(clippy::too_many_lines)]
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self {
             Self::Connected { info, reconnected } => {

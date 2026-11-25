@@ -6,11 +6,14 @@ mod contacts;
 mod device;
 mod messaging;
 
+use std::future::{Future, poll_fn};
+use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError, Weak};
+use std::task::Poll;
 use std::time::Duration;
 
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::JoinHandle;
 
 pub use binary::RequestOptions;
@@ -115,6 +118,8 @@ struct Inner {
     connection_info: StdMutex<Option<String>>,
     auto_update_contacts: AtomicBool,
     background: StdMutex<Background>,
+    /// Wakes the automatic message fetching once a new link's session started.
+    fetch_kick: Arc<Notify>,
     factory_reset_token: StdMutex<Option<String>>,
 }
 
@@ -172,6 +177,7 @@ impl MeshCore {
                 connection_info: StdMutex::new(None),
                 auto_update_contacts: AtomicBool::new(false),
                 background: StdMutex::new(Background::default()),
+                fetch_kick: Arc::new(Notify::new()),
                 factory_reset_token: StdMutex::new(None),
             }),
         }
@@ -302,7 +308,7 @@ impl MeshCore {
 
     /// Opens the link and starts the session with `APP_START`. A link that is
     /// up is closed first; automatic message fetching goes on, as in
-    /// meshcore_py.
+    /// meshcore_py, and reads what came while no link was up.
     ///
     /// # Errors
     ///
@@ -321,7 +327,10 @@ impl MeshCore {
             reconnected: false,
         });
         match self.send_appstart_timeout(APPSTART_TIMEOUT).await {
-            Ok(info) => Ok(info),
+            Ok(info) => {
+                kick_auto_fetch(&self.inner);
+                Ok(info)
+            }
             Err(err) => {
                 self.disconnect().await?;
                 Err(err)
@@ -624,10 +633,13 @@ impl MeshCore {
     }
 
     /// Fetches queued messages whenever the device reports some (they arrive
-    /// as message events), and once right away. Must be called inside a
-    /// Tokio runtime.
+    /// as message events), once right away, and again after every
+    /// [`connect`](Self::connect) and automatic reconnect: the device reports
+    /// only messages that arrive while an app is connected. Must be called
+    /// inside a Tokio runtime.
     pub fn start_auto_message_fetching(&self) {
         let weak = Arc::downgrade(&self.inner);
+        let kick = Arc::clone(&self.inner.fetch_kick);
         let mut sub = self.subscribe();
         let task = tokio::spawn(async move {
             let fetch = |weak: &Weak<Inner>| {
@@ -651,8 +663,8 @@ impl MeshCore {
             if !fetch(&weak).await {
                 return;
             }
-            while let Some(event) = sub.recv().await {
-                if matches!(event, Event::MessagesWaiting) && !fetch(&weak).await {
+            while next_fetch_cause(&mut sub, &kick).await {
+                if !fetch(&weak).await {
                     break;
                 }
             }
@@ -851,6 +863,7 @@ async fn reconnect(weak: Weak<Inner>, lost: u64, reason: String) {
                         info,
                         reconnected: true,
                     });
+                    kick_auto_fetch(&client.inner);
                 }
                 return;
             }
@@ -915,6 +928,47 @@ async fn wait_response<T>(
         }
         if let Event::Disconnected { .. } = event {
             return Err(Error::ConnectionLost);
+        }
+    }
+}
+
+/// Makes the automatic message fetching, when it runs, read the device's
+/// queue after a new link's session started: the device reports only
+/// messages that arrive while an app is connected.
+fn kick_auto_fetch(inner: &Inner) {
+    let running = lock(&inner.background)
+        .auto_fetch
+        .as_ref()
+        .is_some_and(|task| !task.is_finished());
+    if running {
+        inner.fetch_kick.notify_one();
+    }
+}
+
+/// Waits until the automatic message fetching has to read the queue: the
+/// device reports waiting messages, or a new link's session started.
+/// `false` once the client is gone.
+async fn next_fetch_cause(sub: &mut Subscription, kick: &Notify) -> bool {
+    enum Wake {
+        Kick,
+        Event(Option<Event>),
+    }
+    loop {
+        let wake = {
+            let mut kicked = pin!(kick.notified());
+            let mut event = pin!(sub.recv());
+            poll_fn(|cx| {
+                if kicked.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(Wake::Kick);
+                }
+                event.as_mut().poll(cx).map(Wake::Event)
+            })
+            .await
+        };
+        match wake {
+            Wake::Kick | Wake::Event(Some(Event::MessagesWaiting)) => return true,
+            Wake::Event(Some(_)) => {}
+            Wake::Event(None) => return false,
         }
     }
 }
