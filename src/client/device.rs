@@ -108,15 +108,19 @@ impl MeshCore {
         Ok(())
     }
 
-    /// Sets the node's location in degrees.
+    /// Sets the node's location in degrees. They go out in millionths, rounded
+    /// with halves to even as meshcore_py rounds them. A latitude beyond -90
+    /// to 90 or a longitude beyond -180 to 180 after rounding, which the
+    /// firmware would refuse, is refused before sending.
     pub async fn set_coords(&self, latitude: f64, longitude: f64) -> Result<()> {
-        if !(-90.0..=90.0).contains(&latitude) || !(-180.0..=180.0).contains(&longitude) {
+        let lat = (latitude * 1e6).round_ties_even();
+        let lon = (longitude * 1e6).round_ties_even();
+        if !(-90e6..=90e6).contains(&lat) || !(-180e6..=180e6).contains(&lon) {
             return Err(Error::invalid(format!(
                 "coordinates {latitude}, {longitude} out of range"
             )));
         }
-        let lat = (latitude * 1e6).round() as i32;
-        let lon = (longitude * 1e6).round() as i32;
+        let (lat, lon) = (lat as i32, lon as i32);
         let mut frame = vec![CommandType::SetAdvertLatLon.code()];
         frame.extend_from_slice(&lat.to_le_bytes());
         frame.extend_from_slice(&lon.to_le_bytes());
@@ -177,6 +181,8 @@ impl MeshCore {
 
     /// Sets the radio: frequency in MHz, bandwidth in kHz, spreading factor,
     /// coding rate (5-8) and, on firmware code 9 and later, whether to repeat.
+    /// The frequency goes out in whole kHz and the bandwidth in whole Hz,
+    /// rounded (meshcore_py cuts off the rest).
     pub async fn set_radio(
         &self,
         freq_mhz: f64,

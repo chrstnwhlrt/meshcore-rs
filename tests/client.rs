@@ -822,6 +822,45 @@ async fn remaining_command_frames_match_the_firmware() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn coordinates_and_frequencies_are_rounded_and_checked() {
+    let (mc, device) = client(Options::default(), |_| vec![ok()]);
+    mc.connect().await.unwrap();
+
+    // rounded with halves to even as meshcore_py rounds, and checked after
+    // rounding as the firmware checks
+    mc.set_coords(90.000_000_4, -0.000_002_5).await.unwrap();
+    let mut coords = vec![14];
+    coords.extend(90_000_000i32.to_le_bytes());
+    coords.extend((-2i32).to_le_bytes());
+    coords.extend([0; 4]);
+    assert_eq!(device.commands_with(14), vec![coords]);
+    let info = mc.self_info().unwrap();
+    assert_eq!((info.latitude_e6, info.longitude_e6), (90_000_000, -2));
+    for (lat, lon) in [(90.000_000_6, 0.0), (0.0, -180.5), (f64::NAN, 0.0)] {
+        assert!(matches!(
+            mc.set_coords(lat, lon).await,
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+    assert_eq!(device.commands_with(14).len(), 1);
+
+    // rounded to whole kHz: meshcore_py cuts 512.002 MHz (512001.99999999994
+    // kHz as a float) to 512001 kHz and 869.4625 MHz to 869462 kHz
+    mc.set_radio(512.002, 62.5, 9, 8, None).await.unwrap();
+    mc.set_radio(869.4625, 62.5, 9, 8, None).await.unwrap();
+    let radio = device.commands_with(11);
+    assert_eq!(radio[0][1..5], 512_002u32.to_le_bytes());
+    assert_eq!(radio[1][1..5], 869_463u32.to_le_bytes());
+    for (freq, bw) in [(f64::NAN, 62.5), (-1.0, 62.5), (869.525, f64::INFINITY)] {
+        assert!(matches!(
+            mc.set_radio(freq, bw, 9, 8, None).await,
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+    assert_eq!(device.commands_with(11).len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
 async fn remote_answers_are_read_like_meshcore_py() {
     let (mc, device) = client(Options::default(), |cmd| match cmd[0] {
         50 => {

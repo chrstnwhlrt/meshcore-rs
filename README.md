@@ -266,6 +266,9 @@ firmware behaves differently from what meshcore_py expects:
 
 - The TX power is a signed byte (the firmware takes -9 dBm and up); meshcore_py
   reads 247 for -9.
+- `set_radio` rounds the frequency to whole kHz and the bandwidth to whole Hz;
+  meshcore_py cuts off the rest after a float multiplication and sends 869462
+  kHz for 869.4625 MHz and 512001 kHz for 512.002 MHz.
 - `confirm_factory_reset` sends the command with the `reset` text the firmware
   requires; meshcore_py sends the bare command, which the firmware rejects as
   unsupported.
@@ -311,6 +314,10 @@ firmware behaves differently from what meshcore_py expects:
   bytes or a control type without its top bit. So is input it would read
   differently: a NUL byte in a text, name or password (it ends them there) and
   a `:` in a custom variable's name (it splits there).
+- `set_coords` refuses a latitude beyond -90 to 90 or a longitude beyond -180
+  to 180 (after rounding to millionths, as the firmware checks) before
+  sending; meshcore_py sends it, and the firmware answers with
+  `ERR_CODE_ILLEGAL_ARG`.
 - A BLE scan or name search also finds a device this computer is still
   connected to, for example right after another program let go of it;
   meshcore_py finds only advertising devices and misses it for a few seconds.
