@@ -209,9 +209,6 @@ logs/
 *.local
 .local/
 
-# Serial port lock files (relevant for this project)
-/var/lock/LCK..*
-
 # Python bytecode (if any Python tools are used)
 __pycache__/
 *.py[cod]

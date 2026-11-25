@@ -190,8 +190,8 @@ impl MeshCore {
 
     /// Sets a contact's path: whole hops of `hash_mode + 1` bytes, at most 63
     /// hops and 64 bytes (hash mode 3 is reserved). Without a hash mode the
-    /// device's mode is used (one `DEVICE_QUERY`). Returns the contact as
-    /// written.
+    /// device's mode is used (one [`send_device_query`](Self::send_device_query)).
+    /// Returns the contact as written.
     pub async fn change_contact_path(
         &self,
         contact: &Contact,

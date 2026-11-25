@@ -423,8 +423,7 @@ mod serial {
         let mc = device.connect(device.config()).await;
         let mut events = mc.subscribe();
         assert!(matches!(mc.get_time().await, Err(Error::ConnectionLost)));
-        let reason = disconnected(&mut events).await;
-        assert!(reason.starts_with("serial_"), "{reason}");
+        assert_eq!(disconnected(&mut events).await, "serial_disconnect");
         assert!(!mc.is_connected());
     }
 

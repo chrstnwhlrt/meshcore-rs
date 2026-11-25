@@ -73,18 +73,12 @@ impl MeshCore {
         data: &[u8],
         options: RequestOptions,
     ) -> Result<SentInfo> {
-        self.send_binary_req_with(dst, request_type, data, options, 0)
-            .await
-    }
-
-    async fn send_binary_req_with(
-        &self,
-        dst: &PublicKey,
-        request_type: BinaryReqType,
-        data: &[u8],
-        options: RequestOptions,
-        neighbours_prefix_len: u8,
-    ) -> Result<SentInfo> {
+        // A neighbours answer lists key prefixes of the length the request
+        // asks for, which the repeater reads from the sixth byte of the data.
+        let neighbours_prefix_len = match request_type {
+            BinaryReqType::Neighbours => data.get(5).copied().unwrap_or(0),
+            _ => 0,
+        };
         let mut frame = vec![CommandType::SendBinaryReq.code()];
         frame.extend_from_slice(dst.as_bytes());
         frame.push(request_type.code());
@@ -128,13 +122,12 @@ impl MeshCore {
         request_type: BinaryReqType,
         data: &[u8],
         options: RequestOptions,
-        neighbours_prefix_len: u8,
         extract: impl Fn(&Event, u32) -> Option<T>,
     ) -> Result<T> {
         let _mesh = self.inner.mesh_lock.lock().await;
         let mut sub = self.subscribe();
         let sent = self
-            .send_binary_req_with(dst, request_type, data, options, neighbours_prefix_len)
+            .send_binary_req(dst, request_type, data, options)
             .await?;
         let tag = sent.expected_ack;
         wait_response(&mut sub, options.wait(sent.suggested_timeout), |event| {
@@ -154,7 +147,6 @@ impl MeshCore {
             BinaryReqType::Status,
             &[],
             options,
-            0,
             |event, tag| match event {
                 Event::StatusResponse(s) if s.tag == Some(tag) => Some((**s).clone()),
                 _ => None,
@@ -174,7 +166,6 @@ impl MeshCore {
             BinaryReqType::Telemetry,
             &[],
             options,
-            0,
             |event, tag| match event {
                 Event::TelemetryResponse(t) if t.tag == Some(tag) => Some(t.telemetry.clone()),
                 _ => None,
@@ -199,7 +190,6 @@ impl MeshCore {
             BinaryReqType::Mma,
             &data,
             options,
-            0,
             |event, tag| match event {
                 Event::MmaResponse(m) if m.tag == tag => Some(m.entries.clone()),
                 _ => None,
@@ -219,7 +209,6 @@ impl MeshCore {
             BinaryReqType::Acl,
             &[0, 0],
             options,
-            0,
             |event, tag| match event {
                 Event::AclResponse(a) if a.tag == tag => Some(a.entries.clone()),
                 _ => None,
@@ -247,14 +236,8 @@ impl MeshCore {
         options: RequestOptions,
     ) -> Result<SentInfo> {
         let data = Self::neighbours_request(query);
-        self.send_binary_req_with(
-            dst,
-            BinaryReqType::Neighbours,
-            &data,
-            options,
-            query.pubkey_prefix_length,
-        )
-        .await
+        self.send_binary_req(dst, BinaryReqType::Neighbours, &data, options)
+            .await
     }
 
     /// A repeater's neighbours (one page).
@@ -270,7 +253,6 @@ impl MeshCore {
             BinaryReqType::Neighbours,
             &data,
             options,
-            query.pubkey_prefix_length,
             |event, tag| match event {
                 Event::NeighboursResponse(n) if n.tag == Some(tag) => Some((**n).clone()),
                 _ => None,
@@ -330,17 +312,10 @@ impl MeshCore {
         data: &[u8],
         options: RequestOptions,
     ) -> Result<BinaryResponse> {
-        self.binary_request(
-            dst,
-            request_type,
-            data,
-            options,
-            0,
-            |event, tag| match event {
-                Event::BinaryResponse(r) if r.tag == tag => Some((**r).clone()),
-                _ => None,
-            },
-        )
+        self.binary_request(dst, request_type, data, options, |event, tag| match event {
+            Event::BinaryResponse(r) if r.tag == tag => Some((**r).clone()),
+            _ => None,
+        })
         .await
     }
 
@@ -561,7 +536,10 @@ impl MeshCore {
     ) -> Result<AnonOwner> {
         let answer = self.anon_answer(dst, AnonReqType::Owner, options).await?;
         let text = lossy_ignore(answer.data.get(4..).unwrap_or_default());
-        let (name, owner) = text.split_once('\n').unwrap_or((text.as_str(), ""));
+        // The node answers "name\nowner", NUL padded.
+        let (name, owner) = text
+            .split_once('\n')
+            .unwrap_or((text.trim_end_matches('\0'), ""));
         Ok(AnonOwner {
             name: name.to_string(),
             owner: owner.trim_matches('\0').to_string(),

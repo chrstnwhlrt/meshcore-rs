@@ -407,6 +407,26 @@ async fn retries_fall_back_to_flood() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn retries_to_an_unknown_prefix_go_on_without_the_reset() {
+    let (mc, device) = client(Options::default(), |cmd| match cmd[0] {
+        2 => vec![sent_frame(false, 0x300, 500)],
+        4 => vec![vec![2, 0, 0, 0, 0], vec![4, 0, 0, 0, 0]],
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    let prefix: [u8; 6] = KEY[..6].try_into().unwrap();
+    let result = mc
+        .send_msg_with_retry(prefix, "hi", RetryOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(result, None);
+    // the contacts are read for the full key, which they do not hold
+    assert_eq!(device.commands_with(4).len(), 1);
+    assert_eq!(device.commands_with(13).len(), 0);
+    assert_eq!(device.commands_with(2).len(), 3);
+}
+
+#[tokio::test(start_paused = true)]
 async fn binary_answers_right_behind_msg_sent_are_matched() {
     let (mc, device) = client(Options::default(), |cmd| match cmd[0] {
         // MSG_SENT and the answer in one burst: the tag must already be bound
@@ -494,6 +514,25 @@ async fn neighbours_are_paged() {
     assert_eq!(all.neighbours.len(), 3);
     assert_eq!(all.tag, None);
     assert!(device.commands_with(50).len() >= 3);
+
+    // a request of its own: the prefix length comes from its data
+    let mut events = mc.subscribe();
+    let data = [0, 255, 0, 0, 0, 4, 1, 2, 3, 4];
+    mc.req_binary_sync(
+        &key(),
+        BinaryReqType::Neighbours,
+        &data,
+        RequestOptions::default(),
+    )
+    .await
+    .unwrap();
+    let typed = loop {
+        if let Event::NeighboursResponse(page) = events.recv().await.unwrap() {
+            break page;
+        }
+    };
+    assert_eq!(typed.neighbours[1].pubkey, vec![0xa1; 4]);
+    assert_eq!(typed.neighbours[1].secs_ago, 60);
 }
 
 #[tokio::test(start_paused = true)]
@@ -762,6 +801,13 @@ async fn signing_sends_the_data_in_chunks() {
     assert_eq!(chunks[0][1..], data[..120]);
     assert_eq!(chunks[2][1..], data[240..]);
     assert_eq!(device.commands_with(35).len(), 1);
+
+    // more than the device takes (8192 bytes): refused once sign_start told
+    // the limit, before any chunk
+    let too_long = mc.sign(&[1; 8193], 120, None).await;
+    assert!(matches!(too_long, Err(Error::InvalidArgument(_))));
+    assert_eq!(device.commands_with(33).len(), 2);
+    assert_eq!(device.commands_with(34).len(), 3);
 }
 
 #[tokio::test(start_paused = true)]

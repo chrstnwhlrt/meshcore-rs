@@ -134,12 +134,12 @@ impl Transport for SerialTransport {
 
             let (reader, writer) = tokio::io::split(stream);
             let (sender, events) = mpsc::channel(LINK_CAPACITY);
-            let reader_task = spawn_stream_reader(reader, sender, "serial", None);
+            let reader_task = spawn_stream_reader(reader, sender.clone(), "serial", None);
             log::info!(target: "meshcore", "Serial Connection started");
             Ok(Link {
                 info: config.port.clone(),
                 events,
-                writer: Box::new(StreamWriter::new(writer, reader_task)),
+                writer: Box::new(StreamWriter::new(writer, reader_task, sender)),
             })
         })
     }

@@ -28,15 +28,16 @@
 //!   meshcore_py, that waits for the device's reply and returns it typed.
 //!   Device errors come back as [`Error::Device`] with the firmware's
 //!   [`ErrorCode`]. One command is in flight at a time.
-//! - Every frame the device sends becomes an [`Event`]; [`MeshCore::subscribe`]
-//!   delivers them, [`MeshCore::wait_for`] waits for one.
+//! - Every frame the device sends becomes an [`Event`] (a push that cannot be
+//!   read is only logged); [`MeshCore::subscribe`] delivers them,
+//!   [`MeshCore::wait_for`] waits for one.
 //! - Answers from remote nodes (status, telemetry, neighbours, ...) are matched
 //!   to their request by tag; the `*_sync` methods wait for them.
 //! - The client keeps the device's self info, a contact cache, contacts heard
 //!   but not added, and the channel secrets for decoding the RX log.
 //! - It logs through the `log` crate with the target `meshcore`; where
 //!   meshcore_py logs the same case at info level or above, the message has
-//!   its wording.
+//!   its wording (a command without a link fails at once and logs nothing).
 //!
 //! ## Transports
 //!

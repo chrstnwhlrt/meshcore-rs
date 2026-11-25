@@ -327,21 +327,18 @@ pub(crate) fn ack(data: &[u8]) -> Result<Ack> {
 }
 
 /// A login success: permissions, key prefix, then (new firmware) server
-/// clock, ACL permissions and firmware level.
+/// clock, ACL permissions and firmware level. Each field is read at its fixed
+/// offset when the frame holds all of it, as meshcore_py gates them.
 pub(crate) fn login_success(data: &[u8]) -> LoginSuccess {
-    let mut r = ByteReader::new(data);
-    let permissions = r.opt_u8();
-    let pubkey_prefix = if data.len() >= 7 {
-        r.array().ok()
-    } else {
-        None
-    };
     LoginSuccess {
-        permissions,
-        pubkey_prefix,
-        server_timestamp: r.opt_u32(),
-        acl_permissions: r.opt_u8(),
-        fw_ver_level: r.opt_u8(),
+        permissions: data.first().copied(),
+        pubkey_prefix: data.get(1..7).and_then(|prefix| prefix.try_into().ok()),
+        server_timestamp: data
+            .get(7..11)
+            .and_then(|time| time.try_into().ok())
+            .map(u32::from_le_bytes),
+        acl_permissions: data.get(11).copied(),
+        fw_ver_level: data.get(12).copied(),
     }
 }
 
@@ -368,28 +365,29 @@ pub(crate) fn trace(data: &[u8]) -> Result<TraceData> {
     let auth_code = r.u32()?;
     let hash_len = 1usize << (flags & 3);
     let hop_count = path_bytes / hash_len;
-    let mut trace = TraceData {
+    let hashes = r.bytes(hop_count * hash_len)?;
+    let snrs = r.bytes(hop_count)?;
+    let hops = hashes
+        .chunks_exact(hash_len)
+        .zip(snrs)
+        .map(|(hash, &raw)| TraceHop {
+            hash: hash.to_vec(),
+            snr: snr(raw.cast_signed()),
+        })
+        .collect();
+    // The firmware always appends it; without hops meshcore_py ignores it.
+    let final_snr = if hop_count > 0 {
+        Some(snr(r.i8()?))
+    } else {
+        r.opt_u8().map(|raw| snr(raw.cast_signed()))
+    };
+    Ok(TraceData {
         tag,
         auth_code,
         flags,
-        hops: Vec::new(),
-        final_snr: None,
-    };
-    // hashes, one SNR per hop, and the final SNR
-    if r.remaining() > hop_count * hash_len + hop_count {
-        let hashes = r.bytes(hop_count * hash_len)?;
-        let snrs = r.bytes(hop_count)?;
-        trace.hops = hashes
-            .chunks_exact(hash_len)
-            .zip(snrs)
-            .map(|(hash, &raw)| TraceHop {
-                hash: hash.to_vec(),
-                snr: snr(raw.cast_signed()),
-            })
-            .collect();
-        trace.final_snr = Some(snr(r.i8()?));
-    }
-    Ok(trace)
+        hops,
+        final_snr,
+    })
 }
 
 /// A path length byte and the path after it.
@@ -426,10 +424,12 @@ pub(crate) fn control_data(data: &[u8]) -> Result<(ControlData, Option<DiscoverR
     let Some(&payload_type) = payload.first() else {
         return Err(Error::protocol("invalid_frame_length"));
     };
-    let discover = if payload_type & 0xF0 == 0x90 {
+    // A discovery answer too short to read still leaves the control data:
+    // control packets come unchecked from any node.
+    let read_discover = || {
         let mut p = ByteReader::new(&payload[1..]);
-        let snr_in = snr(p.i8()?);
-        let tag = p.u32()?;
+        let snr_in = snr(p.i8().ok()?);
+        let tag = p.u32().ok()?;
         let key = p.rest();
         let key_len = if key.len() < 32 { key.len().min(8) } else { 32 };
         Some(DiscoverResponse {
@@ -441,6 +441,9 @@ pub(crate) fn control_data(data: &[u8]) -> Result<(ControlData, Option<DiscoverR
             tag,
             pubkey: key[..key_len].to_vec(),
         })
+    };
+    let discover = if payload_type & 0xF0 == 0x90 {
+        read_discover()
     } else {
         None
     };
@@ -552,11 +555,11 @@ pub(crate) fn acl(data: &[u8]) -> Vec<AclEntry> {
         .collect()
 }
 
-/// A min/max/average answer: the sensor's clock, then the series.
+/// A min/max/average answer: the sensor's clock, then the series (from
+/// offset 4 also when the clock is cut short, as meshcore_py reads them).
 pub(crate) fn mma(data: &[u8], pubkey_prefix: [u8; 6], tag: u32) -> MmaResponse {
-    let mut r = ByteReader::new(data);
-    let timestamp = r.opt_u32();
-    let (entries, undecoded) = parse_mma(r.rest());
+    let timestamp = ByteReader::new(data).opt_u32();
+    let (entries, undecoded) = parse_mma(data.get(4..).unwrap_or_default());
     MmaResponse {
         pubkey_prefix,
         tag,
@@ -567,20 +570,22 @@ pub(crate) fn mma(data: &[u8], pubkey_prefix: [u8; 6], tag: u32) -> MmaResponse 
 }
 
 /// A neighbours answer: total count, count in this answer, then per
-/// neighbour its key prefix, seconds since heard and SNR.
+/// neighbour its key prefix (as long as asked for, at most the 32 bytes the
+/// repeater sends), seconds since heard and SNR.
 pub(crate) fn neighbours(
     data: &[u8],
     pubkey_prefix: [u8; 6],
     tag: u32,
     prefix_len: u8,
 ) -> Result<NeighboursResponse> {
+    let key_len = usize::from(prefix_len).min(crate::types::PUBLIC_KEY_LEN);
     let mut r = ByteReader::new(data);
     let neighbours_count = r.i16()?;
     let results_count = r.i16()?;
     let mut list = Vec::new();
     for _ in 0..results_count.max(0) {
         list.push(Neighbour {
-            pubkey: r.bytes(usize::from(prefix_len))?.to_vec(),
+            pubkey: r.bytes(key_len)?.to_vec(),
             secs_ago: r.i32()?,
             snr: snr(r.i8()?),
         });
@@ -766,6 +771,13 @@ mod tests {
         assert!(modern.is_admin());
         assert_eq!(modern.server_timestamp, Some(77));
         assert_eq!(modern.fw_ver_level, Some(2));
+        // a prefix cut short: no field is read from its bytes
+        let cut = login_success(&[1, 2, 3, 4, 5, 6]);
+        assert_eq!(cut.permissions, Some(1));
+        assert_eq!(
+            (cut.pubkey_prefix, cut.server_timestamp, cut.acl_permissions),
+            (None, None, None)
+        );
         assert_eq!(
             login_failed(&[0, 1, 2, 3, 4, 5, 6]).pubkey_prefix,
             Some([1, 2, 3, 4, 5, 6])
@@ -786,6 +798,36 @@ mod tests {
         assert_eq!(t.hops[1].hash, vec![0xbb, 0xbc]);
         assert_eq!(t.hops[1].snr, -1.0);
         assert_eq!(t.final_snr, Some(3.0));
+        // a path cut short (here its final SNR) makes the trace unreadable
+        assert!(trace(&data[..data.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn neighbours_have_the_prefix_length_the_repeater_sends() {
+        let mut data = 1i16.to_le_bytes().to_vec();
+        data.extend(1i16.to_le_bytes());
+        data.extend([7; 32]);
+        data.extend(30i32.to_le_bytes());
+        data.push(8);
+        // asked for 40 bytes, the repeater sends 32
+        let answer = neighbours(&data, [1; 6], 5, 40).unwrap();
+        assert_eq!(answer.pubkey_prefix_length, 40);
+        assert_eq!(answer.neighbours[0].pubkey, vec![7; 32]);
+        assert_eq!(answer.neighbours[0].secs_ago, 30);
+        assert_eq!(answer.neighbours[0].snr, 2.0);
+    }
+
+    #[test]
+    fn mma_series_start_after_the_clock() {
+        let mut data = 1000u32.to_le_bytes().to_vec();
+        data.extend([1, 103, 0, 200, 0, 255, 0, 221]);
+        let answer = mma(&data, [1; 6], 9);
+        assert_eq!(answer.timestamp, Some(1000));
+        assert_eq!(answer.entries.len(), 1);
+        // a clock cut short: no series either
+        let answer = mma(&[1, 103], [1; 6], 9);
+        assert_eq!((answer.timestamp, answer.entries.len()), (None, 0));
+        assert_eq!(answer.undecoded, Vec::<u8>::new());
     }
 
     #[test]
@@ -810,6 +852,10 @@ mod tests {
         assert_eq!(d.snr_in, 4.0);
         assert_eq!(d.tag, 0xdead_beef);
         assert_eq!(d.pubkey, vec![7; 8]);
+        // an answer cut inside its tag still gives the control data
+        let (control, discover) = control_data(&data[..7]).unwrap();
+        assert_eq!(control.payload, vec![0x92, 0x10, 0xef, 0xbe]);
+        assert!(discover.is_none());
     }
 
     #[test]

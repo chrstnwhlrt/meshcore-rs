@@ -500,7 +500,9 @@ impl MeshCore {
     }
 
     /// Signs `data` on the device in chunks of `chunk_size` bytes (meshcore_py
-    /// uses 120); a chunk and its command byte have to fit one frame.
+    /// uses 120); a chunk and its command byte have to fit one frame. Data
+    /// longer than the device takes, which only [`sign_start`](Self::sign_start)
+    /// tells, is refused before the first chunk.
     pub async fn sign(
         &self,
         data: &[u8],
@@ -645,7 +647,8 @@ impl MeshCore {
         self.request_ok(&frame).await.map(drop)
     }
 
-    /// The path hash mode (0 when the firmware does not report one).
+    /// The path hash mode, from a [`send_device_query`](Self::send_device_query)
+    /// (0 when the firmware does not report one).
     pub async fn get_path_hash_mode(&self) -> Result<u8> {
         Ok(self.send_device_query().await?.path_hash_mode.unwrap_or(0))
     }

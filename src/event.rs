@@ -1,4 +1,5 @@
-//! Events the client dispatches for every frame the device sends.
+//! Events the client dispatches for the frames the device sends and for the
+//! state of the connection.
 
 use std::future::{Future, poll_fn};
 use std::pin::pin;
@@ -23,7 +24,8 @@ pub struct ErrorInfo {
     /// The device's error code (`RESP_CODE_ERR`).
     pub code: Option<ErrorCode>,
     /// Why a reply could not be read: `invalid_frame_length` when it is too
-    /// short (as meshcore_py says), or `unknown_stats_type: N`.
+    /// short (meshcore_py's reason where it checks the length), or
+    /// `unknown_stats_type: N`.
     pub reason: Option<String>,
     /// The code of the reply that could not be read.
     pub packet_type: Option<u8>,
@@ -40,8 +42,10 @@ impl ErrorInfo {
     }
 }
 
-/// An event. Every frame from the device becomes one (some two), and the
-/// connection reports its state changes.
+/// An event. Every frame from the device becomes one (some two), except an
+/// empty frame and a push that cannot be read, which are only logged; a reply
+/// that cannot be read becomes an [`Event::Error`]. The connection reports
+/// its state changes too.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum Event {
@@ -240,6 +244,8 @@ pub enum EventKind {
 
 impl EventKind {
     /// meshcore_py's `EventType` value (`"contact_message"`, `"acknowledgement"`, ...).
+    /// `"contacts_start"` and `"unknown"` are this library's own: meshcore_py
+    /// dispatches nothing for those frames.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {

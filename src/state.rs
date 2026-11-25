@@ -94,12 +94,16 @@ impl State {
         match self.handle(packet_type, data) {
             Ok(events) => events,
             Err(err) => {
-                // Not the frame itself: message frames carry decrypted text.
-                log::error!(
-                    target: "meshcore",
-                    "could not read frame 0x{code:02x} ({} bytes): {err}",
-                    frame.len()
-                );
+                // meshcore_py's wording, without its traceback. Not the frame
+                // itself: message frames carry decrypted text. Stats and the
+                // private key have lines of their own (logged in `handle`).
+                if !matches!(packet_type, PacketType::Stats | PacketType::PrivateKey) {
+                    log::error!(
+                        target: "meshcore",
+                        "handle_rx parse error: packet type 0x{code:02x}, {} bytes: {err}",
+                        frame.len()
+                    );
+                }
                 // A reply answers the command in flight, so its caller learns
                 // at once. A push came unasked: an error for it would end an
                 // unrelated command, so it is only logged.
@@ -216,10 +220,14 @@ impl State {
             }
             PacketType::Battery => Event::Battery(parse::battery(data)?),
             PacketType::CustomVars => Event::CustomVars(CustomVars::parse(&lossy_ignore(data))),
-            PacketType::Stats => match parse::stats(data)? {
-                parse::Stats::Core(core) => Event::StatsCore(core),
-                parse::Stats::Radio(radio) => Event::StatsRadio(radio),
-                parse::Stats::Packets(packets) => Event::StatsPackets(packets),
+            PacketType::Stats => match parse::stats(data) {
+                Ok(parse::Stats::Core(core)) => Event::StatsCore(core),
+                Ok(parse::Stats::Radio(radio)) => Event::StatsRadio(radio),
+                Ok(parse::Stats::Packets(packets)) => Event::StatsPackets(packets),
+                Err(err) => {
+                    log_unreadable_stats(data);
+                    return Err(err);
+                }
             },
             PacketType::AutoaddConfig => Event::AutoAddConfig(parse::autoadd_config(data)?),
             PacketType::ChannelInfo => {
@@ -258,10 +266,18 @@ impl State {
             PacketType::PathDiscoveryResponse => {
                 Event::PathResponse(Box::new(parse::path_discovery(data)?))
             }
-            PacketType::PrivateKey => {
-                let key: [u8; 64] = ByteReader::new(data).array()?;
-                Event::PrivateKey(Box::new(PrivateKey::new(key)))
-            }
+            PacketType::PrivateKey => match ByteReader::new(data).array::<64>() {
+                Ok(key) => Event::PrivateKey(Box::new(PrivateKey::new(key))),
+                Err(err) => {
+                    // meshcore_py's line, with the length of the whole frame
+                    log::error!(
+                        target: "meshcore",
+                        "Invalid private key response length: {}",
+                        data.len() + 1
+                    );
+                    return Err(err);
+                }
+            },
             PacketType::SignStart => {
                 let mut r = ByteReader::new(data);
                 r.skip(1)?;
@@ -425,6 +441,37 @@ fn upsert(list: &mut Vec<Contact>, contact: Contact) {
     }
 }
 
+/// Logs meshcore_py's line for a stats reply it cannot read (`data` after the
+/// code; meshcore_py counts the code too). Only a reply cut short or of an
+/// unknown type cannot be read.
+fn log_unreadable_stats(data: &[u8]) {
+    let len = data.len() + 1;
+    match data.first() {
+        None => log::error!(
+            target: "meshcore",
+            "Stats response too short: {len} bytes, need at least 2 for header"
+        ),
+        Some(0) => log::error!(
+            target: "meshcore",
+            "Stats core response too short: {len} bytes, expected 11"
+        ),
+        Some(1) => log::error!(
+            target: "meshcore",
+            "Stats radio response too short: {len} bytes, expected 14"
+        ),
+        Some(2) => log::error!(
+            target: "meshcore",
+            "Stats packets response too short: {len} bytes, expected 26 or 30"
+        ),
+        Some(other) => log::error!(
+            target: "meshcore",
+            "Unknown stats type: {other}, data: {:02x}{}",
+            PacketType::Stats.code(),
+            crate::hex::encode(data)
+        ),
+    }
+}
+
 fn read_key(data: &[u8]) -> Result<PublicKey> {
     Ok(PublicKey::new(ByteReader::new(data).array()?))
 }
@@ -584,5 +631,19 @@ mod tests {
         let mut state = State::new();
         state.handle_frame(&[9, 0x10, 0, 0, 0]);
         assert_eq!(state.time, 16);
+
+        let mut frame = vec![5, 1, 22, 22];
+        frame.extend([7; 32]);
+        // location, multi ACKs, location policy, telemetry modes, manual add
+        frame.extend([0; 12]);
+        frame.extend(869_525u32.to_le_bytes());
+        frame.extend(250_000u32.to_le_bytes());
+        frame.extend([11, 5]);
+        frame.extend(b"Node");
+        assert_eq!(state.handle_frame(&frame)[0].kind(), EventKind::SelfInfo);
+        let info = state.self_info.as_ref().unwrap();
+        assert_eq!(info.public_key, PublicKey::new([7; 32]));
+        assert_eq!((info.radio_sf, info.radio_cr), (11, 5));
+        assert_eq!(info.name, "Node");
     }
 }

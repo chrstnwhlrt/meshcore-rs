@@ -24,8 +24,9 @@ const USAGE: &str = "usage: check serial PORT | tcp HOST:PORT | ble [ADDRESS|NAM
 struct StderrLogger;
 
 impl log::Log for StderrLogger {
+    // Only the library's lines: mio-serial and bluer log through `log` too.
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::max_level()
+        metadata.target() == "meshcore" && metadata.level() <= log::max_level()
     }
 
     fn log(&self, record: &log::Record<'_>) {

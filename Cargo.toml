@@ -59,12 +59,7 @@ missing_docs = "warn"
 all = { level = "deny", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 # Allow certain patterns that are acceptable for this library
-module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
-# Allow patterns common in async code
-significant_drop_tightening = "allow"
 # Allow patterns needed for protocol handling
 cast_possible_truncation = "allow"
-# Allow if-let-else for clearer code
-option_if_let_else = "allow"

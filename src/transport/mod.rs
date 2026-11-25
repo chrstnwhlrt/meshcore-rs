@@ -103,7 +103,11 @@ where
                         }
                     }
                 }
-                Err(err) => break format!("{name}_read_failed: {err}"),
+                // meshcore_py reports any loss on the read side as a disconnect.
+                Err(err) => {
+                    log::debug!(target: "meshcore", "{name} read failed: {err}");
+                    break format!("{name}_disconnect");
+                }
             }
         };
         log::debug!(target: "meshcore", "link closed: {reason}");
@@ -111,17 +115,23 @@ where
     })
 }
 
-/// Writes frames to a byte stream with the `<` framing.
+/// Writes frames to a serial port with the `<` framing.
 pub(crate) struct StreamWriter<W> {
     writer: W,
     reader_task: Option<tokio::task::JoinHandle<()>>,
+    events: mpsc::Sender<LinkEvent>,
 }
 
 impl<W> StreamWriter<W> {
-    pub(crate) const fn new(writer: W, reader_task: tokio::task::JoinHandle<()>) -> Self {
+    pub(crate) const fn new(
+        writer: W,
+        reader_task: tokio::task::JoinHandle<()>,
+        events: mpsc::Sender<LinkEvent>,
+    ) -> Self {
         Self {
             writer,
             reader_task: Some(reader_task),
+            events,
         }
     }
 }
@@ -134,9 +144,14 @@ impl<W: AsyncWrite + Unpin + Send> FrameWriter for StreamWriter<W> {
                 Ok(()) => self.writer.flush().await,
                 Err(err) => Err(err),
             };
-            // Only the serial transport writes through here.
             if let Err(err) = written {
+                // As in meshcore_py: the link counts as lost.
                 log::warn!(target: "meshcore", "Serial write failed: {err}");
+                if let Some(task) = self.reader_task.take() {
+                    task.abort();
+                }
+                let reason = format!("serial_write_failed: {err}");
+                let _ = self.events.send(LinkEvent::Closed(reason)).await;
                 return Err(err.into());
             }
             Ok(())
@@ -158,5 +173,45 @@ impl<W> Drop for StreamWriter<W> {
         if let Some(task) = self.reader_task.take() {
             task.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::task::{Context, Poll};
+
+    use super::*;
+
+    /// A port that refuses every write, as one that was unplugged.
+    struct UnpluggedPort;
+
+    impl AsyncWrite for UnpluggedPort {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::other("unplugged")))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_takes_the_link_down() {
+        let (sender, mut events) = mpsc::channel(4);
+        let reader = tokio::spawn(std::future::pending::<()>());
+        let mut writer = StreamWriter::new(UnpluggedPort, reader, sender);
+        assert!(writer.write_frame(&[22, 3]).await.is_err());
+        assert_eq!(
+            events.recv().await,
+            Some(LinkEvent::Closed("serial_write_failed: unplugged".into()))
+        );
     }
 }

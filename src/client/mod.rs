@@ -104,7 +104,8 @@ struct Inner {
     state: Arc<StdMutex<State>>,
     /// One command at a time: replies are matched to the command in flight.
     cmd_lock: Mutex<()>,
-    /// One remote request at a time: the firmware tracks one pending request.
+    /// One remote request at a time: the firmware tracks one pending request
+    /// of each kind and drops the answer to one that the next replaced.
     mesh_lock: Mutex<()>,
     link: Mutex<Option<LinkHandle>>,
     connected: AtomicBool,
@@ -685,8 +686,10 @@ impl MeshCore {
         Ok(link.generation)
     }
 
-    /// Sends a command and waits for the reply `extract` accepts. An error
-    /// reply ends the wait with [`Error::Device`] unless `extract` takes it.
+    /// Sends a command and waits for the reply `extract` accepts. Unless
+    /// `extract` takes it, an error reply ends the wait with
+    /// [`Error::Device`], and a reply that could not be read with
+    /// [`Error::Protocol`].
     async fn request<T>(
         &self,
         frame: &[u8],
@@ -833,7 +836,9 @@ async fn reconnect(weak: Weak<Inner>, lost: u64, reason: String) {
         match open_link(&inner, Some(lost)).await {
             Ok((info, generation)) => {
                 let client = MeshCore { inner };
-                // The firmware needs APP_START on every new connection.
+                // Every new link starts with APP_START, as in meshcore_py: it
+                // stops a contact list the device may still be sending and
+                // refreshes the self info.
                 if let Err(err) = client.send_appstart_timeout(APPSTART_TIMEOUT).await {
                     log::warn!(target: "meshcore", "Reconnect callback failed: {err}");
                 }

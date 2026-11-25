@@ -292,7 +292,9 @@ fn parse_advert(pkt_payload: &[u8]) -> Option<AdvertInfo> {
         advert.adv_feat2 = Some(reader.array::<2>().ok()?);
     }
     if adv_flags & 0x80 != 0 {
-        advert.adv_name = Some(lossy_ignore(trim_nul(reader.rest())));
+        // Decoded before the NULs go, as in meshcore_py: a dropped byte may
+        // have stood before one.
+        advert.adv_name = Some(lossy_ignore(reader.rest()).trim_matches('\0').to_string());
     }
     Some(advert)
 }
@@ -417,5 +419,14 @@ mod tests {
         assert_eq!(advert.adv_type, 2);
         assert_eq!(advert.adv_name.as_deref(), Some("Rep1"));
         assert_eq!(advert.adv_lat, Some(53.5511));
+
+        // an invalid byte before a NUL: dropped first, then the NUL goes
+        let mut packet = packet[..2 + 32 + 4 + 64].to_vec();
+        packet.extend([0x80, 0xff, 0x00, b'R', 0x00]);
+        let info = PacketParser::default().parse(&packet, 0.0, 0, 0).unwrap();
+        let PacketContent::Advert(advert) = info.content else {
+            panic!()
+        };
+        assert_eq!(advert.adv_name.as_deref(), Some("R"));
     }
 }

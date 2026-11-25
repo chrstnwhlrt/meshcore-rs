@@ -289,9 +289,13 @@ impl MeshCore {
     }
 
     /// Sends a message and waits for its ACK, retrying; after
-    /// `flood_after` attempts the path is reset and the message flooded.
+    /// `flood_after` attempts the path is reset and the message flooded. A
+    /// key prefix needs its contact for the reset: when even the contacts
+    /// read then do not hold it, the attempts go on without the reset.
     /// Returns the [`SentInfo`] of the attempt that was acknowledged, or
-    /// `None` when none was.
+    /// `None` when none was, also when attempts could not be sent (their
+    /// errors are logged). Fails only with [`Error::InvalidArgument`], for a
+    /// text the firmware would not take.
     pub async fn send_msg_with_retry(
         &self,
         dst: impl Into<Destination>,
@@ -434,8 +438,14 @@ impl MeshCore {
 
     /// Sends a login to a repeater, room server or sensor without waiting for
     /// the answer. The password has at most 15 bytes, the most the firmware
-    /// sends (empty for a guest login).
+    /// sends (empty for a guest login). Like meshcore_py, it logs a hint to
+    /// use [`send_login_sync`](Self::send_login_sync).
     pub async fn send_login(&self, dst: &PublicKey, password: &str) -> Result<SentInfo> {
+        log::warn!(target: "meshcore", "*** please consider using send_login_sync instead of send_login");
+        self.send_login_raw(dst, password).await
+    }
+
+    async fn send_login_raw(&self, dst: &PublicKey, password: &str) -> Result<SentInfo> {
         if password.len() > 15 || password.contains('\0') {
             return Err(Error::invalid(
                 "a login password has at most 15 bytes and no NUL, the firmware cuts it there",
@@ -461,7 +471,7 @@ impl MeshCore {
     ) -> Result<LoginSuccess> {
         let _mesh = self.inner.mesh_lock.lock().await;
         let mut sub = self.subscribe();
-        let sent = self.send_login(dst, password).await?;
+        let sent = self.send_login_raw(dst, password).await?;
         let prefix = dst.prefix();
         let matches = |p: Option<[u8; 6]>| p.is_none_or(|p| p == prefix);
         wait_response(
@@ -486,8 +496,10 @@ impl MeshCore {
     }
 
     /// Asks a node for its status the old way; the answer arrives as
-    /// [`Event::StatusResponse`]. Prefer [`req_status_sync`](Self::req_status_sync).
+    /// [`Event::StatusResponse`]. Prefer [`req_status_sync`](Self::req_status_sync)
+    /// (this logs a hint to it, as meshcore_py).
     pub async fn send_statusreq(&self, dst: &PublicKey) -> Result<SentInfo> {
+        log::warn!(target: "meshcore", "*** please consider using req_status_sync instead of send_statusreq");
         let mut frame = vec![CommandType::SendStatusReq.code()];
         frame.extend_from_slice(dst.as_bytes());
         self.request(
@@ -499,8 +511,13 @@ impl MeshCore {
     }
 
     /// Asks a node for telemetry the old way; the answer arrives as
-    /// [`Event::TelemetryResponse`]. Prefer [`req_telemetry_sync`](Self::req_telemetry_sync).
+    /// [`Event::TelemetryResponse`]. Prefer [`req_telemetry_sync`](Self::req_telemetry_sync)
+    /// (this logs a hint to it, as meshcore_py).
     pub async fn send_telemetry_req(&self, dst: &PublicKey) -> Result<SentInfo> {
+        log::warn!(
+            target: "meshcore",
+            "*** please consider using req_telemetry_sync instead of send_telemetry_req"
+        );
         let mut frame = vec![CommandType::SendTelemetryReq.code(), 0, 0, 0];
         frame.extend_from_slice(dst.as_bytes());
         self.request(
@@ -512,7 +529,17 @@ impl MeshCore {
     }
 
     /// Starts a path discovery; the answer arrives as [`Event::PathResponse`].
+    /// Like meshcore_py, it logs a hint to use
+    /// [`send_path_discovery_sync`](Self::send_path_discovery_sync).
     pub async fn send_path_discovery(&self, dst: &PublicKey) -> Result<SentInfo> {
+        log::warn!(
+            target: "meshcore",
+            "*** please consider using send_path_discovery_sync instead of send_path_discovery"
+        );
+        self.send_path_discovery_raw(dst).await
+    }
+
+    async fn send_path_discovery_raw(&self, dst: &PublicKey) -> Result<SentInfo> {
         let mut frame = vec![CommandType::SendPathDiscoveryReq.code(), 0];
         frame.extend_from_slice(dst.as_bytes());
         self.request(
@@ -531,7 +558,7 @@ impl MeshCore {
     ) -> Result<PathDiscovery> {
         let _mesh = self.inner.mesh_lock.lock().await;
         let mut sub = self.subscribe();
-        let sent = self.send_path_discovery(dst).await?;
+        let sent = self.send_path_discovery_raw(dst).await?;
         let prefix = dst.prefix();
         wait_response(
             &mut sub,

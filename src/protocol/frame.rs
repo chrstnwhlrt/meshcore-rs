@@ -13,7 +13,8 @@ pub const FRAME_START_OUT: u8 = 0x3c;
 /// Start byte of frames the device sends (`'>'`).
 pub const FRAME_START_IN: u8 = 0x3e;
 
-/// The largest frame the firmware sends or accepts (v1.18; older firmware: 172).
+/// The largest frame the firmware sends or accepts (from firmware 1.16 on;
+/// 172 before).
 pub const DEVICE_MAX_FRAME_SIZE: usize = 176;
 
 /// Frames announcing more than this are taken for noise and skipped, as in

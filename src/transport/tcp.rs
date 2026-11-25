@@ -115,7 +115,13 @@ impl FrameWriter for TcpWriter {
             }
             let framed = encode(frame)?;
             if let Err(err) = self.writer.write_all(&framed).await {
+                // As in meshcore_py: the link counts as lost.
                 log::warn!(target: "meshcore", "TCP write failed: {err}");
+                if let Some(task) = self.reader_task.take() {
+                    task.abort();
+                }
+                let reason = format!("tcp_write_failed: {err}");
+                let _ = self.events.send(LinkEvent::Closed(reason)).await;
                 return Err(err.into());
             }
             Ok(())

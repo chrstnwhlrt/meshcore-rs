@@ -46,8 +46,8 @@
 
           # The ble feature links libdbus to talk to BlueZ (Linux only; on other
           # systems the feature has no effect).
-          bleNativeInputs = lib.optionals pkgs.stdenv.isLinux [ pkgs.pkg-config ];
-          bleInputs = lib.optionals pkgs.stdenv.isLinux [ pkgs.dbus ];
+          bleNativeInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.pkg-config ];
+          bleInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.dbus ];
 
           commonArgs = {
             inherit src;

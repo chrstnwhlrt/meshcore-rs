@@ -118,7 +118,9 @@ pub enum Error {
     LoginFailed,
     /// A reply could not be read or was not the one expected.
     Protocol(String),
-    /// An argument was rejected before anything was sent.
+    /// An argument was rejected before anything was sent (data too long to
+    /// sign only after [`MeshCore::sign_start`](crate::MeshCore::sign_start),
+    /// whose answer gives the limit).
     InvalidArgument(String),
 }
 

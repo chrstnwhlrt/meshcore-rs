@@ -475,17 +475,28 @@ fn mma_layout(code: u8) -> (usize, f64, bool) {
 
 /// Decodes the series of a min/max/average answer: per series the channel, the
 /// type and three values (min, max, average). Returns the series and the bytes
-/// from the first one that could not be decoded.
+/// from the first one that could not be decoded, and logs why as meshcore_py
+/// does (which then drops the whole answer).
 #[must_use]
 pub fn parse_mma(buf: &[u8]) -> (Vec<MmaEntry>, Vec<u8>) {
     let mut entries = Vec::new();
     let mut i = 0;
     while i < buf.len() && buf[i] != 0 {
-        let Some(lpp_type) = buf.get(i + 1).and_then(|&code| LppType::from_code(code)) else {
+        // The lines meshcore_py logs: its own and the exceptions it catches.
+        let Some(&code) = buf.get(i + 1) else {
+            log::error!(target: "meshcore", "Error parsing binary MMA response: index out of range");
             return (entries, buf[i..].to_vec());
         };
-        let (size, multiplier, signed) = mma_layout(lpp_type.code());
+        let Some(lpp_type) = LppType::from_code(code) else {
+            log::error!(target: "meshcore", "Unknown LPP type: {code}");
+            return (entries, buf[i..].to_vec());
+        };
+        let (size, multiplier, signed) = mma_layout(code);
         if buf.len() - i < 2 + 3 * size {
+            log::error!(
+                target: "meshcore",
+                "Error parsing binary MMA response: Invalid buffer length!"
+            );
             return (entries, buf[i..].to_vec());
         }
         let value = |n: usize| {
@@ -601,5 +612,14 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].max, LppValue::Scalar(25.5));
         assert_eq!(entries[1].avg, LppValue::Scalar(50.5));
+
+        // an unknown type, a series cut short and a missing type byte end the
+        // reading; the series before stay
+        let series = [1, 103, 0, 200, 0, 255, 0, 221];
+        for rest in [&[2, 200, 1, 2, 3][..], &[2, 103, 0, 1], &[2]] {
+            let (entries, undecoded) = parse_mma(&[&series[..], rest].concat());
+            assert_eq!(entries.len(), 1);
+            assert_eq!(undecoded, rest);
+        }
     }
 }

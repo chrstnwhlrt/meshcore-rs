@@ -43,6 +43,8 @@ meshcore = { git = "https://github.com/chrstnwhlrt/meshcore-rs" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
+Releases are git tags (`vX.Y.Z`); `tag = "vX.Y.Z"` in the dependency pins one.
+
 Rust 1.89 or newer. Two features are optional:
 
 - `ble` adds the BLE transport. It talks to BlueZ over D-Bus, so it works on
@@ -213,8 +215,10 @@ async fn main() -> meshcore::Result<()> {
 Requests to repeaters, rooms and sensors go out over the mesh. The `_sync`
 methods wait for the answer, which the device matches to the request by a tag;
 the other variants return the `SentInfo` and the answer arrives as an event. The
-firmware keeps track of one remote request at a time, so the client sends them
-one after the other. An answer that arrives while the client reconnects still
+firmware keeps one pending request of each kind (login, status, telemetry, path
+discovery, binary or anonymous request) and drops the answer to one that the
+next of its kind replaced, so the client sends them one after the other, as
+meshcore_py does. An answer that arrives while the client reconnects still
 reaches the waiting request.
 
 ```rust no_run
@@ -243,10 +247,12 @@ async fn main() -> meshcore::Result<()> {
 
 ## Events and state
 
-Every frame from the device becomes an `Event`. `subscribe()` returns a
-`Subscription` for all events from then on, `wait_for()` and `wait_for_event()`
-wait for one. `event.kind().as_str()` gives meshcore_py's event type name
-(`contact_message`, `acknowledgement`, ...).
+Every frame from the device becomes an `Event`; a push that cannot be read is
+only logged, and a reply that cannot be read becomes an `Event::Error`.
+`subscribe()` returns a `Subscription` for all events from then on,
+`wait_for()` and `wait_for_event()` wait for one. `event.kind().as_str()`
+gives meshcore_py's event type name (`contact_message`, `acknowledgement`,
+...; `contacts_start` and `unknown` are this library's own).
 
 The client keeps what meshcore_py keeps:
 
@@ -259,13 +265,16 @@ The client keeps what meshcore_py keeps:
   `set_decrypt_channel_logs(true)` decrypts group packets in the RX log and
   adds path and signal to received channel messages.
 
-A command whose link drops fails at once with `Error::ConnectionLost`. Without
-automatic reconnecting the client then sends `Event::Disconnected`.
+A command whose link drops fails at once with `Error::ConnectionLost`. As in
+meshcore_py, a write that fails takes the link down too. Without automatic
+reconnecting the client then sends `Event::Disconnected`.
 
 The library logs through the `log` crate with the target `meshcore`. Where
 meshcore_py logs the same case at info level or above, the message has its
 wording (spelling included), so a program shows the lines a meshcore_py
-program would show.
+program would show. The one exception is a command without a link: it fails
+at once with `Error::NotConnected` and logs nothing, where meshcore_py tries
+to send and logs that the transport is not connected.
 
 ## Differences from meshcore_py
 
@@ -281,7 +290,9 @@ firmware behaves differently from what meshcore_py expects:
   requires; meshcore_py sends the bare command, which the firmware rejects as
   unsupported.
 - MMA readings from sensors use the firmware's LPP table (humidity has 2 bytes
-  in 0.1 % steps), not the CayenneLPP one.
+  in 0.1 % steps), not the CayenneLPP one. A series of a type meshcore_py does
+  not know, or one cut short, ends the reading, and the series before it are
+  kept; meshcore_py drops the whole answer then.
 - `reboot` does not wait for an answer, the firmware sends none.
 - A full contact fetch replaces the cache instead of merging into it, so
   contacts removed on the device disappear.
@@ -293,8 +304,21 @@ firmware behaves differently from what meshcore_py expects:
   timeout.
 - `send_cmd` looks up the node type of a bare key in the contact cache to pick
   the text type; meshcore_py assumes a repeater then.
+- `send_msg_with_retry` to a key prefix whose contact is not found, not even
+  in the contacts read for the path reset, goes on without the reset;
+  meshcore_py raises an error there.
 - An RX log packet that was logged before its channel was known is decrypted
   when it comes again.
+- A group text in the RX log that ends within its channel hash and MAC, or an
+  advert that ends within the fields its flags announce, gets no decoded
+  fields; meshcore_py reports the parts it could read (a location from the
+  bytes that are left).
+- A push too short to read is only logged, and a reply too short to read
+  ends its command with an error (reason `invalid_frame_length`); meshcore_py
+  fills the missing fields of most frames with zeros, or reports a
+  `parse_error` where a missing byte raises an exception. A neighbours or
+  node discovery answer cut short likewise comes only as its raw
+  `BinaryResponse` or `ControlData`.
 - `set_channel` keeps the channel's secret for the RX log as `get_channel`
   does; meshcore_py learns secrets from `get_channel` only.
 - A command fails at once when its link drops instead of waiting for its
@@ -303,6 +327,10 @@ firmware behaves differently from what meshcore_py expects:
   along at least one hop.
 - `fetch_all_neighbours` stops when a page comes back empty; meshcore_py asks
   again forever.
+- A neighbours answer to a request sent with `send_binary_req` is read too,
+  with the prefix length from the request; meshcore_py logs an error for it.
+  Prefixes asked for longer than 32 bytes are read at the 32 the repeater
+  sends, where meshcore_py misreads the entries.
 - `get_self_telemetry` takes only the answer with the device's own key, not
   a late answer to an earlier telemetry request of another node.
 - Names are cut to the 31 bytes the firmware keeps, at a character boundary:
@@ -357,7 +385,7 @@ firmware behaves differently from what meshcore_py expects:
 ## Development
 
 ```text
-cargo test --all-features   # unit, client, transport and parity tests, README examples
+cargo test --all-features   # unit, client, transport, parity and logging tests, README examples
                             # (--all-features includes ble, which needs libdbus)
 cargo clippy --all-targets --all-features
 ```
@@ -368,6 +396,7 @@ cargo clippy --all-targets --all-features
 - `tests/parity.rs` (feature `serde`) compares with meshcore_py. After updating
   meshcore_py, regenerate its fixtures as described in
   `tests/fixtures/meshcore_py_reader.py`.
+- `tests/logging.rs` checks the log lines that follow meshcore_py's wording.
 
 `examples/check.rs` checks a real device with read-only commands over any
 transport and prints each result with its time; `--watch` then stays connected
