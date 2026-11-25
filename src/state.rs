@@ -48,7 +48,9 @@ struct PendingRequest {
 
 #[derive(Debug, Default)]
 struct ContactsInProgress {
-    since: u32,
+    /// The `since` of the request the list answers; `None` for a list no
+    /// request here waits for any more (it came after its request timed out).
+    since: Option<u32>,
     contacts: Vec<Contact>,
 }
 
@@ -135,7 +137,7 @@ impl State {
             PacketType::ContactStart => {
                 let count = ByteReader::new(data).opt_u32().unwrap_or(0);
                 self.building = Some(ContactsInProgress {
-                    since: self.contacts_request_since.take().unwrap_or(0),
+                    since: self.contacts_request_since.take(),
                     contacts: Vec::new(),
                 });
                 Event::ContactsStart { count }
@@ -153,7 +155,9 @@ impl State {
             PacketType::ContactEnd => {
                 let lastmod = ByteReader::new(data).opt_u32().unwrap_or(0);
                 let contacts = if let Some(building) = self.building.take() {
-                    if building.since == 0 {
+                    // Only a list known to be full replaces the cache: one
+                    // that may be partial would drop the contacts it leaves out.
+                    if building.since == Some(0) {
                         self.contacts.clone_from(&building.contacts);
                     } else {
                         for contact in &building.contacts {
@@ -507,6 +511,7 @@ mod tests {
             crate::ContactType::Chat,
             "gone",
         ));
+        state.contacts_request_since = Some(0);
         assert_eq!(
             state.handle_frame(&[2, 2, 0, 0, 0])[0].kind(),
             EventKind::ContactsStart
@@ -522,6 +527,18 @@ mod tests {
         assert_eq!(state.contacts.len(), 2);
         assert!(!state.contacts_dirty);
         assert_eq!(state.contacts_lastmod, 77);
+    }
+
+    #[test]
+    fn a_list_after_its_request_gave_up_is_merged() {
+        // get_contacts timed out before the list started: it may be partial
+        let mut state = State::new();
+        state.handle_frame(&contact_frame(3, 1, "a"));
+        state.handle_frame(&[2, 1, 0, 0, 0]);
+        state.handle_frame(&contact_frame(3, 2, "b"));
+        state.handle_frame(&end_frame(30));
+        assert_eq!(state.contacts.len(), 2);
+        assert_eq!(state.contacts_lastmod, 30);
     }
 
     #[test]

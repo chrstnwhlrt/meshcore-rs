@@ -352,6 +352,14 @@ async fn new_adverts_are_pending_not_cached() {
     assert_eq!(mc.pending_contacts().len(), 1);
     assert!(mc.pop_pending_contact(&key()).is_some());
     assert_eq!(mc.pending_contacts(), []);
+
+    device
+        .push(contact_frame(0x8a, KEY, "Stranger", 0xff, &[]))
+        .await;
+    device.settle().await;
+    assert_eq!(mc.pending_contacts().len(), 1);
+    mc.flush_pending_contacts();
+    assert_eq!(mc.pending_contacts(), []);
 }
 
 #[tokio::test(start_paused = true)]
@@ -560,6 +568,86 @@ async fn anonymous_request_to_an_unknown_node_asks_for_a_zero_hop_reply() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn anonymous_requests_of_every_kind() {
+    let (mc, device) = client(Options::default(), |cmd| match cmd[0] {
+        57 => {
+            let tag = 0x900 + u32::from(cmd[33]);
+            let answer = [&tag.to_le_bytes()[..], b"answer"].concat();
+            vec![sent_frame(false, tag, 1000), binary_response(tag, &answer)]
+        }
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    let options = RequestOptions::default();
+    let regions = mc.req_regions_async(&key(), options).await.unwrap();
+    let owner = mc.req_owner_async(&key(), options).await.unwrap();
+    let basic = mc.req_basic_async(&key(), options).await.unwrap();
+    assert_eq!(
+        [regions.expected_ack, owner.expected_ack, basic.expected_ack],
+        [0x901, 0x902, 0x903]
+    );
+    let answer = mc.req_basic_sync(&key(), options).await.unwrap();
+    assert_eq!(answer.tag, 0x903);
+    assert_eq!(&answer.data[4..], b"answer");
+    // the request type, then a zero-hop reply path to a node not in the contacts
+    let frames = device.commands_with(57);
+    let tails: Vec<&[u8]> = frames.iter().map(|frame| &frame[33..]).collect();
+    assert_eq!(tails, [&[1, 0][..], &[2, 0], &[3, 0], &[3, 0]]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn binary_requests_without_waiting() {
+    let (mc, device) = client(Options::default(), |cmd| match cmd[0] {
+        50 => {
+            let tag = 0xa00 + u32::from(cmd[33]);
+            let answer = if cmd[33] == BinaryReqType::Neighbours.code() {
+                // one neighbour, with the 6-byte prefix the request asks for
+                let mut answer = 1i16.to_le_bytes().to_vec();
+                answer.extend(1i16.to_le_bytes());
+                answer.extend([0xa0; 6]);
+                answer.extend(90i32.to_le_bytes());
+                answer.push(12);
+                answer
+            } else {
+                vec![]
+            };
+            vec![sent_frame(false, tag, 1000), binary_response(tag, &answer)]
+        }
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    let options = RequestOptions::default();
+    let mut events = mc.subscribe();
+    let query = NeighboursQuery {
+        pubkey_prefix_length: 6,
+        ..NeighboursQuery::default()
+    };
+    let sent = mc
+        .req_neighbours_async(&key(), query, options)
+        .await
+        .unwrap();
+    assert_eq!(sent.expected_ack, 0xa06);
+    let page = loop {
+        if let Event::NeighboursResponse(page) = events.recv().await.unwrap() {
+            break page;
+        }
+    };
+    assert_eq!(page.tag, Some(0xa06));
+    assert_eq!(page.neighbours[0].pubkey, vec![0xa0; 6]);
+    assert_eq!(page.neighbours[0].secs_ago, 90);
+
+    let keep_alive = mc
+        .send_binary_req(&key(), BinaryReqType::KeepAlive, &[7], options)
+        .await
+        .unwrap();
+    assert_eq!(keep_alive.expected_ack, 0xa02);
+    mc.req_unsubscribe_sync(&key(), options).await.unwrap();
+    let frames = device.commands_with(50);
+    assert_eq!(frames[1][33..], [0x02, 7]);
+    assert_eq!(frames[2][33..], [0x09]);
+}
+
+#[tokio::test(start_paused = true)]
 async fn anonymous_request_to_a_flood_contact_goes_zero_hop_and_back() {
     let (mc, device) = client(Options::default(), |cmd| match cmd[0] {
         30 => vec![contact_frame(3, KEY, "Rep", 0xff, &[])],
@@ -673,6 +761,15 @@ async fn settings_keep_the_others_without_app_start() {
     // manual add 0, telemetry base 2 / loc 1 / env 1, loc policy 1, multi acks 2
     assert_eq!(last, vec![38, 0, 0b01_01_10, 1, 2]);
     assert_eq!(mc.self_info().unwrap().multi_acks, 2);
+
+    mc.set_manual_add_contacts(true).await.unwrap();
+    mc.set_telemetry_mode_base(1).await.unwrap();
+    mc.set_telemetry_mode_loc(2).await.unwrap();
+    mc.set_advert_loc_policy(0).await.unwrap();
+    let last = device.commands_with(38).last().unwrap().clone();
+    // manual add 1, telemetry base 1 / loc 2 / env 1, loc policy 0, multi acks 2
+    assert_eq!(last, vec![38, 1, 0b01_10_01, 0, 2]);
+    assert_eq!(device.commands_with(1).len(), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -763,6 +860,198 @@ async fn command_frames_match_the_protocol() {
 
     mc.set_path_hash_mode(1).await.unwrap();
     assert_eq!(device.commands_with(61)[0], vec![61, 0, 1]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn read_commands_return_their_replies() {
+    let (mc, _device) = client(Options::default(), |cmd| match cmd {
+        [56, 0] => {
+            let mut f = vec![24, 0];
+            f.extend(4100u16.to_le_bytes());
+            f.extend(3600u32.to_le_bytes());
+            f.extend(0u16.to_le_bytes());
+            f.push(2);
+            vec![f]
+        }
+        [56, 1] => {
+            let mut f = vec![24, 1];
+            f.extend((-110i16).to_le_bytes());
+            f.extend([(-80i8).cast_unsigned(), 26]);
+            f.extend(10u32.to_le_bytes());
+            f.extend(20u32.to_le_bytes());
+            vec![f]
+        }
+        [56, 2] => {
+            let mut f = vec![24, 2];
+            for value in 1u32..=7 {
+                f.extend(value.to_le_bytes());
+            }
+            vec![f]
+        }
+        [43] => vec![[&[23u8][..], &500u32.to_le_bytes(), &1200u32.to_le_bytes()].concat()],
+        [40] => vec![[&[21u8][..], b"gps:1,url:x"].concat()],
+        [64] => {
+            let mut name = [0u8; 31];
+            name[..8].copy_from_slice(b"#hamburg");
+            vec![[&[28u8][..], &name, &[5; 16]].concat()]
+        }
+        [59] => vec![vec![25, 0x0e, 3]],
+        [60] => vec![
+            [
+                &[26u8][..],
+                &433_000u32.to_le_bytes(),
+                &434_000u32.to_le_bytes(),
+            ]
+            .concat(),
+        ],
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    let core = mc.get_stats_core().await.unwrap();
+    assert_eq!(
+        (core.battery_mv, core.uptime_secs, core.queue_len),
+        (4100, 3600, 2)
+    );
+    let radio = mc.get_stats_radio().await.unwrap();
+    assert_eq!((radio.noise_floor, radio.last_rssi), (-110, -80));
+    assert_eq!(radio.last_snr, 6.5);
+    let packets = mc.get_stats_packets().await.unwrap();
+    assert_eq!(
+        (packets.recv, packets.direct_rx, packets.recv_errors),
+        (1, 6, Some(7))
+    );
+    let tuning = mc.get_tuning().await.unwrap();
+    assert_eq!((tuning.rx_delay, tuning.airtime_factor), (500, 1200));
+    assert_eq!(mc.get_custom_vars().await.unwrap().get("url"), Some("x"));
+    let scope = mc.get_default_flood_scope().await.unwrap().unwrap();
+    assert_eq!((scope.name.as_str(), scope.key), ("#hamburg", [5; 16]));
+    let autoadd = mc.get_autoadd_config().await.unwrap();
+    assert_eq!((autoadd.config, autoadd.max_hops), (0x0e, Some(3)));
+    assert_eq!(
+        mc.get_allowed_repeat_freq().await.unwrap(),
+        [meshcore::FreqRange {
+            min: 433_000,
+            max: 434_000
+        }]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn contacts_one_by_one_and_without_waiting() {
+    let (mc, device) = client(Options::default(), |cmd| match cmd[0] {
+        30 => vec![contact_frame(3, KEY, "Alice", 0xff, &[])],
+        4 => {
+            let mut end = vec![4];
+            end.extend(7000u32.to_le_bytes());
+            vec![
+                vec![2, 1, 0, 0, 0],
+                contact_frame(3, [0x33; 32], "Bob", 0xff, &[]),
+                end,
+            ]
+        }
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    // one contact read alone goes into the cache
+    assert_eq!(mc.get_contact_by_key(&key()).await.unwrap().name, "Alice");
+    assert_eq!(mc.contacts().len(), 1);
+    assert_eq!(
+        device.commands_with(30)[0],
+        [&[30u8][..], &KEY[..]].concat()
+    );
+    // a list asked for without waiting arrives as events, and replaces the cache
+    let mut events = mc.subscribe();
+    mc.get_contacts_async(0).await.unwrap();
+    let list = loop {
+        if let Event::Contacts(list) = events.recv().await.unwrap() {
+            break list;
+        }
+    };
+    assert_eq!(list.contacts[0].name, "Bob");
+    assert_eq!(mc.contacts_lastmod(), 7000);
+    assert!(mc.contact(&key()).is_none());
+    assert!(mc.uncache_contact(&PublicKey::new([0x33; 32])).is_some());
+    assert_eq!(mc.contacts(), []);
+}
+
+#[tokio::test(start_paused = true)]
+async fn contacts_are_read_when_needed() {
+    let (mc, device) = client(Options::default(), |cmd| match cmd[0] {
+        4 => {
+            let mut end = vec![4];
+            end.extend(5000u32.to_le_bytes());
+            vec![
+                vec![2, 1, 0, 0, 0],
+                contact_frame(3, KEY, "Alice", 0xff, &[]),
+                end,
+            ]
+        }
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    // nothing cached: read; cached and unchanged: not again
+    assert!(mc.ensure_contacts(false).await.unwrap());
+    assert!(!mc.ensure_contacts(true).await.unwrap());
+    // an advert marks them changed: read since the last lastmod when following
+    let mut advert = vec![0x80];
+    advert.extend(KEY);
+    device.push(advert).await;
+    device.settle().await;
+    assert!(mc.contacts_dirty());
+    assert!(!mc.ensure_contacts(false).await.unwrap());
+    assert!(mc.ensure_contacts(true).await.unwrap());
+    assert_eq!(
+        device.commands_with(4),
+        [vec![4], [&[4u8][..], &5000u32.to_le_bytes()[..]].concat()]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn flood_scopes_go_back_to_the_default_or_none() {
+    let (mc, device) = client(Options::default(), |_| vec![ok()]);
+    mc.connect().await.unwrap();
+    mc.reset_flood_scope().await.unwrap();
+    mc.force_unscoped().await.unwrap();
+    let scopes = device.commands_with(54);
+    assert_eq!(scopes[0], [&[54u8, 0][..], &[0; 16]].concat());
+    assert_eq!(scopes[1], [54, 1]);
+    mc.reset_default_flood_scope().await.unwrap();
+    assert_eq!(device.commands_with(63), [vec![63]]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn waiting_for_events() {
+    let (mc, device) = client(Options::default(), |cmd| match cmd[0] {
+        10 => vec![vec![10]],
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    let push_soon = |frame: Vec<u8>| {
+        let device = device.clone();
+        tokio::spawn(async move {
+            device.settle().await;
+            device.push(frame).await;
+        })
+    };
+    push_soon(vec![0x83]);
+    let waiting = mc.wait_for_event(EventKind::MessagesWaiting, None).await;
+    assert!(matches!(waiting, Some(Event::MessagesWaiting)));
+    let mut advert = vec![0x80];
+    advert.extend(KEY);
+    push_soon(advert);
+    let heard = mc
+        .wait_for(None, |event| event.pubkey_prefix() == Some([0x11; 6]))
+        .await;
+    assert!(matches!(heard, Some(Event::Advertisement(k)) if k == key()));
+    // nothing comes: None once the timeout is over
+    let one_second = Some(Duration::from_secs(1));
+    assert!(
+        mc.wait_for_event(EventKind::Ack, one_second)
+            .await
+            .is_none()
+    );
+    let none = mc.get_msg_timeout(Duration::from_secs(1)).await.unwrap();
+    assert!(none.is_none());
 }
 
 #[tokio::test(start_paused = true)]
@@ -1688,6 +1977,9 @@ async fn set_channel_keeps_the_secret_for_the_rx_log() {
         panic!()
     };
     assert_eq!(group.chan_name.as_deref(), Some("#hamburg"));
+    assert!(mc.keep_channel_secrets());
+    mc.set_keep_channel_secrets(false);
+    assert!(!mc.keep_channel_secrets());
 }
 
 #[test]

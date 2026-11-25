@@ -79,7 +79,8 @@ impl MeshCore {
     /// changed since. A full list replaces the cache, a partial one is merged.
     ///
     /// When the device sends nothing for 5 s before the list ends, this fails
-    /// with [`Error::Timeout`].
+    /// with [`Error::Timeout`]; a list that only starts after that is merged
+    /// into the cache, as it may be partial.
     pub async fn get_contacts(&self, lastmod: u32) -> Result<ContactList> {
         let _guard = self.inner.cmd_lock.lock().await;
         let mut sub = self.subscribe();

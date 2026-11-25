@@ -407,6 +407,9 @@ mod tests {
         assert!(contact.is_flood());
         assert_eq!(contact.name_raw[..4], *b"Rep\0");
         assert_eq!(contact.name_field(), contact.name_raw);
+        assert_eq!(contact.out_path_hex(), "");
+        assert_eq!(contact.contact_type.short_name(), "REP");
+        assert_eq!(ContactType::Other(9).short_name(), "UNK");
     }
 
     #[test]

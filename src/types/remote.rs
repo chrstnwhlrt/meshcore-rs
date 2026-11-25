@@ -281,3 +281,19 @@ impl TelemetryResponse {
         &self.telemetry.readings
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn telemetry_answers_hand_out_their_readings() {
+        let answer = TelemetryResponse {
+            pubkey_prefix: [1; 6],
+            tag: None,
+            telemetry: Telemetry::parse(&[1, 116, 0x01, 0x9c]),
+        };
+        assert_eq!(answer.readings().len(), 1);
+        assert_eq!(answer.readings()[0].lpp_type, LppType::Voltage);
+    }
+}

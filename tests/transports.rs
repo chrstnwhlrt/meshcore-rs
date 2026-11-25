@@ -182,6 +182,19 @@ async fn tcp_session_end_to_end() {
 }
 
 #[tokio::test]
+async fn tcp_client_made_first_and_connected_later() {
+    let device = TcpDevice::start(answer).await;
+    let mc = MeshCore::tcp("127.0.0.1", device.port);
+    assert!(!mc.is_connected());
+    let info = timeout(PATIENCE, mc.connect())
+        .await
+        .expect("connect took too long")
+        .unwrap();
+    assert_eq!(info.name, "Node");
+    assert_eq!(mc.get_bat().await.unwrap().level, 3540);
+}
+
+#[tokio::test]
 async fn tcp_frames_arrive_split_joined_and_behind_console_text() {
     let device = TcpDevice::start(|command| match command.first() {
         // console text, then the frame one byte per write
@@ -385,6 +398,19 @@ mod serial {
         assert!(!mc.is_connected());
         let commands = device.commands.lock().unwrap().clone();
         assert_eq!(commands, [APP_START.to_vec(), vec![20]]);
+    }
+
+    #[tokio::test]
+    async fn serial_client_made_first_and_connected_later() {
+        let device = PtyDevice::start(&[], answer).await;
+        // the default settings: 115200 baud, settle and drain delays
+        let mc = MeshCore::serial(device.path.clone());
+        let info = timeout(PATIENCE, mc.connect())
+            .await
+            .expect("connect took too long")
+            .unwrap();
+        assert_eq!(info.name, "Node");
+        assert_eq!(mc.connection_info().unwrap(), device.path);
     }
 
     #[tokio::test]

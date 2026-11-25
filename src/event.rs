@@ -567,4 +567,19 @@ mod tests {
         assert_eq!(Event::NoMoreMessages.kind().as_str(), "no_more_messages");
         assert_eq!(EventKind::RxLog.to_string(), "rx_log_data");
     }
+
+    #[test]
+    fn tags_and_key_prefixes_of_events() {
+        let key = PublicKey::new([7; 32]);
+        let advert = Event::Advertisement(key);
+        assert_eq!(advert.pubkey_prefix(), Some([7; 6]));
+        assert_eq!(advert.tag(), None);
+        let answer = Event::BinaryResponse(Box::new(BinaryResponse {
+            tag: 9,
+            data: Vec::new(),
+        }));
+        assert_eq!((answer.tag(), answer.pubkey_prefix()), (Some(9), None));
+        assert!(Event::Error(ErrorInfo::unreadable(6, "invalid_frame_length")).is_error());
+        assert!(!advert.is_error());
+    }
 }

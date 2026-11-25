@@ -168,7 +168,7 @@ time, so a `MeshCore` (it is `Clone`) can be shared between tasks.
 | Contacts | `get_contacts`, `get_contact_by_key`, `add_contact`, `update_contact`, `remove_contact`, `reset_path`, `change_contact_path`, `change_contact_flags`, `share_contact`, `export_contact`, `import_contact`, `get_advert_path`, `send_advert` |
 | Messages | `send_msg`, `send_msg_with_retry`, `send_cmd`, `get_msg`, `fetch_messages`, `start_auto_message_fetching` |
 | Channels | `get_channel`, `set_channel`, `send_chan_msg`, `send_channel_data`, `set_flood_scope`, `set_default_flood_scope`, `get_default_flood_scope` |
-| Remote nodes | `send_login_sync`, `send_logout`, `req_status_sync`, `req_telemetry_sync`, `req_mma_sync`, `req_acl_sync`, `fetch_all_neighbours`, `req_owner_info_sync`, `req_binary_sync`, `req_regions_sync`, `req_owner_sync`, `req_basic_sync`, `send_path_discovery_sync`, `trace_sync`, `send_node_discover_req` |
+| Remote nodes | `send_login_sync`, `send_logout`, `req_status_sync`, `req_telemetry_sync`, `req_mma_sync`, `req_acl_sync`, `req_neighbours_sync`, `fetch_all_neighbours`, `req_owner_info_sync`, `req_subscribe_sync`, `req_unsubscribe_sync`, `req_binary_sync`, `req_regions_sync`, `req_owner_sync`, `req_basic_sync`, `send_path_discovery_sync`, `trace_sync`, `send_node_discover_req`, `has_connection` |
 | Keys, reset | `export_private_key`, `import_private_key`, `sign`, `request_factory_reset` with `confirm_factory_reset` |
 | Raw | `send_raw_packet`, `send_raw_data`, `send_control_data` |
 
@@ -282,7 +282,8 @@ The library differs from meshcore_py in these points, most of them where the
 firmware behaves differently from what meshcore_py expects:
 
 - The TX power is a signed byte (the firmware takes -9 dBm and up); meshcore_py
-  reads 247 for -9.
+  reads 247 for -9, and its `set_tx_power` raises an error for a negative
+  power.
 - `set_radio` rounds the frequency to whole kHz and the bandwidth to whole Hz;
   meshcore_py cuts off the rest after a float multiplication and sends 869462
   kHz for 869.4625 MHz and 512001 kHz for 512.002 MHz.
