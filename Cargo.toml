@@ -1,6 +1,6 @@
 [package]
 name = "meshcore"
-version = "0.10.14"
+version = "0.10.15"
 edition = "2024"
 # The newest versions of aes (0.9.4) and, with the ble feature, uuid (1.29.3)
 # need Rust 1.89. With edition 2024 Cargo resolves dependencies against this
