@@ -275,7 +275,11 @@ meshcore_py logs the same case at info level or above, the message has its
 wording (spelling included), so a program shows the lines a meshcore_py
 program would show. The one exception is a command without a link: it fails
 at once with `Error::NotConnected` and logs nothing, where meshcore_py tries
-to send and logs that the transport is not connected.
+to send and logs that the transport is not connected. Some cases meshcore_py
+does not log at that level get lines of the library's own, such as a lost
+link. A frame or remote answer the library cannot read is logged with
+meshcore_py's error line for it, also where meshcore_py logs nothing at that
+level (it fills in zeros for the missing bytes or skips the frame).
 
 ## Differences from meshcore_py
 
@@ -298,15 +302,25 @@ meshcore_py leaves a gap:
   kept; meshcore_py then reports no series (`mma_data` is null for an unknown
   type, and an answer cut short is dropped).
 - A full contact fetch replaces the cache instead of merging into it, so
-  contacts removed on the device disappear.
+  contacts removed on the device disappear. It does so only when the list
+  brings as many contacts as the device reports to hold; a shorter one may
+  be the late answer to an earlier request since a time and is merged.
 - `get_contacts` fails when the list stalls for 5 s; meshcore_py looks every
   5 s whether a contact came, so it waits 5 to 10 s.
 - The contact cache follows what the client does to the device's contacts
   (`add_contact`, `update_contact`, `remove_contact`, `reset_path`,
   `change_contact_path`, `change_contact_flags`, `get_contact_by_key`) and
-  drops the contacts the device deletes to make room (`ContactDeleted`);
+  drops the contacts the device deletes to make room (`ContactDeleted`).
+  A contact list coming in meanwhile (as with `get_contacts_async`) does not
+  undo such a change with the older copy it brought before.
   meshcore_py's cache gains and loses contacts only through contact lists,
   and its commands change at most the path and flags of a contact it holds.
+- An advert or path update that arrives while a contact list comes in leaves
+  the contacts marked as changed (`contacts_dirty()`), as the list may hold
+  that contact from before the change, so `ensure_contacts(true)` and the
+  automatic contact update read again. meshcore_py clears the mark at the end
+  of the list; its automatic update reads the list again on every advert and
+  path update anyway.
 - `self_info()` follows the name, location, TX power and radio settings the
   client sets; meshcore_py updates its self info only for the settings of
   `CMD_SET_OTHER_PARAMS` and takes the others from the next `APP_START`.
@@ -329,6 +343,10 @@ meshcore_py leaves a gap:
   meshcore_py raises an error there.
 - `get_path_hash_mode`, which `change_contact_path` without a hash mode uses,
   fails when the device query fails; meshcore_py takes mode 0 then.
+- The single setters of the `CMD_SET_OTHER_PARAMS` settings (such as
+  `set_multi_acks`) and `sign` run one after the other when several tasks
+  call them at once. In meshcore_py they interleave, so a setter can write
+  back a value another one has just changed, and two signing sessions mix.
 - A command fails at once when its link drops instead of waiting for its
   timeout.
 - `send_trace` refuses an empty path before sending; the firmware only traces
@@ -344,8 +362,9 @@ meshcore_py leaves a gap:
 - A contact set to zero-hop for an anonymous request (`send_anon_req`, used
   by `req_regions_sync`, `req_owner_sync`, `req_basic_sync` and their
   `_async` variants) is set back to flood also when the request is given up
-  halfway, as by a timeout around it; meshcore_py leaves it at zero-hop when
-  its request is cancelled there.
+  halfway, as by a timeout around it, and when setting zero-hop got no
+  answer, which the device may have taken anyway. meshcore_py leaves it at
+  zero-hop in both cases.
 - `set_channel` keeps the channel's secret for the RX log as `get_channel`
   does; meshcore_py learns secrets from `get_channel` only.
 - An RX log packet that was logged before its channel was known, or while

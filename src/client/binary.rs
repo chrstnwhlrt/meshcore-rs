@@ -435,7 +435,8 @@ impl MeshCore {
     /// zero-hop. A contact the cache holds as flood is read from the device
     /// first; if the device holds it as flood too, it is set to zero-hop for
     /// the request and reset to flood afterwards, also when the request is
-    /// given up halfway (the reset then runs in the background).
+    /// given up halfway (the reset then runs in the background) and when
+    /// setting zero-hop got no answer, which the device may have taken anyway.
     pub async fn send_anon_req(
         &self,
         dst: &PublicKey,
@@ -477,6 +478,15 @@ impl MeshCore {
                 log::info!(target: "meshcore", "No path set trying zero hop");
                 flood_again.client = Some(self.clone());
                 if let Err(err) = self.change_contact_path(contact, &[], None).await {
+                    // Without an answer the device may have taken the change.
+                    if matches!(err, Error::Timeout | Error::ConnectionLost)
+                        && let Err(reset_err) = self.reset_path(dst).await
+                    {
+                        log::warn!(
+                            target: "meshcore",
+                            "could not reset the path to flood: {reset_err}"
+                        );
+                    }
                     flood_again.client = None;
                     // Flooded, the server would drop the request: fail now.
                     log::debug!(target: "meshcore", "could not set a zero-hop path: {err}");

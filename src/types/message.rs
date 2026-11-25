@@ -89,7 +89,7 @@ pub struct ChannelMessage {
     /// frames only).
     pub txt_hash: Option<u32>,
     /// What the RX log recorded for this message's packet, when channel log
-    /// decryption is on and the packet was logged.
+    /// decryption is on and the log holds the packet decrypted.
     pub rx_info: Option<ChannelRxInfo>,
     /// The frame was a v3 frame (affects meshcore_py's field layout).
     pub(crate) v3: bool,

@@ -99,7 +99,11 @@ fn as_stored(contact: &Contact, lastmod: Option<u32>) -> Contact {
 
 impl MeshCore {
     /// Reads the contact list: all contacts with `lastmod` 0, else those
-    /// changed since. A full list replaces the cache, a partial one is merged.
+    /// changed since. A list asked for in full that brings as many contacts
+    /// as the device reports to hold replaces the cache; any other is merged.
+    /// A contact that changes in the cache while the list comes in (written
+    /// or removed by this client, or deleted by the device) keeps that
+    /// change, as the list may hold it from before.
     ///
     /// When the list stalls for 5 s (no start, contact or end), this fails
     /// with [`Error::Timeout`]; a list that only starts after that is merged
@@ -116,7 +120,8 @@ impl MeshCore {
     }
 
     /// Asks for the contact list without waiting; the contacts arrive as
-    /// [`Event::NextContact`] and [`Event::Contacts`].
+    /// [`Event::NextContact`] and [`Event::Contacts`], and the cache takes
+    /// them as with [`get_contacts`](Self::get_contacts).
     pub async fn get_contacts_async(&self, lastmod: u32) -> Result<()> {
         let _guard = self.inner.cmd_lock.lock().await;
         self.send_contacts_request(lastmod).await.map(|_| ())
@@ -141,11 +146,7 @@ impl MeshCore {
     pub async fn reset_path(&self, key: &PublicKey) -> Result<()> {
         self.request_ok(&key_frame(CommandType::ResetPath, key))
             .await?;
-        let mut state = self.state();
-        if let Some(contact) = state.contacts.iter_mut().find(|c| c.public_key == *key) {
-            contact.out_path_len = PathLen::NONE;
-            contact.out_path.clear();
-        }
+        self.state().reset_contact_path(key);
         Ok(())
     }
 

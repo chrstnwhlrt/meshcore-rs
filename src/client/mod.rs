@@ -110,6 +110,12 @@ struct Inner {
     /// One remote request at a time: the firmware tracks one pending request
     /// of each kind and drops the answer to one that the next replaced.
     mesh_lock: Mutex<()>,
+    /// One change of the `CMD_SET_OTHER_PARAMS` settings at a time: a single
+    /// setter reads the others and writes them back.
+    settings_lock: Mutex<()>,
+    /// One signing session at a time: the device has one, and the chunks of
+    /// two would mix in it.
+    sign_lock: Mutex<()>,
     link: Mutex<Option<LinkHandle>>,
     connected: AtomicBool,
     /// Counts every link opened and every close on purpose: a reconnect
@@ -171,6 +177,8 @@ impl MeshCore {
                 state: Arc::new(StdMutex::new(State::new())),
                 cmd_lock: Mutex::new(()),
                 mesh_lock: Mutex::new(()),
+                settings_lock: Mutex::new(()),
+                sign_lock: Mutex::new(()),
                 link: Mutex::new(None),
                 connected: AtomicBool::new(false),
                 generation: AtomicU64::new(0),
@@ -473,7 +481,7 @@ impl MeshCore {
     }
 
     /// True when the contacts were not read yet, or adverts or path updates
-    /// arrived since they were.
+    /// arrived since the last contact list started.
     #[must_use]
     pub fn contacts_dirty(&self) -> bool {
         self.state().contacts_dirty
@@ -567,14 +575,15 @@ impl MeshCore {
         self.state().parser.keep_channel_secrets()
     }
 
-    /// Whether the contacts are read again (incrementally) on every advert
-    /// and path update.
+    /// Whether adverts and path updates make the client read the contacts
+    /// again (incrementally).
     #[must_use]
     pub fn auto_update_contacts(&self) -> bool {
         self.inner.auto_update_contacts.load(Ordering::SeqCst)
     }
 
-    /// Turns automatic contact updates on or off.
+    /// Turns automatic contact updates on or off. Turning them on must happen
+    /// inside a Tokio runtime: it starts the task that follows the events.
     pub fn set_auto_update_contacts(&self, enabled: bool) {
         self.inner
             .auto_update_contacts
@@ -852,9 +861,14 @@ async fn reconnect(weak: Weak<Inner>, lost: u64, reason: String) {
                 let client = MeshCore { inner };
                 // Every new link starts with APP_START, as in meshcore_py: it
                 // stops a contact list the device may still be sending and
-                // refreshes the self info.
+                // refreshes the self info. A failure is logged in words of
+                // its own: meshcore_py's "Reconnect callback failed" comes
+                // only from an exception, which its APP_START does not raise.
                 if let Err(err) = client.send_appstart_timeout(APPSTART_TIMEOUT).await {
-                    log::warn!(target: "meshcore", "Reconnect callback failed: {err}");
+                    log::warn!(
+                        target: "meshcore",
+                        "could not start the session after reconnecting: {err}"
+                    );
                 }
                 let slot = client.inner.link.lock().await;
                 if slot

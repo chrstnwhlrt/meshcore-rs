@@ -12,6 +12,7 @@ use crate::packet::{PacketParser, message_hash};
 use crate::protocol::bytes::{ByteReader, lossy_ignore};
 use crate::protocol::codes::{AnonReqType, BinaryReqType, PacketType};
 use crate::protocol::parse;
+use crate::protocol::path::PathLen;
 use crate::types::{
     AclResponse, BinaryResponse, ChannelRxInfo, Contact, ContactList, CustomVars, PrivateKey,
     PublicKey, RxLogData, SelfInfo, SentInfo, TelemetryResponse,
@@ -51,7 +52,17 @@ struct ContactsInProgress {
     /// The `since` of the request the list answers; `None` for a list no
     /// request here waits for any more (it came after its request timed out).
     since: Option<u32>,
+    /// How many contacts the device holds, as the list's start reports.
+    count: u32,
     contacts: Vec<Contact>,
+    /// Contacts that changed in the cache while the list came in (written or
+    /// removed by the client, or deleted by the device) and that the list
+    /// did not send again after: its copy of them is older, so its end keeps
+    /// what the cache holds for them.
+    newer_in_cache: Vec<PublicKey>,
+    /// An advert or path update came while the list came in: the list may
+    /// hold that contact from before the change.
+    changed: bool,
 }
 
 /// State shared by the reader task and the client.
@@ -138,7 +149,8 @@ impl State {
                 let count = ByteReader::new(data).opt_u32().unwrap_or(0);
                 self.building = Some(ContactsInProgress {
                     since: self.contacts_request_since.take(),
-                    contacts: Vec::new(),
+                    count,
+                    ..ContactsInProgress::default()
                 });
                 Event::ContactsStart { count }
             }
@@ -149,6 +161,11 @@ impl State {
                     // (the answer to CMD_GET_CONTACT_BY_KEY in the middle of
                     // a list) is listed once.
                     upsert(&mut building.contacts, contact.clone());
+                    // Sent again after it changed in the cache: this copy
+                    // is the newer one.
+                    building
+                        .newer_in_cache
+                        .retain(|key| *key != contact.public_key);
                 } else {
                     // a single contact (CMD_GET_CONTACT_BY_KEY): the device holds it
                     self.upsert_contact(contact.clone());
@@ -159,16 +176,35 @@ impl State {
                 let lastmod = ByteReader::new(data).opt_u32().unwrap_or(0);
                 let contacts = if let Some(building) = self.building.take() {
                     // Only a list known to be full replaces the cache: one
-                    // that may be partial would drop the contacts it leaves out.
-                    if building.since == Some(0) {
+                    // asked for in full that brought every contact the
+                    // device holds. Any other may be partial (the late
+                    // answer to an earlier request can take the place of a
+                    // new one) and would drop the contacts it leaves out.
+                    let all = usize::try_from(building.count)
+                        .is_ok_and(|count| count == building.contacts.len());
+                    let newer: Vec<(PublicKey, Option<Contact>)> = building
+                        .newer_in_cache
+                        .iter()
+                        .map(|key| (*key, self.cached(key).cloned()))
+                        .collect();
+                    if building.since == Some(0) && all {
                         self.contacts.clone_from(&building.contacts);
                     } else {
                         for contact in &building.contacts {
                             self.upsert_contact(contact.clone());
                         }
                     }
+                    // What changed in the cache meanwhile stays as it is now.
+                    for (key, contact) in newer {
+                        match contact {
+                            Some(contact) => self.upsert_contact(contact),
+                            None => {
+                                self.remove_contact(&key);
+                            }
+                        }
+                    }
                     self.contacts_lastmod = lastmod;
-                    self.contacts_dirty = false;
+                    self.contacts_dirty = building.changed;
                     building.contacts
                 } else {
                     // Without its start the list is incomplete: the cache stays.
@@ -253,11 +289,11 @@ impl State {
                 Event::ChannelInfo(Box::new(channel))
             }
             PacketType::Advertisement => {
-                self.contacts_dirty = true;
+                self.contacts_changed();
                 Event::Advertisement(read_key(data)?)
             }
             PacketType::PathUpdate => {
-                self.contacts_dirty = true;
+                self.contacts_changed();
                 Event::PathUpdate(read_key(data)?)
             }
             PacketType::Ack => Event::Ack(parse::ack(data)?),
@@ -428,15 +464,55 @@ impl State {
         );
     }
 
+    /// A contact changed on the device (advert, path update): the cache is
+    /// dirty, also after a list that is coming in now.
+    fn contacts_changed(&mut self) {
+        self.contacts_dirty = true;
+        if let Some(building) = &mut self.building {
+            building.changed = true;
+        }
+    }
+
     /// Inserts or replaces a contact in the cache.
     pub(crate) fn upsert_contact(&mut self, contact: Contact) {
+        self.changed_in_cache(contact.public_key);
         upsert(&mut self.contacts, contact);
     }
 
     /// Removes a contact from the cache.
     pub(crate) fn remove_contact(&mut self, key: &PublicKey) -> Option<Contact> {
+        self.changed_in_cache(*key);
         let index = self.contacts.iter().position(|c| c.public_key == *key)?;
         Some(self.contacts.remove(index))
+    }
+
+    /// Sets a contact to flood in the cache, also one that so far only a
+    /// list coming in has brought.
+    pub(crate) fn reset_contact_path(&mut self, key: &PublicKey) {
+        let listed = self
+            .building
+            .as_ref()
+            .and_then(|building| building.contacts.iter().find(|c| c.public_key == *key));
+        if let Some(mut contact) = self.cached(key).or(listed).cloned() {
+            contact.out_path_len = PathLen::NONE;
+            contact.out_path.clear();
+            self.upsert_contact(contact);
+        }
+    }
+
+    /// A cached contact by key.
+    fn cached(&self, key: &PublicKey) -> Option<&Contact> {
+        self.contacts.iter().find(|c| c.public_key == *key)
+    }
+
+    /// Notes that the cached contact `key` changed while a list comes in, so
+    /// that the list's older copy does not undo it.
+    fn changed_in_cache(&mut self, key: PublicKey) {
+        if let Some(building) = &mut self.building
+            && !building.newer_in_cache.contains(&key)
+        {
+            building.newer_in_cache.push(key);
+        }
     }
 
     /// The first cached contact whose key starts with `prefix`.
@@ -552,6 +628,115 @@ mod tests {
         assert_eq!(state.contacts.len(), 2);
         assert!(!state.contacts_dirty);
         assert_eq!(state.contacts_lastmod, 77);
+    }
+
+    #[test]
+    fn a_full_request_answered_by_fewer_contacts_than_the_device_holds_is_merged() {
+        // the late answer to an earlier request since a time can take the
+        // place of a full one
+        let mut state = State::new();
+        state.upsert_contact(crate::Contact::new(
+            PublicKey::new([9; 32]),
+            crate::ContactType::Chat,
+            "kept",
+        ));
+        state.contacts_request_since = Some(0);
+        state.handle_frame(&[2, 3, 0, 0, 0]);
+        state.handle_frame(&contact_frame(3, 1, "a"));
+        state.handle_frame(&end_frame(40));
+        assert_eq!(state.contacts.len(), 2);
+        assert_eq!(state.contacts_lastmod, 40);
+    }
+
+    #[test]
+    fn a_contact_the_device_deletes_while_a_list_comes_stays_out_of_the_cache() {
+        // the device overwrote a contact the list had brought already
+        let mut deleted = vec![0x8f];
+        deleted.extend([1; 32]);
+        let mut state = State::new();
+        state.contacts_request_since = Some(0);
+        state.handle_frame(&[2, 2, 0, 0, 0]);
+        state.handle_frame(&contact_frame(3, 1, "a"));
+        state.handle_frame(&deleted);
+        state.handle_frame(&contact_frame(3, 2, "b"));
+        let events = state.handle_frame(&end_frame(7));
+        // the list is what came, as in meshcore_py
+        let Event::Contacts(list) = &events[0] else {
+            panic!()
+        };
+        assert_eq!(list.contacts.len(), 2);
+        let names: Vec<&str> = state.contacts.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["b"]);
+        // one the list sends again after its deletion was added anew
+        state.contacts_request_since = Some(0);
+        state.handle_frame(&[2, 2, 0, 0, 0]);
+        state.handle_frame(&contact_frame(3, 1, "a"));
+        state.handle_frame(&deleted);
+        state.handle_frame(&contact_frame(3, 2, "b"));
+        state.handle_frame(&contact_frame(3, 1, "a2"));
+        state.handle_frame(&end_frame(8));
+        let names: Vec<&str> = state.contacts.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["a2", "b"]);
+    }
+
+    #[test]
+    fn changes_to_the_cache_while_a_list_comes_are_kept() {
+        let mut state = State::new();
+        state.contacts_request_since = Some(0);
+        state.handle_frame(&[2, 4, 0, 0, 0]);
+        state.handle_frame(&contact_frame(3, 1, "a"));
+        state.handle_frame(&contact_frame(3, 2, "b"));
+        let mut with_path = contact_frame(3, 4, "d");
+        with_path[35] = 0x01;
+        with_path[36] = 0xaa;
+        state.handle_frame(&with_path);
+        // commands change contacts the list has brought already: removed,
+        // written anew, set to flood (one only the list holds so far)
+        state.remove_contact(&PublicKey::new([1; 32]));
+        state.upsert_contact(crate::Contact::new(
+            PublicKey::new([2; 32]),
+            crate::ContactType::Chat,
+            "b2",
+        ));
+        state.reset_contact_path(&PublicKey::new([4; 32]));
+        // one written before the list brings it: the list's copy is newer
+        state.upsert_contact(crate::Contact::new(
+            PublicKey::new([3; 32]),
+            crate::ContactType::Chat,
+            "c-old",
+        ));
+        state.handle_frame(&contact_frame(3, 3, "c"));
+        let events = state.handle_frame(&end_frame(7));
+        // the list is what came
+        let Event::Contacts(list) = &events[0] else {
+            panic!()
+        };
+        let names: Vec<&str> = list.contacts.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "d", "c"]);
+        assert!(!list.contacts[2].is_flood());
+        let names: Vec<&str> = state.contacts.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["b2", "d", "c"]);
+        assert!(state.contacts[1].is_flood());
+    }
+
+    #[test]
+    fn an_advert_while_a_list_comes_leaves_the_contacts_dirty() {
+        let mut advert = vec![0x80];
+        advert.extend([1; 32]);
+        let mut state = State::new();
+        state.contacts_request_since = Some(0);
+        state.handle_frame(&[2, 1, 0, 0, 0]);
+        state.handle_frame(&contact_frame(3, 1, "a"));
+        // the contact changed after the list brought it
+        state.handle_frame(&advert);
+        state.handle_frame(&end_frame(7));
+        assert!(state.contacts_dirty);
+        // a list without changes meanwhile clears the mark
+        state.contacts_request_since = Some(7);
+        state.handle_frame(&[2, 1, 0, 0, 0]);
+        state.handle_frame(&contact_frame(3, 1, "a"));
+        state.handle_frame(&end_frame(9));
+        assert!(!state.contacts_dirty);
     }
 
     #[test]

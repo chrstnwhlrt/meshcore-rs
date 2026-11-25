@@ -418,11 +418,15 @@ impl MeshCore {
         text: &str,
         timestamp: Option<u32>,
     ) -> Result<()> {
-        // An empty channel message is fine with the firmware ("<name>: ").
-        let name_len = self.state().self_info.as_ref().map(|info| info.name.len());
-        if let Some(name_len) = name_len
-            && !text.is_empty()
-        {
+        // An empty channel message is fine with the firmware ("<name>: "). The
+        // node name is known once connected; before, the limit is the one for
+        // the shortest name.
+        let name_len = self
+            .state()
+            .self_info
+            .as_ref()
+            .map_or(0, |info| info.name.len());
+        if !text.is_empty() {
             let limit = MAX_TEXT_LENGTH.saturating_sub(name_len + 2);
             check_text(text, limit, "channel message")?;
         }

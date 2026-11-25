@@ -180,7 +180,9 @@ async fn contact_list_fills_and_replaces_the_cache() {
     let (mc, device) = client(Options::default(), move |cmd| match cmd[0] {
         4 => {
             let round = first.fetch_add(1, Ordering::SeqCst);
-            let mut frames = vec![vec![2, 2, 0, 0, 0]];
+            // the device holds two contacts, later only Rep
+            let count: u32 = if round == 0 { 2 } else { 1 };
+            let mut frames = vec![[&[2u8][..], &count.to_le_bytes()].concat()];
             if round == 0 {
                 frames.push(contact_frame(3, KEY, "Alice", 0xff, &[]));
                 frames.push(contact_frame(3, [0x22; 32], "Rep", 0x41, &[0xaa, 0xbb]));
@@ -714,6 +716,39 @@ async fn an_anonymous_request_given_up_halfway_still_resets_the_path() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_zero_hop_change_without_an_answer_is_set_back_to_flood() {
+    // the device may have taken the change whose answer never came
+    let options = Options {
+        default_timeout: Duration::from_secs(1),
+        ..Options::default()
+    };
+    let (mc, device) = client(options, |cmd| match cmd[0] {
+        30 => vec![contact_frame(3, KEY, "Rep", 0xff, &[])],
+        13 => vec![ok()],
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    mc.cache_contact(Contact::new(key(), ContactType::Repeater, "Rep"));
+    let result = mc
+        .send_anon_req(
+            &key(),
+            meshcore::AnonReqType::Owner,
+            RequestOptions::default(),
+        )
+        .await;
+    assert!(matches!(result, Err(Error::Timeout)));
+    let codes: Vec<u8> = device
+        .commands()
+        .iter()
+        .map(|c| c[0])
+        .filter(|&c| c != 1)
+        .collect();
+    // read the device's record, query the hash mode, set zero-hop, reset
+    assert_eq!(codes, vec![30, 22, 9, 13]);
+    assert!(mc.contact(&key()).unwrap().is_flood());
+}
+
+#[tokio::test(start_paused = true)]
 async fn login_success_and_failure() {
     let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let fail_flag = Arc::clone(&fail);
@@ -806,6 +841,46 @@ async fn settings_keep_the_others_without_app_start() {
     // manual add 1, telemetry base 1 / loc 2 / env 1, loc policy 0, multi acks 2
     assert_eq!(last, vec![38, 1, 0b01_10_01, 0, 2]);
     assert_eq!(device.commands_with(1).len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn settings_changed_at_once_keep_both_changes() {
+    let (mc, device) = client(Options::default(), |cmd| match cmd[0] {
+        38 => vec![ok()],
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    // each setter reads the other settings and writes them back: the second
+    // must see the first's change
+    let (acks, env) = tokio::join!(mc.set_multi_acks(2), mc.set_telemetry_mode_env(1));
+    acks.unwrap();
+    env.unwrap();
+    let last = device.commands_with(38).last().unwrap().clone();
+    // manual add 0, telemetry base 2 / loc 1 / env 1, loc policy 1, multi acks 2
+    assert_eq!(last, vec![38, 0, 0b01_01_10, 1, 2]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn signing_sessions_at_once_run_one_after_the_other() {
+    let (mc, device) = client(Options::default(), |cmd| match cmd[0] {
+        33 => vec![[&[19u8, 0][..], &8192u32.to_le_bytes()].concat()],
+        34 => vec![ok()],
+        35 => vec![[&[20u8][..], &[0x5a; 64]].concat()],
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    let (first, second) =
+        tokio::join!(mc.sign(&[1; 200], 120, None), mc.sign(&[2; 200], 120, None));
+    first.unwrap();
+    second.unwrap();
+    // the device has one session: start, chunks and finish of one, then the other
+    let steps: Vec<u8> = device
+        .commands()
+        .iter()
+        .map(|c| c[0])
+        .filter(|code| (33..=35).contains(code))
+        .collect();
+    assert_eq!(steps, [33, 34, 34, 35, 33, 34, 34, 35]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1040,6 +1115,72 @@ async fn contacts_are_read_when_needed() {
         device.commands_with(4),
         [vec![4], [&[4u8][..], &5000u32.to_le_bytes()[..]].concat()]
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_advert_during_a_contact_list_has_the_contacts_read_again() {
+    // the advert comes after the list brought its contact, so the list may
+    // hold the contact from before the change
+    let mut advert = vec![0x80];
+    advert.extend(KEY);
+    let (mc, device) = client(Options::default(), move |cmd| match cmd[0] {
+        4 => {
+            let mut end = vec![4];
+            end.extend(5000u32.to_le_bytes());
+            vec![
+                vec![2, 1, 0, 0, 0],
+                contact_frame(3, KEY, "Alice", 0xff, &[]),
+                advert.clone(),
+                end,
+            ]
+        }
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    assert!(mc.ensure_contacts(true).await.unwrap());
+    assert!(mc.contacts_dirty());
+    assert!(mc.ensure_contacts(true).await.unwrap());
+    assert_eq!(device.commands_with(4).len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn commands_while_a_contact_list_comes_in_keep_their_changes() {
+    // the list ends only when the test pushes its end, so commands run while
+    // it comes in, after it brought the contacts they change
+    let (mc, device) = client(Options::default(), |cmd| match cmd[0] {
+        4 => vec![
+            vec![2, 2, 0, 0, 0],
+            contact_frame(3, KEY, "Alice", 0xff, &[]),
+            contact_frame(3, [0x22; 32], "Rep", 0x41, &[0xaa, 0xbb]),
+        ],
+        13 | 15 => vec![ok()],
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    let mut events = mc.subscribe();
+    mc.get_contacts_async(0).await.unwrap();
+    let mut brought = 0;
+    while brought < 2 {
+        if let Event::NextContact(_) = events.recv().await.unwrap() {
+            brought += 1;
+        }
+    }
+    let rep = PublicKey::new([0x22; 32]);
+    mc.remove_contact(&key()).await.unwrap();
+    mc.reset_path(&rep).await.unwrap();
+    let mut end = vec![4];
+    end.extend(5000u32.to_le_bytes());
+    device.push(end).await;
+    loop {
+        if let Event::Contacts(list) = events.recv().await.unwrap() {
+            // the list is what the device sent
+            assert_eq!(list.contacts.len(), 2);
+            break;
+        }
+    }
+    assert!(mc.contact(&key()).is_none());
+    assert!(mc.contact(&rep).unwrap().is_flood());
+    assert_eq!(mc.contacts().len(), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1564,6 +1705,21 @@ async fn texts_longer_than_the_firmware_takes_are_refused() {
     for code in [55, 65, 18, 26, 32, 63, 9] {
         assert_eq!(device.commands_with(code).len(), 0);
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn channel_texts_are_checked_before_connecting() {
+    let (mc, _device) = client(Options::default(), |_| vec![]);
+    let refused = |result: meshcore::Result<()>| matches!(result, Err(Error::InvalidArgument(_)));
+    // no self info yet: a NUL, or a text too long for any node name, is refused
+    assert!(refused(mc.send_chan_msg(0, "a\0b", None).await));
+    let too_long = "x".repeat(MAX_TEXT_LENGTH - 1);
+    assert!(refused(mc.send_chan_msg(0, &too_long, None).await));
+    // anything else goes to the link, which is not up
+    assert!(matches!(
+        mc.send_chan_msg(0, "hi", None).await,
+        Err(Error::NotConnected)
+    ));
 }
 
 #[tokio::test(start_paused = true)]

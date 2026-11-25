@@ -243,6 +243,12 @@ impl MeshCore {
     /// Writes all settings of `CMD_SET_OTHER_PARAMS` (meshcore_py's
     /// `set_other_params_from_infos`).
     pub async fn set_other_params(&self, params: &OtherParams) -> Result<()> {
+        let _settings = self.inner.settings_lock.lock().await;
+        self.write_other_params(params).await
+    }
+
+    /// Writes the settings; the caller holds the settings lock.
+    async fn write_other_params(&self, params: &OtherParams) -> Result<()> {
         let frame = [
             CommandType::SetOtherParams.code(),
             u8::from(params.manual_add_contacts),
@@ -261,15 +267,18 @@ impl MeshCore {
     ///
     /// The others come from the self info held since connecting, not from a
     /// new `APP_START`: that would stop a contact list the device is sending.
-    /// `APP_START` is sent only when no self info is held.
+    /// `APP_START` is sent only when no self info is held. Changes from
+    /// several tasks run one after the other, so none writes back a value
+    /// another has just changed.
     async fn set_other_param(&self, change: impl FnOnce(&mut OtherParams)) -> Result<()> {
+        let _settings = self.inner.settings_lock.lock().await;
         let held = self.state().self_info.as_ref().map(SelfInfo::other_params);
         let mut params = match held {
             Some(params) => params,
             None => self.send_appstart().await?.other_params(),
         };
         change(&mut params);
-        self.set_other_params(&params).await
+        self.write_other_params(&params).await
     }
 
     /// Sets the telemetry mode for base data (0 deny, 1 by contact flags, 2 allow all).
@@ -502,7 +511,8 @@ impl MeshCore {
     /// Signs `data` on the device in chunks of `chunk_size` bytes (meshcore_py
     /// uses 120); a chunk and its command byte have to fit one frame. Data
     /// longer than the device takes, which only [`sign_start`](Self::sign_start)
-    /// tells, is refused before the first chunk.
+    /// tells, is refused before the first chunk. Calls from several tasks run
+    /// one after the other: the device has one signing session.
     pub async fn sign(
         &self,
         data: &[u8],
@@ -515,6 +525,7 @@ impl MeshCore {
                 "chunk size {chunk_size}, it has to be 1 to {largest} bytes"
             )));
         }
+        let _session = self.inner.sign_lock.lock().await;
         let max_length = self.sign_start().await?;
         if max_length > 0 && data.len() > max_length as usize {
             return Err(Error::invalid(format!(
