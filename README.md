@@ -247,12 +247,13 @@ async fn main() -> meshcore::Result<()> {
 
 ## Events and state
 
-Every frame from the device becomes an `Event`; a push that cannot be read is
-only logged, and a reply that cannot be read becomes an `Event::Error`.
-`subscribe()` returns a `Subscription` for all events from then on,
-`wait_for()` and `wait_for_event()` wait for one. `event.kind().as_str()`
-gives meshcore_py's event type name (`contact_message`, `acknowledgement`,
-...; `contacts_start` and `unknown` are this library's own).
+Every frame from the device becomes an `Event`; an empty frame or a push that
+cannot be read is only logged, and a reply that cannot be read becomes an
+`Event::Error`. `subscribe()` returns a `Subscription` for all events from
+then on, `wait_for()` and `wait_for_event()` wait for one.
+`event.kind().as_str()` gives meshcore_py's event type name
+(`contact_message`, `acknowledgement`, ...; `contacts_start` and `unknown` are
+this library's own).
 
 The client keeps what meshcore_py keeps:
 
@@ -302,9 +303,8 @@ meshcore_py leaves a gap:
   (`add_contact`, `update_contact`, `remove_contact`, `reset_path`,
   `change_contact_path`, `change_contact_flags`, `get_contact_by_key`) and
   drops the contacts the device deletes to make room (`ContactDeleted`);
-  meshcore_py's cache takes contacts from contact lists only, its
-  `reset_path` resets the cached path, and its other commands change at most
-  the contact dict they are given.
+  meshcore_py's cache gains and loses contacts only through contact lists,
+  and its commands change at most the path and flags of a contact it holds.
 - `self_info()` follows the name, location, TX power and radio settings the
   client sets; meshcore_py updates its self info only for the settings of
   `CMD_SET_OTHER_PARAMS` and takes the others from the next `APP_START`.
@@ -341,8 +341,9 @@ meshcore_py leaves a gap:
   its request is cancelled there.
 - `set_channel` keeps the channel's secret for the RX log as `get_channel`
   does; meshcore_py learns secrets from `get_channel` only.
-- An RX log packet that was logged before its channel was known is decrypted
-  when it comes again.
+- An RX log packet that was logged before its channel was known, or while
+  decryption was off, is decrypted when it comes again; meshcore_py takes
+  over the empty entry it logged then.
 - A group text in the RX log that ends within its channel hash and MAC, or an
   advert that ends within the fields its flags announce, gets no decoded
   fields; meshcore_py reports the parts it could read (a location from the
