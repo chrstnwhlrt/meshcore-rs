@@ -1,9 +1,9 @@
 # meshcore-rs
 
 A Rust client library for [MeshCore](https://meshcore.co.uk) companion radios
-connected over USB (serial), WiFi (TCP) or Bluetooth LE. It is a port of the Python library
-[meshcore_py](https://github.com/meshcore-dev/meshcore_py) and keeps its command
-names, event types and payload fields.
+connected over USB (serial), WiFi or Ethernet (TCP) or Bluetooth LE. It is a
+port of the Python library [meshcore_py](https://github.com/meshcore-dev/meshcore_py)
+and keeps its command names, event types and payload fields.
 
 ## Disclaimer
 
@@ -81,22 +81,24 @@ async fn main() -> meshcore::Result<()> {
 ## Connecting
 
 `MeshCore::create_serial` opens the port and starts the session. When the node
-does not answer, it tries again with DTR set and then with DTR inverted, as
-meshcore_py does; a port that cannot be opened fails at once. On boards with the
-usual ESP32 auto-reset circuit, such as the LilyGO T-LoRa V2.1-1.6, a try with
-DTR off holds the chip in reset while RTS is on, and Linux turns both lines on
-when it opens a port. That try gets no answer, and the board starts again when
-the port closes, without the messages waiting in its queue and, if it has no
-real-time clock, without its time. The try with DTR set changes nothing on
-Linux, where DTR is on already; meshcore_py's tries have the same effects.
+does not answer, it tries again with DTR set (unless `SerialConfig` sets it) and
+then with DTR inverted, as meshcore_py does; a port that cannot be opened fails
+at once. On boards with the usual ESP32 auto-reset circuit, such as the LilyGO
+T-LoRa V2.1-1.6, a try with DTR off holds the chip in reset while RTS is on, and
+Linux turns both lines on when it opens a port. That try gets no answer, and the
+board starts again when the port closes, without the messages waiting in its
+queue. If it has no real-time clock, its time is lost with firmware before 1.18
+and goes on from where it stopped with 1.18. The try with DTR set changes nothing
+on Linux, where DTR is on already; meshcore_py's tries have the same effects.
 `connect` on `MeshCore::new(SerialTransport::new(config), options)` tries once,
-with the lines as configured. `SerialConfig` sets the baud rate (115200), DTR
-and RTS (left alone by default), the wait after opening (`settle_delay`, 300 ms,
-for boards that reset on open) and how long old bytes are read and dropped
+with the lines as configured. `SerialConfig` sets the baud rate (115200), DTR and
+RTS (left alone by default), the wait after opening (`settle_delay`, 300 ms, for
+boards that reset on open) and how long old bytes are read and dropped
 (`drain_duration`, 500 ms). `list_ports()` lists the serial ports of the system.
 
-`MeshCore::create_tcp` connects to a WiFi companion (the firmware listens on
-port 5000 unless built otherwise):
+`MeshCore::create_tcp` connects to a WiFi or Ethernet companion. The firmware
+listens on port 5000 unless built otherwise and serves one TCP client: a new
+one takes the place of the one before.
 
 ```rust no_run
 use meshcore::{MeshCore, Options};
@@ -117,10 +119,16 @@ Like meshcore_py, the client counts the frames it sends and receives over TCP.
 When the next frame would be the fifth more sent than received, it takes the
 link for dead instead of sending, and reports `tcp_no_response`.
 
+From firmware 1.17 on a companion can serve several links at once (such as BLE
+and WiFi, depending on the build) and sends every frame over all of them. With
+another app on another link, the client gets that app's replies too and can
+take one for its own.
+
 `MeshCore::create_ble` (feature `ble`) finds a companion by its address, by a
 part of its name (it advertises as `MeshCore-<node name>`) or as the first one
-in range, as meshcore_py does. A companion advertises only while no other app
-(such as the phone app) is connected to it.
+in range, as meshcore_py does. A reconnect looks for it the same way and may
+find another device. A companion advertises only while no other app (such as
+the phone app) is connected to it over BLE.
 
 ```rust ignore
 use meshcore::{BleConfig, MeshCore, Options};
@@ -149,8 +157,9 @@ link to go and connects anew.
 BlueZ keeps a link up after its program is gone, and the device does not
 advertise meanwhile. So call `disconnect` before the program ends; it waits the
 2 s BlueZ takes, and a shorter timeout around it is fine. A client dropped
-without it, or a connect given up halfway, takes its link down in the
-background, which needs the Tokio runtime to keep running for a moment.
+without it, or a connect given up or stopped while it opens the link, takes the
+link down in the background, which needs the Tokio runtime to keep running for a
+moment.
 
 `meshcore::transport::ble::scan` lists the MeshCore devices in range. Frames go
 one per write (with response) and one per notification; a write that takes
@@ -158,15 +167,18 @@ longer than 10 s takes the link down, as in meshcore_py.
 
 `Options` holds the default command timeout (15 s), automatic reconnecting (off;
 up to 3 attempts a second apart, a new link starts with `APP_START` again) and
-the event buffer (1024 events per subscriber). Other links can implement
-`Transport` and go to `MeshCore::new`.
+the event buffer (1024 events per subscriber, which is also the least). Other
+links can implement `Transport` and go to `MeshCore::new`.
 
 ## Commands
 
-Every command is an async method named as in meshcore_py. It waits for the
-device's reply and returns it typed; a device error comes back as
-`Error::Device` with the firmware's `ErrorCode`. One command is in flight at a
-time, so a `MeshCore` (it is `Clone`) can be shared between tasks.
+Every command is an async method, named as in meshcore_py (a few, such as
+`trace_sync` and `fetch_messages`, are this library's own). It waits for the
+device's reply (`reboot` has none) and returns it typed; a device error comes
+back as `Error::Device` with the firmware's `ErrorCode`. One command is in
+flight at a time, so a `MeshCore` (it is `Clone`) can be shared between tasks.
+Replies do not name their command: one that comes after its command was given
+up can pass for the reply to the next, as in meshcore_py.
 
 | Area | Methods |
 |------|---------|
@@ -220,13 +232,15 @@ async fn main() -> meshcore::Result<()> {
 ### Remote nodes
 
 Requests to repeaters, rooms and sensors go out over the mesh. The `_sync`
-methods wait for the answer, which the device matches to the request by a tag;
-the other variants return the `SentInfo` and the answer arrives as an event. The
-firmware keeps one pending request of each kind (login, status, telemetry, path
-discovery, binary or anonymous request) and drops the answer to one that the
-next of its kind replaced, so the client sends them one after the other, as
-meshcore_py does. An answer that arrives while the client reconnects still
-reaches the waiting request.
+methods wait for the answer; the other variants return the `SentInfo` and the
+answer arrives as an event. The firmware keeps one pending request (login,
+status, telemetry, path discovery, binary or anonymous request), and the next
+one replaces it whatever its kind. From 1.18 on the answer to a replaced request
+still comes, but only as a `BinaryResponse`; before, the device drops it. So the
+`_sync` methods of these requests run one after the other, as in meshcore_py;
+the other variants are not held back. With automatic reconnecting, a request
+goes on waiting when its link drops, and an answer the device sends after the
+reconnect still reaches it.
 
 ```rust no_run
 use meshcore::{MeshCore, Options, RequestOptions, SerialConfig};
@@ -267,15 +281,20 @@ The client keeps what meshcore_py keeps:
 - the device's self info (`self_info()`), updated by the settings commands;
 - a contact cache (`contacts()`, `get_contact_by_name()`), replaced by a full
   `get_contacts(0)` and merged by incremental fetches; with
-  `set_auto_update_contacts(true)` it follows adverts and path changes;
+  `set_auto_update_contacts(true)` it follows adverts and path changes, after
+  a reconnect also those from meanwhile;
 - contacts the device heard but did not add (`pending_contacts()`);
 - channel secrets (from `get_channel` and `set_channel`), so that
   `set_decrypt_channel_logs(true)` decrypts group packets in the RX log and
   adds path and signal to received channel messages.
 
+It forgets all that when another device answers `APP_START` (one with another
+public key, unless the client imported it) and after a factory reset.
+
 A command whose link drops fails at once with `Error::ConnectionLost`. As in
 meshcore_py, a write that fails takes the link down too. Without automatic
-reconnecting the client then sends `Event::Disconnected`.
+reconnecting the client then sends `Event::Disconnected`; with it, it does so
+once the attempts have failed, or when a `disconnect` or `connect` ends them.
 
 The library logs through the `log` crate with the target `meshcore`. Where
 meshcore_py logs the same case at info level or above, the message has its
@@ -310,8 +329,20 @@ meshcore_py leaves a gap:
   type, and an answer cut short is dropped).
 - A full contact fetch replaces the cache instead of merging into it, so
   contacts removed on the device disappear. It does so only when the list
-  brings as many contacts as the device reports to hold; a shorter one may
-  be the late answer to an earlier request since a time and is merged.
+  brings as many contacts as the device reports to hold (or is as short as the
+  one before: firmware 1.16.0 counts entries it does not list); a shorter one
+  may be the late answer to an earlier request since a time and is merged.
+  An incremental fetch does not bring the removal of a contact; when it leaves
+  the cache with another number of contacts than the device holds, the contacts
+  stay marked as changed and the next fetch is a full one. meshcore_py's cache
+  keeps removed contacts.
+- A contact list the client did not ask for (another app's on another link),
+  or one during which it removes a contact (the firmware then leaves out
+  another), is merged but does not count as read; meshcore_py goes on from its
+  `lastmod` and can miss what changed before or was left out.
+- `get_contacts_async` waits for the start of the list, so a refusal (while
+  another list is coming in) is its own error; in meshcore_py the refusal
+  can pass for the reply to the next command.
 - `get_contacts` fails when the list stalls for 5 s; meshcore_py looks every
   5 s whether a contact came, so it waits 5 to 10 s. When such a list goes on
   later, the next `get_contacts` does not take its end for its own answer;
@@ -321,15 +352,35 @@ meshcore_py leaves a gap:
   `change_contact_path`, `change_contact_flags`, `get_contact_by_key`) and
   drops the contacts the device deletes to make room (`ContactDeleted`).
   A contact list coming in meanwhile (as with `get_contacts_async`) does not
-  undo such a change with the older copy it brought before.
-  meshcore_py's cache gains and loses contacts only through contact lists,
-  and its commands change at most the path and flags of a contact it holds.
+  undo such a change with the older copy it brought before. When such a command
+  ends without an answer (its link drops, it runs into its timeout or is given
+  up), the device may have taken it, so the contact counts as changed until a
+  list brings it or a full one was read. So does a cached contact for which the
+  device refuses one, as it may not hold the contact any more.
+  meshcore_py's cache gains contacts only through contact lists and never
+  loses one; its commands change at most the path and flags of a contact it
+  holds.
+- When another device answers `APP_START`, and after a factory reset, the
+  client forgets what it held of the one before; meshcore_py keeps it and
+  merges the contacts of both.
 - An advert or path update that arrives while a contact list comes in leaves
   the contacts marked as changed (`contacts_dirty()`), as the list may hold
   that contact from before the change, so `ensure_contacts(true)` and the
   automatic contact update read again. meshcore_py clears the mark at the end
   of the list; its automatic update reads the list again on every advert and
   path update anyway.
+- A new link marks the contacts as changed too, as the device reports adverts
+  and path updates only while an app is connected. The automatic contact
+  update, once a list was read, asks for what changed since when the session
+  started; meshcore_py's waits for the next advert or path update.
+- A contact list since a time that brings nothing ends with the `lastmod` 0;
+  the client goes on from the time it had, where meshcore_py takes over the 0
+  and reads in full the next time. A change the device reported that a list
+  lacks (it came in the second the list starts after, or the device's clock was
+  set back) leaves the contacts marked as changed, and `ensure_contacts(true)`
+  and the automatic update read in full right away; meshcore_py does not look
+  for it. `ensure_contacts` also reads in full when the cache is empty, not
+  since the last `lastmod`.
 - `self_info()` follows the name, location, TX power and radio settings the
   client sets, in the form the device reports them back: the firmware keeps
   the location as a double and frequency and bandwidth as floats, so some
@@ -343,9 +394,10 @@ meshcore_py leaves a gap:
   fetches one message at the start and the rest only after the next
   `MESSAGES_WAITING`, so messages that came during a reconnect wait for the
   next new one.
-- `send_login_sync` returns `Error::LoginFailed` as soon as the node rejects
-  the password; meshcore_py waits for a successful login only and runs into its
-  timeout.
+- `send_login_sync` returns `Error::LoginFailed` as soon as the device reports
+  a refused login; meshcore_py waits for a successful login only and runs into
+  its timeout. (Repeaters, room servers and sensors with firmware 1.18 do not
+  answer a wrong password, which ends in `Error::Timeout`.)
 - `import_private_key` returns `Error::Disabled` as soon as the firmware
   answers that importing keys is disabled; meshcore_py waits for `OK` or an
   error only and runs into its timeout.
@@ -356,28 +408,37 @@ meshcore_py leaves a gap:
   meshcore_py raises an error there.
 - `get_path_hash_mode`, which `change_contact_path` without a hash mode uses,
   fails when the device query fails; meshcore_py takes mode 0 then.
-- The single setters of the `CMD_SET_OTHER_PARAMS` settings (such as
-  `set_multi_acks`) and `sign` run one after the other when several tasks
-  call them at once. In meshcore_py they interleave, so a setter can write
-  back a value another one has just changed, and two signing sessions mix.
+- Commands from several tasks go out one after the other, so each gets its
+  own reply; meshcore_py sends them at once, where one's `OK` or error can end
+  another. The single setters of the `CMD_SET_OTHER_PARAMS` settings (such as
+  `set_multi_acks`) and `sign`, which take several commands, run one after the
+  other as a whole. In meshcore_py they interleave, so a setter can write back
+  a value another one has just changed, and two signing sessions mix.
 - A command fails at once when its link drops instead of waiting for its
   timeout.
-- `send_trace` refuses an empty path before sending; the firmware only traces
-  along at least one hop.
+- `send_trace` refuses an empty path before sending, as the firmware only
+  traces along at least one hop; meshcore_py sends a zero byte as its hop.
 - `fetch_all_neighbours` stops when a page comes back empty; meshcore_py asks
   again forever.
 - A neighbours answer to a request sent with `send_binary_req` is read too,
   with the prefix length from the request; meshcore_py logs an error for it.
   Prefixes asked for longer than 32 bytes are read at the 32 the repeater
   sends, where meshcore_py misreads the entries.
-- `get_self_telemetry` takes only the answer with the device's own key, not
-  a late answer to an earlier telemetry request of another node.
-- A contact set to zero-hop for an anonymous request (`send_anon_req`, used
-  by `req_regions_sync`, `req_owner_sync`, `req_basic_sync` and their
-  `_async` variants) is set back to flood also when the request is given up
-  halfway, as by a timeout around it, and when setting zero-hop got no
-  answer, which the device may have taken anyway. meshcore_py leaves it at
-  zero-hop in both cases.
+- `get_channel`, `get_contact_by_key`, `send_login_sync`,
+  `send_path_discovery_sync` and `get_self_telemetry` take only the answer for
+  the channel, key or node they asked about (the last one the device itself).
+  meshcore_py takes the first of the kind, such as a contact of a list that is
+  coming in or a late answer of another node.
+- An anonymous request (`send_anon_req`, used by `req_regions_sync`,
+  `req_owner_sync`, `req_basic_sync` and their `_async` variants) takes its
+  reply path from the device's own record of the node, along which the device
+  sends. meshcore_py takes it from its contact cache, where the contact may be
+  missing (it then asks for a zero-hop reply) or have an older path, and reads
+  the record only for a contact cached as flood. A contact set to zero-hop for
+  such a request is set back to flood also when the request is given up
+  halfway, as by a timeout around it, and when setting zero-hop got no answer,
+  which the device may have taken anyway. meshcore_py leaves it at zero-hop in
+  both cases.
 - `set_channel` keeps the channel's secret for the RX log as `get_channel`
   does; meshcore_py learns secrets from `get_channel` only.
 - An RX log packet that was logged before its channel was known, or while
@@ -406,7 +467,7 @@ meshcore_py leaves a gap:
   cut in the middle of a character.
 - A command longer than the 176 bytes the firmware takes is refused before it
   is sent; meshcore_py sends it, and the firmware cuts it short over serial and
-  drops it over BLE.
+  Ethernet and drops it over BLE and WiFi.
 - A text the firmware would not send whole is refused too: a private message
   or CLI command to a node over 160 bytes (`MAX_TEXT_LENGTH`; a private
   message from its fifth attempt on over 158), which the firmware answers
@@ -441,6 +502,17 @@ meshcore_py leaves a gap:
 - `connect` takes the link down again when the device does not answer
   `APP_START`, and returns the error; meshcore_py's `connect` returns `None`
   and leaves the link up (its `create_*` functions take it down).
+- A `disconnect` or another `connect` that comes in while a `connect` opens its
+  link counts, and the first one fails with `Error::NotConnected`; meshcore_py
+  opens that link all the same. One that comes in while the client reconnects
+  reports the connection gone; meshcore_py reports nothing then.
+- `disconnect` lets the command in flight finish for up to half a second and
+  sends none of those that wait for their turn; meshcore_py cuts the one in
+  flight off, and a message the automatic fetching has just asked for is lost:
+  the device has taken it out of its queue.
+- A write that does not finish within 10 s takes the link down over serial and
+  TCP too (`serial_write_timeout`, `tcp_write_timeout`); meshcore_py limits
+  writes over BLE only and queues the others in memory.
 - Over serial, the client waits 300 ms after opening the port, then reads and
   drops for 500 ms what the board sent before (boot output, an answer of an
   earlier session); meshcore_py reads from the first byte on, where a stale
@@ -465,12 +537,15 @@ meshcore_py leaves a gap:
 ## Development
 
 ```text
-cargo test --all-features   # unit, client, transport, parity and logging tests, README examples
+cargo test --all-features   # unit and integration tests, README examples
                             # (--all-features includes ble, which needs libdbus)
 cargo clippy --all-targets --all-features
 ```
 
-- `tests/client.rs` runs the client against a simulated device on paused time.
+- `tests/client.rs` runs the client against a simulated device, all but one test
+  on paused time.
+- `tests/contacts.rs` checks the contact cache against a model of the firmware's
+  contact table, with random events and commands.
 - `tests/transports.rs` runs the TCP transport over a local socket and the
   serial transport over a pseudo terminal (Unix).
 - `tests/parity.rs` (feature `serde`) compares with meshcore_py. After updating
@@ -481,7 +556,8 @@ cargo clippy --all-targets --all-features
 `examples/check.rs` checks a real device with read-only commands over any
 transport and prints each result with its time; `--watch` then stays connected
 until Ctrl-C and reports link losses and reconnects (it does not fetch
-messages):
+messages). Over serial it connects with `create_serial`, which can restart a
+board that does not answer (see Connecting).
 
 ```text
 cargo run --example check -- serial /dev/ttyUSB0

@@ -110,7 +110,7 @@ impl OtherParams {
 }
 
 /// Firmware information (`RESP_CODE_DEVICE_INFO`, the reply to `DEVICE_QUERY`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
     /// The firmware's protocol version code (`FIRMWARE_VER_CODE`).
     pub fw_ver: u8,
@@ -118,7 +118,7 @@ pub struct DeviceInfo {
     pub max_contacts: Option<u16>,
     /// The most channels the device stores (code 3 and later).
     pub max_channels: Option<u8>,
-    /// The BLE PIN (code 3 and later).
+    /// The BLE PIN stored on the device, 0 when none is (code 3 and later).
     pub ble_pin: Option<u32>,
     /// The firmware build date (code 3 and later).
     pub fw_build: Option<String>,
@@ -130,6 +130,22 @@ pub struct DeviceInfo {
     pub repeat: Option<bool>,
     /// The path hash mode the device uses (code 10 and later).
     pub path_hash_mode: Option<u8>,
+}
+
+impl fmt::Debug for DeviceInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceInfo")
+            .field("fw_ver", &self.fw_ver)
+            .field("max_contacts", &self.max_contacts)
+            .field("max_channels", &self.max_channels)
+            .field("ble_pin", &self.ble_pin.map(|_| "<redacted>"))
+            .field("fw_build", &self.fw_build)
+            .field("model", &self.model)
+            .field("ver", &self.ver)
+            .field("repeat", &self.repeat)
+            .field("path_hash_mode", &self.path_hash_mode)
+            .finish()
+    }
 }
 
 /// Battery and storage (`RESP_CODE_BATT_AND_STORAGE`).
@@ -384,5 +400,18 @@ mod tests {
         };
         assert!(!format!("{channel:?}").contains("187"));
         assert!(!format!("{channel:?}").contains("bb"));
+        let device = DeviceInfo {
+            fw_ver: 14,
+            max_contacts: Some(350),
+            max_channels: Some(40),
+            ble_pin: Some(123_456),
+            fw_build: None,
+            model: Some("Heltec".into()),
+            ver: None,
+            repeat: None,
+            path_hash_mode: None,
+        };
+        assert!(format!("{device:?}").contains("Heltec"));
+        assert!(!format!("{device:?}").contains("123456"));
     }
 }

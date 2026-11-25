@@ -115,7 +115,8 @@ pub enum Error {
     /// The device has the requested feature disabled (private key export or
     /// import).
     Disabled,
-    /// The remote node rejected the login.
+    /// The device reported a refused login (a node that does not answer a wrong
+    /// password ends in [`Error::Timeout`]).
     LoginFailed,
     /// A reply could not be read or was not the one expected.
     Protocol(String),

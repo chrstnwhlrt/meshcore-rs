@@ -139,7 +139,7 @@ impl Transport for SerialTransport {
             Ok(Link {
                 info: config.port.clone(),
                 events,
-                writer: Box::new(StreamWriter::new(writer, reader_task, sender)),
+                writer: Box::new(StreamWriter::new(writer, "serial", reader_task, sender)),
             })
         })
     }

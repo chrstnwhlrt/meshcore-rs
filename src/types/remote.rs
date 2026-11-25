@@ -6,15 +6,15 @@ use crate::protocol::path::PathLen;
 /// A successful login to a repeater, room server or sensor (`PUSH_CODE_LOGIN_SUCCESS`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoginSuccess {
-    /// The permissions byte (bit 0: admin).
+    /// The permissions byte (bit 0: admin; a room server sends 2 for read-only).
     pub permissions: Option<u8>,
     /// The server's 6-byte key prefix.
     pub pubkey_prefix: Option<[u8; 6]>,
-    /// The server's clock (firmware 1.10 and later).
+    /// The server's clock (firmware 1.7 and later).
     pub server_timestamp: Option<u32>,
-    /// The ACL permissions (firmware 1.10 and later).
+    /// The ACL permissions (firmware 1.7.3 and later).
     pub acl_permissions: Option<u8>,
-    /// The server's firmware level (firmware 1.10 and later).
+    /// The server's firmware level (firmware 1.9 and later).
     pub fw_ver_level: Option<u8>,
 }
 
@@ -49,12 +49,15 @@ pub struct TelemetryResponse {
 
 /// A raw answer to a binary or anonymous request (`PUSH_CODE_BINARY_RESPONSE`).
 ///
-/// Sensor telemetry pushes arrive this way too, with the subscription's push tag.
+/// Sensor telemetry pushes arrive this way too, with the subscription's push
+/// tag, and from firmware 1.18 on every other answer the device cannot match,
+/// such as one to a request the next has replaced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinaryResponse {
     /// The tag: the `expected_ack` of the request's [`SentInfo`](crate::SentInfo).
     pub tag: u32,
-    /// The answer after the tag.
+    /// The answer after the tag, with the zeros that fill the cipher's last
+    /// 16-byte block.
     pub data: Vec<u8>,
 }
 
@@ -180,10 +183,10 @@ pub struct SensorSubscription {
     pub scope: String,
 }
 
-/// A node's name and owner info (anonymous `Owner` request).
+/// A repeater's name and owner info (anonymous `Owner` request).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnonOwner {
-    /// The node's name.
+    /// The repeater's name.
     pub name: String,
     /// The owner info.
     pub owner: String,

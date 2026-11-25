@@ -1,4 +1,6 @@
-//! Checks a companion radio with read-only commands, over any transport.
+//! Checks a companion radio with read-only commands, over any transport. Over
+//! serial it connects as `MeshCore::create_serial` does, which restarts some
+//! boards when they do not answer (see there).
 //!
 //! ```text
 //! cargo run --example check -- serial /dev/ttyUSB0

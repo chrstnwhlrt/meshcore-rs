@@ -1,10 +1,7 @@
 //! Events the client dispatches for the frames the device sends and for the
 //! state of the connection.
 
-use std::future::{Future, poll_fn};
-use std::pin::pin;
 use std::sync::Arc;
-use std::task::Poll;
 
 use tokio::sync::{broadcast, watch};
 
@@ -17,6 +14,7 @@ use crate::types::{
     PublicKey, RadioStats, RawData, RxLogData, SelfInfo, SentInfo, StatusResponse,
     TelemetryResponse, TraceData, TuningParams,
 };
+use crate::util::until;
 
 /// An error the device answered with, or a reply that could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,14 +54,16 @@ pub enum Event {
         /// True after an automatic reconnect.
         reconnected: bool,
     },
-    /// The connection is down (`disconnected`).
+    /// The connection is down (`disconnected`). A lost link is not reported
+    /// while the client reconnects.
     Disconnected {
         /// Why.
         reason: String,
     },
-    /// A command succeeded (`command_ok`), with an optional value.
+    /// A command succeeded (`command_ok`).
     Ok {
-        /// A 32-bit value some commands return.
+        /// The 32-bit value of a longer frame (meshcore_py reads it too; the
+        /// firmware sends none).
         value: Option<u32>,
     },
     /// A command failed (`command_error`).
@@ -127,7 +127,8 @@ pub enum Event {
     TraceData(Box<TraceData>),
     /// Telemetry (`telemetry_response`).
     TelemetryResponse(Box<TelemetryResponse>),
-    /// A raw answer to a binary or anonymous request (`binary_response`).
+    /// A raw answer to a binary or anonymous request, a sensor's telemetry
+    /// push, or an answer the device could not match (`binary_response`).
     BinaryResponse(Box<BinaryResponse>),
     /// A min/max/average answer (`mma_response`).
     MmaResponse(Box<MmaResponse>),
@@ -443,18 +444,11 @@ impl Subscription {
     /// [`Error::ConnectionLost`]. Events from before the link dropped still
     /// come first: the reader dispatches them before it reports the drop.
     pub(crate) async fn recv_on_link(&mut self, generation: u64) -> Result<Event> {
-        let mut event = pin!(next_event(&mut self.receiver));
-        let mut gone = pin!(self.link.wait_for(|current| *current != generation));
-        poll_fn(|cx| {
-            if let Poll::Ready(event) = event.as_mut().poll(cx) {
-                return Poll::Ready(event.ok_or(Error::ConnectionLost));
-            }
-            if gone.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(Err(Error::ConnectionLost));
-            }
-            Poll::Pending
-        })
-        .await
+        let gone = self.link.wait_for(|current| *current != generation);
+        until(gone, next_event(&mut self.receiver))
+            .await
+            .flatten()
+            .ok_or(Error::ConnectionLost)
     }
 
     /// The next event if one is queued, without waiting.
@@ -484,20 +478,26 @@ async fn next_event(receiver: &mut broadcast::Receiver<Event>) -> Option<Event> 
 }
 
 /// Fans events out to subscribers.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct Dispatcher {
     sender: broadcast::Sender<Event>,
-    link: Arc<watch::Sender<u64>>,
+    link: watch::Sender<u64>,
 }
 
 impl Dispatcher {
+    /// How many events a command may fall behind. A list of 350 contacts comes
+    /// in at once over TCP, and a task that waits for it runs only now and
+    /// then in between.
+    pub(crate) const MIN_CAPACITY: usize = 1024;
+
+    /// The buffer is allocated as a whole, so it has a limit.
+    const MAX_CAPACITY: usize = 1 << 20;
+
     pub(crate) fn new(capacity: usize) -> Self {
-        let (sender, _) = broadcast::channel(capacity.max(16));
+        let capacity = capacity.clamp(Self::MIN_CAPACITY, Self::MAX_CAPACITY);
+        let (sender, _) = broadcast::channel(capacity);
         let (link, _) = watch::channel(0);
-        Self {
-            sender,
-            link: Arc::new(link),
-        }
+        Self { sender, link }
     }
 
     /// Records the link that is up now (`0`: none), ending the waits bound
@@ -561,6 +561,13 @@ mod tests {
             sub.recv_on_link(2).await.unwrap().kind(),
             EventKind::NoMoreMessages
         );
+    }
+
+    #[test]
+    fn any_capacity_will_do() {
+        for capacity in [0, usize::MAX] {
+            Dispatcher::new(capacity).dispatch(Event::MessagesWaiting);
+        }
     }
 
     #[test]

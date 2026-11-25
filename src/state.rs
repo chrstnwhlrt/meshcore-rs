@@ -1,6 +1,7 @@
 //! Turns frames from the device into events and keeps the client's state
 //! (meshcore_py's `MessageReader` plus the data tracking of `MeshCore`).
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,8 +15,8 @@ use crate::protocol::codes::{AnonReqType, BinaryReqType, PacketType};
 use crate::protocol::parse;
 use crate::protocol::path::PathLen;
 use crate::types::{
-    AclResponse, BinaryResponse, ChannelRxInfo, Contact, ContactList, CustomVars, PrivateKey,
-    PublicKey, RxLogData, SelfInfo, SentInfo, TelemetryResponse,
+    AclResponse, BinaryResponse, ChannelRxInfo, Contact, ContactList, ContactType, CustomVars,
+    PrivateKey, PublicKey, RxLogData, SelfInfo, SentInfo, TelemetryResponse,
 };
 
 /// The kind of a request whose answer is parsed by its tag.
@@ -47,10 +48,26 @@ struct PendingRequest {
     neighbours_prefix_len: u8,
 }
 
+/// How the device answered a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Answer {
+    /// With `OK`: it has done what the command says.
+    Taken,
+    /// With an error, or that the feature is disabled.
+    Refused,
+    /// With neither, or the answer was not waited for.
+    Unknown,
+}
+
+/// Notes what a command changes in what the client holds, by the answer.
+pub(crate) type Change = Box<dyn FnOnce(&mut State, Answer) + Send>;
+
 #[derive(Debug, Default)]
 struct ContactsInProgress {
-    /// The `since` of the request the list answers; `None` for a list no
-    /// request here waits for any more (it came after its request timed out).
+    /// The `since` of the request the list answers; `None` for a list that
+    /// does not count as read: one no request here waits for (another app's on
+    /// another link, or one that came after its request timed out), or one
+    /// that may leave out contacts.
     since: Option<u32>,
     /// How many contacts the device holds, as the list's start reports.
     count: u32,
@@ -63,20 +80,44 @@ struct ContactsInProgress {
     /// An advert or path update came while the list came in: the list may
     /// hold that contact from before the change.
     changed: bool,
+    /// The contacts reported as changed while the list came in that it has
+    /// not brought since.
+    reported: Vec<PublicKey>,
 }
 
 /// State shared by the reader task and the client.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct State {
     pub(crate) self_info: Option<SelfInfo>,
+    /// The device's public key, unless a private key was imported since the
+    /// last self info.
+    pub(crate) own_key: Option<PublicKey>,
+    /// The length of the device's name on the device, in bytes.
+    pub(crate) name_len: usize,
     pub(crate) time: u32,
     pub(crate) contacts: Vec<Contact>,
+    /// A contact list was read that left the cache with all contacts the
+    /// device holds. Without one, it may hold contacts that came in one by
+    /// one, or since a time.
+    pub(crate) contacts_listed: bool,
     pub(crate) contacts_lastmod: u32,
     pub(crate) contacts_dirty: bool,
+    /// How many more contacts the device counts than its lists bring: firmware
+    /// 1.16.0 counts the transient entries they leave out.
+    unlisted: usize,
+    /// The same of the last list asked for in full, which may have been short
+    /// by accident; `None` when it brought more than the device counted.
+    last_unlisted: Option<usize>,
+    /// The contacts that no list has brought since the device reported them as
+    /// changed, or a command that changes them got no answer or was refused.
+    reported: Vec<PublicKey>,
     pub(crate) pending_contacts: Vec<Contact>,
     /// Set before a contact list request goes out: the `since` it asks with.
     pub(crate) contacts_request_since: Option<u32>,
     building: Option<ContactsInProgress>,
+    /// What the command in flight changes: noted when the device answers,
+    /// before any later frame is read, or when the command ends.
+    pub(crate) change: Option<Change>,
     pub(crate) prepared: Option<PreparedRequest>,
     pending: HashMap<u32, PendingRequest>,
     pub(crate) parser: PacketParser,
@@ -136,15 +177,21 @@ impl State {
     #[allow(clippy::too_many_lines)]
     fn handle(&mut self, packet_type: PacketType, data: &[u8]) -> Result<Vec<Event>> {
         let event = match packet_type {
-            PacketType::Ok => Event::Ok {
-                value: (data.len() == 4)
-                    .then(|| u32::from_le_bytes([data[0], data[1], data[2], data[3]])),
-            },
-            PacketType::Error => Event::Error(ErrorInfo {
-                code: data.first().map(|&c| ErrorCode::from_code(c)),
-                reason: None,
-                packet_type: None,
-            }),
+            PacketType::Ok => {
+                self.note_change(Answer::Taken);
+                Event::Ok {
+                    value: (data.len() == 4)
+                        .then(|| u32::from_le_bytes([data[0], data[1], data[2], data[3]])),
+                }
+            }
+            PacketType::Error => {
+                self.note_change(Answer::Refused);
+                Event::Error(ErrorInfo {
+                    code: data.first().map(|&c| ErrorCode::from_code(c)),
+                    reason: None,
+                    packet_type: None,
+                })
+            }
             PacketType::ContactStart => {
                 let count = ByteReader::new(data).opt_u32().unwrap_or(0);
                 self.building = Some(ContactsInProgress {
@@ -161,51 +208,21 @@ impl State {
                     // (the answer to CMD_GET_CONTACT_BY_KEY in the middle of
                     // a list) is listed once.
                     upsert(&mut building.contacts, contact.clone());
-                    // Sent again after it changed in the cache: this copy
-                    // is the newer one.
-                    building
-                        .newer_in_cache
-                        .retain(|key| *key != contact.public_key);
+                    // Sent again after it changed in the cache or on the
+                    // device: this copy is the newer one.
+                    for keys in [&mut building.newer_in_cache, &mut building.reported] {
+                        keys.retain(|key| *key != contact.public_key);
+                    }
                 } else {
-                    // a single contact (CMD_GET_CONTACT_BY_KEY): the device holds it
-                    self.upsert_contact(contact.clone());
+                    // a single contact (CMD_GET_CONTACT_BY_KEY)
+                    self.cache_device_contact(contact.clone());
                 }
                 Event::NextContact(Box::new(contact))
             }
             PacketType::ContactEnd => {
                 let lastmod = ByteReader::new(data).opt_u32().unwrap_or(0);
                 let contacts = if let Some(building) = self.building.take() {
-                    // Only a list known to be full replaces the cache: one
-                    // asked for in full that brought every contact the
-                    // device holds. Any other may be partial (the late
-                    // answer to an earlier request can take the place of a
-                    // new one) and would drop the contacts it leaves out.
-                    let all = usize::try_from(building.count)
-                        .is_ok_and(|count| count == building.contacts.len());
-                    let newer: Vec<(PublicKey, Option<Contact>)> = building
-                        .newer_in_cache
-                        .iter()
-                        .map(|key| (*key, self.cached(key).cloned()))
-                        .collect();
-                    if building.since == Some(0) && all {
-                        self.contacts.clone_from(&building.contacts);
-                    } else {
-                        for contact in &building.contacts {
-                            self.upsert_contact(contact.clone());
-                        }
-                    }
-                    // What changed in the cache meanwhile stays as it is now.
-                    for (key, contact) in newer {
-                        match contact {
-                            Some(contact) => self.upsert_contact(contact),
-                            None => {
-                                self.remove_contact(&key);
-                            }
-                        }
-                    }
-                    self.contacts_lastmod = lastmod;
-                    self.contacts_dirty = building.changed;
-                    building.contacts
+                    self.end_list(building, lastmod)
                 } else {
                     // Without its start the list is incomplete: the cache stays.
                     log::warn!(target: "meshcore", "end of a contact list that did not start");
@@ -229,8 +246,14 @@ impl State {
                         stopped.contacts.len()
                     );
                 }
-                let info = parse::self_info(data)?;
+                let (info, name_len) = parse::self_info(data)?;
+                if self.own_key.is_some_and(|key| key != info.public_key) {
+                    log::debug!(target: "meshcore", "another device answered: {}", info.public_key);
+                    self.forget_device();
+                }
+                self.own_key = Some(info.public_key);
                 self.self_info = Some(info.clone());
+                self.name_len = name_len;
                 Event::SelfInfo(Box::new(info))
             }
             PacketType::DeviceInfo => Event::DeviceInfo(Box::new(parse::device_info(data)?)),
@@ -289,12 +312,18 @@ impl State {
                 Event::ChannelInfo(Box::new(channel))
             }
             PacketType::Advertisement => {
-                self.contacts_changed();
-                Event::Advertisement(read_key(data)?)
+                let key = read_key(data)?;
+                self.contact_changed(key);
+                Event::Advertisement(key)
             }
             PacketType::PathUpdate => {
+                let key = read_key(data)?;
+                // One of a transient entry is in no list.
+                if self.known(&key).is_some() {
+                    self.contact_reported(key);
+                }
                 self.contacts_changed();
-                Event::PathUpdate(read_key(data)?)
+                Event::PathUpdate(key)
             }
             PacketType::Ack => Event::Ack(parse::ack(data)?),
             PacketType::MessagesWaiting => Event::MessagesWaiting,
@@ -339,7 +368,10 @@ impl State {
                 }
             }
             PacketType::Signature => Event::Signature(data.to_vec()),
-            PacketType::Disabled => Event::Disabled,
+            PacketType::Disabled => {
+                self.note_change(Answer::Refused);
+                Event::Disabled
+            }
             PacketType::ControlData => {
                 let (control, discover) = parse::control_data(data)?;
                 let mut events = vec![Event::ControlData(Box::new(control))];
@@ -362,6 +394,79 @@ impl State {
             PacketType::AdvertPath => Event::AdvertPath(Box::new(parse::advert_path(data)?)),
         };
         Ok(vec![event])
+    }
+
+    /// Takes a contact list that has ended into the cache; returns its contacts.
+    fn end_list(&mut self, list: ContactsInProgress, lastmod: u32) -> Vec<Contact> {
+        let count = usize::try_from(list.count).unwrap_or(usize::MAX);
+        let contacts = list.contacts;
+        let newer: Vec<(PublicKey, Option<Contact>)> = list
+            .newer_in_cache
+            .iter()
+            .map(|key| (*key, self.cached(key).cloned()))
+            .collect();
+        // Only a list known to be full replaces the cache: one asked for in
+        // full that brought every contact the device holds, or is as short as
+        // the one before. Any other may be partial (the late answer to an
+        // earlier request can take the place of a new one) and would drop the
+        // contacts it leaves out.
+        let unlisted = count.checked_sub(contacts.len());
+        let full = list.since == Some(0)
+            && unlisted.is_some_and(|n| n == 0 || self.last_unlisted == Some(n));
+        if full {
+            self.contacts.clone_from(&contacts);
+        } else {
+            for contact in &contacts {
+                upsert(&mut self.contacts, contact.clone());
+            }
+        }
+        // What changed in the cache meanwhile stays as it is now.
+        let changed_meanwhile = !newer.is_empty();
+        for (key, contact) in newer {
+            match contact {
+                Some(contact) => upsert(&mut self.contacts, contact),
+                None => self.contacts.retain(|c| c.public_key != key),
+            }
+        }
+        // One that does not count as read may start after a time not known
+        // here, so it does not stand for the list.
+        let Some(since) = list.since else {
+            return contacts;
+        };
+        if since == 0 {
+            self.last_unlisted = unlisted;
+        }
+        if full {
+            self.unlisted = unlisted.unwrap_or(0);
+        }
+        // A change reported before the list began that it does not bring came
+        // in the second the list starts after, the device's clock was set
+        // back, or the contact is gone. One without an answer may not have
+        // happened, or have left the contact's lastmod. A full list is complete.
+        self.reported.retain(|key| {
+            let brought = contacts.iter().any(|c| c.public_key == *key);
+            list.reported.contains(key) || (!full && !brought)
+        });
+        let lacking = self.reported.iter().any(|key| !list.reported.contains(key));
+        // Less: the cache lacks contacts. Greater: it holds some that were
+        // removed on the device unnoticed. With changes meanwhile the numbers
+        // tell nothing.
+        let held = (!changed_meanwhile).then(|| (self.contacts.len() + self.unlisted).cmp(&count));
+        let incomplete = if since == 0 {
+            !full
+        } else {
+            held.is_some_and(Ordering::is_ne)
+        };
+        if lacking || incomplete {
+            self.contacts_lastmod = 0;
+        } else if since == 0 || !contacts.is_empty() {
+            // One since a time that brings nothing ends with 0: that time
+            // counts on.
+            self.contacts_lastmod = lastmod;
+        }
+        self.contacts_listed |= full || held.is_some_and(Ordering::is_ge);
+        self.contacts_dirty = list.changed || lacking || incomplete;
+        contacts
     }
 
     fn rx_log(&mut self, data: &[u8]) -> RxLogData {
@@ -464,12 +569,95 @@ impl State {
         );
     }
 
-    /// A contact changed on the device (advert, path update): the cache is
-    /// dirty, also after a list that is coming in now.
-    fn contacts_changed(&mut self) {
+    /// The command in flight has ended, or was given up: a reply to it that
+    /// comes later is not taken for it.
+    pub(crate) fn end_command(&mut self) {
+        self.contacts_request_since = None;
+        self.prepared = None;
+        self.note_change(Answer::Unknown);
+    }
+
+    fn note_change(&mut self, answer: Answer) {
+        if let Some(note) = self.change.take() {
+            note(self, answer);
+        }
+    }
+
+    /// Forgets what is held of the device, as another one is there now, or
+    /// this one after a factory reset. The client's own settings stay.
+    pub(crate) fn forget_device(&mut self) {
+        let mut parser = std::mem::take(&mut self.parser);
+        parser.forget_channels();
+        *self = Self {
+            parser,
+            change: self.change.take(),
+            ..Self::new()
+        };
+    }
+
+    /// The device took another key, whose public key comes with its next self
+    /// info. It reads its contacts anew from its storage then, without those
+    /// it had not written yet, so the next list is asked for in full.
+    pub(crate) fn own_key_imported(&mut self) {
+        self.own_key = None;
+        self.contacts_lastmod = 0;
+        self.discount_list();
+        self.contacts_changed();
+    }
+
+    /// A command is about to remove a contact on the device. A list on its
+    /// way leaves out the contact that takes the place of one it has brought.
+    pub(crate) fn removing_contact(&mut self) {
+        self.discount_list();
+    }
+
+    /// A contact list on its way does not count as read.
+    fn discount_list(&mut self) {
+        if let Some(building) = &mut self.building {
+            building.since = None;
+        }
+    }
+
+    /// Contacts changed on the device (advert, path update), or may have while
+    /// no link was up: the cache is dirty, also after a list that is coming in
+    /// now.
+    pub(crate) fn contacts_changed(&mut self) {
         self.contacts_dirty = true;
         if let Some(building) = &mut self.building {
             building.changed = true;
+        }
+    }
+
+    /// A contact changed on the device, or may have: the next list has to
+    /// bring it.
+    pub(crate) fn contact_changed(&mut self, key: PublicKey) {
+        self.contact_reported(key);
+        self.contacts_changed();
+    }
+
+    /// The device refused a command about a contact. One known here it may
+    /// not hold any more.
+    pub(crate) fn contact_refused(&mut self, key: PublicKey) {
+        if self.known(&key).is_some() {
+            self.contact_changed(key);
+        }
+    }
+
+    fn contact_reported(&mut self, key: PublicKey) {
+        let building = self.building.as_mut().map(|b| &mut b.reported);
+        for keys in std::iter::once(&mut self.reported).chain(building) {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+
+    /// Takes a contact the device holds into the cache. One without a type
+    /// that is not known yet is a transient entry of the device (as for an
+    /// anonymous request), which its contact lists leave out.
+    pub(crate) fn cache_device_contact(&mut self, contact: Contact) {
+        if contact.contact_type != ContactType::None || self.known(&contact.public_key).is_some() {
+            self.upsert_contact(contact);
         }
     }
 
@@ -482,6 +670,11 @@ impl State {
     /// Removes a contact from the cache.
     pub(crate) fn remove_contact(&mut self, key: &PublicKey) -> Option<Contact> {
         self.changed_in_cache(*key);
+        // No list is expected to bring it any more.
+        self.reported.retain(|reported| reported != key);
+        if let Some(building) = &mut self.building {
+            building.reported.retain(|reported| reported != key);
+        }
         let index = self.contacts.iter().position(|c| c.public_key == *key)?;
         Some(self.contacts.remove(index))
     }
@@ -489,20 +682,31 @@ impl State {
     /// Sets a contact to flood in the cache, also one that so far only a
     /// list coming in has brought.
     pub(crate) fn reset_contact_path(&mut self, key: &PublicKey) {
-        let listed = self
-            .building
-            .as_ref()
-            .and_then(|building| building.contacts.iter().find(|c| c.public_key == *key));
-        if let Some(mut contact) = self.cached(key).or(listed).cloned() {
+        if let Some(mut contact) = self.known(key).cloned() {
             contact.out_path_len = PathLen::NONE;
             contact.out_path.clear();
             self.upsert_contact(contact);
         }
     }
 
+    /// The newest copy of a contact: of a list coming in, or in the cache.
+    fn known(&self, key: &PublicKey) -> Option<&Contact> {
+        self.listed(key).or_else(|| self.cached(key))
+    }
+
     /// A cached contact by key.
     fn cached(&self, key: &PublicKey) -> Option<&Contact> {
         self.contacts.iter().find(|c| c.public_key == *key)
+    }
+
+    /// A contact by key that the list coming in has brought, newer than the
+    /// one the cache may hold.
+    fn listed(&self, key: &PublicKey) -> Option<&Contact> {
+        let building = self.building.as_ref()?;
+        if building.newer_in_cache.contains(key) {
+            return None;
+        }
+        building.contacts.iter().find(|c| c.public_key == *key)
     }
 
     /// Notes that the cached contact `key` changed while a list comes in, so
@@ -645,7 +849,9 @@ mod tests {
         state.handle_frame(&contact_frame(3, 1, "a"));
         state.handle_frame(&end_frame(40));
         assert_eq!(state.contacts.len(), 2);
-        assert_eq!(state.contacts_lastmod, 40);
+        // the cache lacks one
+        assert!(state.contacts_dirty);
+        assert_eq!(state.contacts_lastmod, 0);
     }
 
     #[test]
@@ -720,6 +926,43 @@ mod tests {
     }
 
     #[test]
+    fn a_contact_without_a_type_so_far_only_listed_takes_a_change() {
+        let mut typeless = contact_frame(3, 1, "a");
+        typeless[33] = 0;
+        let mut state = State::new();
+        state.contacts_request_since = Some(0);
+        state.handle_frame(&[2, 1, 0, 0, 0]);
+        state.handle_frame(&typeless);
+        let key = PublicKey::new([1; 32]);
+        state.cache_device_contact(crate::Contact::new(key, ContactType::None, "a2"));
+        state.handle_frame(&end_frame(7));
+        assert_eq!(state.contacts[0].name, "a2");
+    }
+
+    #[test]
+    fn a_path_reset_while_a_list_comes_keeps_the_newer_copy() {
+        let key = PublicKey::new([1; 32]);
+        let mut with_path = contact_frame(3, 1, "a2");
+        with_path[35] = 0x01;
+        with_path[36] = 0xaa;
+        let mut state = State::new();
+        state.handle_frame(&contact_frame(3, 1, "a"));
+        // the list's, or the cache's when that was written since
+        for (written, kept) in [(None, "a2"), (Some("a3"), "a3")] {
+            state.contacts_request_since = Some(0);
+            state.handle_frame(&[2, 1, 0, 0, 0]);
+            state.handle_frame(&with_path);
+            if let Some(name) = written {
+                state.upsert_contact(crate::Contact::new(key, ContactType::Chat, name));
+            }
+            state.reset_contact_path(&key);
+            state.handle_frame(&end_frame(7));
+            assert_eq!(state.contacts[0].name, kept);
+            assert!(state.contacts[0].is_flood());
+        }
+    }
+
+    #[test]
     fn an_advert_while_a_list_comes_leaves_the_contacts_dirty() {
         let mut advert = vec![0x80];
         advert.extend([1; 32]);
@@ -740,15 +983,313 @@ mod tests {
     }
 
     #[test]
-    fn a_list_after_its_request_gave_up_is_merged() {
-        // get_contacts timed out before the list started: it may be partial
+    fn a_change_reported_while_a_list_comes_is_expected_of_the_next() {
+        let advert = |key: u8| [&[0x80][..], &[key; 32]].concat();
         let mut state = State::new();
+        state.contacts_request_since = Some(0);
+        state.handle_frame(&[2, 2, 0, 0, 0]);
         state.handle_frame(&contact_frame(3, 1, "a"));
+        // one the list has brought already, and one it brings afterwards
+        state.handle_frame(&advert(1));
+        state.handle_frame(&advert(2));
+        state.handle_frame(&contact_frame(3, 2, "b"));
+        state.handle_frame(&end_frame(30));
+        assert!(state.contacts_dirty);
+        // a list without the first one's change lacks it, and so does the
+        // next, whatever else they bring
+        for (name, lastmod) in [("b2", 40), ("b3", 50)] {
+            state.contacts_request_since = Some(30);
+            state.handle_frame(&[2, 2, 0, 0, 0]);
+            state.handle_frame(&contact_frame(3, 2, name));
+            state.handle_frame(&end_frame(lastmod));
+            assert!(state.contacts_dirty);
+            assert_eq!(state.contacts_lastmod, 0);
+        }
+        // a full one brings all there is
+        state.contacts_request_since = Some(0);
         state.handle_frame(&[2, 1, 0, 0, 0]);
         state.handle_frame(&contact_frame(3, 2, "b"));
         state.handle_frame(&end_frame(30));
-        assert_eq!(state.contacts.len(), 2);
+        assert!(!state.contacts_dirty);
         assert_eq!(state.contacts_lastmod, 30);
+        // with only the second one's change the next list lacks nothing
+        state.contacts_request_since = Some(30);
+        state.handle_frame(&[2, 1, 0, 0, 0]);
+        state.handle_frame(&advert(2));
+        state.handle_frame(&contact_frame(3, 2, "b2"));
+        state.handle_frame(&end_frame(40));
+        state.contacts_request_since = Some(40);
+        state.handle_frame(&[2, 1, 0, 0, 0]);
+        state.handle_frame(&end_frame(0));
+        assert!(!state.contacts_dirty);
+        assert_eq!(state.contacts_lastmod, 40);
+    }
+
+    #[test]
+    fn a_contact_deleted_and_added_again_while_a_list_comes_is_expected_of_the_next() {
+        let mut state = State::new();
+        state.contacts_request_since = Some(0);
+        state.handle_frame(&[2, 1, 0, 0, 0]);
+        state.handle_frame(&contact_frame(3, 1, "a"));
+        state.handle_frame(&[&[0x8f][..], &[1; 32]].concat());
+        state.handle_frame(&[&[0x80][..], &[1; 32]].concat());
+        state.handle_frame(&end_frame(30));
+        assert_eq!(state.contacts, Vec::<Contact>::new());
+        state.contacts_request_since = Some(30);
+        state.handle_frame(&[2, 1, 0, 0, 0]);
+        state.handle_frame(&end_frame(0));
+        assert!(state.contacts_dirty);
+        assert_eq!(state.contacts_lastmod, 0);
+    }
+
+    #[test]
+    fn a_path_update_of_a_contact_so_far_only_listed_is_expected_of_the_next_list() {
+        let mut state = State::new();
+        state.contacts_request_since = Some(0);
+        state.handle_frame(&[2, 1, 0, 0, 0]);
+        state.handle_frame(&contact_frame(3, 1, "a"));
+        // in the same second as the contact's last change
+        state.handle_frame(&[&[0x81][..], &[1; 32]].concat());
+        state.handle_frame(&end_frame(30));
+        state.contacts_request_since = Some(30);
+        state.handle_frame(&[2, 1, 0, 0, 0]);
+        state.handle_frame(&end_frame(0));
+        assert!(state.contacts_dirty);
+        assert_eq!(state.contacts_lastmod, 0);
+    }
+
+    /// Feeds a list of these contacts, of which the device counts `count`.
+    fn feed_list(state: &mut State, since: u32, count: u8, contacts: &[(u8, &str)], end: u32) {
+        state.contacts_request_since = Some(since);
+        state.handle_frame(&[2, count, 0, 0, 0]);
+        for (key, name) in contacts {
+            state.handle_frame(&contact_frame(3, *key, name));
+        }
+        state.handle_frame(&end_frame(end));
+    }
+
+    #[test]
+    fn contacts_removed_unnoticed_make_the_next_list_a_full_one() {
+        let mut state = State::new();
+        feed_list(&mut state, 0, 2, &[(1, "a"), (2, "b")], 30);
+        assert!(!state.contacts_dirty);
+        // one was removed, one added
+        for _ in 0..2 {
+            feed_list(&mut state, 30, 2, &[(3, "c")], 40);
+            assert!(state.contacts_dirty);
+            assert_eq!(state.contacts_lastmod, 0);
+        }
+        feed_list(&mut state, 0, 2, &[(2, "b"), (3, "c")], 40);
+        assert_eq!(state.contacts.len(), 2);
+        assert!(!state.contacts_dirty);
+        assert_eq!(state.contacts_lastmod, 40);
+        // one added that a list since a time does not bring
+        feed_list(&mut state, 40, 3, &[], 0);
+        assert!(state.contacts_dirty);
+        assert_eq!(state.contacts_lastmod, 0);
+        // one added while a list came in, twice: that says nothing of others
+        feed_list(
+            &mut state,
+            0,
+            3,
+            &[(2, "b"), (3, "c"), (4, "d"), (5, "e")],
+            50,
+        );
+        feed_list(
+            &mut state,
+            0,
+            4,
+            &[(2, "b"), (3, "c"), (4, "d"), (5, "e"), (6, "f")],
+            60,
+        );
+        feed_list(&mut state, 60, 4, &[], 0);
+        assert!(state.contacts_dirty);
+        assert_eq!(state.contacts_lastmod, 0);
+        // a change in the cache meanwhile: the number tells nothing
+        feed_list(&mut state, 0, 3, &[(2, "b"), (3, "c"), (4, "d")], 40);
+        state.contacts_request_since = Some(40);
+        state.handle_frame(&[2, 3, 0, 0, 0]);
+        state.remove_contact(&PublicKey::new([4; 32]));
+        state.handle_frame(&end_frame(0));
+        assert!(!state.contacts_dirty);
+        assert_eq!(state.contacts_lastmod, 40);
+    }
+
+    #[test]
+    fn a_short_list_during_which_a_contact_changed_does_not_stand_for_all() {
+        // one asked for in full, and one since a time
+        for since in [0, 10] {
+            let mut state = State::new();
+            state.contacts_request_since = Some(since);
+            state.handle_frame(&[2, 3, 0, 0, 0]);
+            state.handle_frame(&contact_frame(3, 1, "a"));
+            state.handle_frame(&contact_frame(3, 2, "b"));
+            state.reset_contact_path(&PublicKey::new([1; 32]));
+            state.handle_frame(&end_frame(30));
+            assert!(!state.contacts_listed);
+            // a full one does
+            state.contacts_request_since = Some(0);
+            state.handle_frame(&[2, 2, 0, 0, 0]);
+            state.handle_frame(&contact_frame(3, 1, "a"));
+            state.handle_frame(&contact_frame(3, 2, "b"));
+            state.reset_contact_path(&PublicKey::new([1; 32]));
+            state.handle_frame(&end_frame(30));
+            assert!(state.contacts_listed && !state.contacts_dirty);
+        }
+    }
+
+    #[test]
+    fn a_device_may_count_contacts_that_it_does_not_list() {
+        // firmware 1.16.0 counts the transient entries its lists leave out:
+        // a list as short as the one before is full
+        let mut state = State::new();
+        feed_list(&mut state, 0, 3, &[(1, "a"), (2, "b")], 30);
+        assert!(state.contacts_dirty);
+        assert_eq!(state.contacts_lastmod, 0);
+        feed_list(&mut state, 0, 3, &[(1, "a"), (2, "b")], 30);
+        assert!(!state.contacts_dirty);
+        assert_eq!(state.contacts_lastmod, 30);
+        feed_list(&mut state, 30, 3, &[], 0);
+        assert!(!state.contacts_dirty);
+        assert_eq!(state.contacts_lastmod, 30);
+        // one removed unnoticed
+        feed_list(&mut state, 30, 2, &[], 0);
+        assert!(state.contacts_dirty);
+        feed_list(&mut state, 0, 2, &[(2, "b")], 30);
+        assert_eq!(state.contacts.len(), 1);
+        assert!(!state.contacts_dirty);
+        assert_eq!(state.contacts_lastmod, 30);
+    }
+
+    #[test]
+    fn after_an_imported_key_a_list_on_its_way_does_not_count_as_read() {
+        let mut state = State::new();
+        for started in [false, true] {
+            state.contacts_request_since = Some(0);
+            if started {
+                state.handle_frame(&[2, 1, 0, 0, 0]);
+            }
+            // the list's request was given up, the import has come since
+            state.end_command();
+            state.own_key_imported();
+            if !started {
+                state.handle_frame(&[2, 1, 0, 0, 0]);
+            }
+            state.handle_frame(&contact_frame(3, 1, "a"));
+            state.handle_frame(&end_frame(30));
+            assert!(state.contacts_dirty);
+            assert_eq!(state.contacts_lastmod, 0);
+        }
+    }
+
+    #[test]
+    fn changes_are_noted_by_the_answer() {
+        let change = || -> Change {
+            Box::new(|state, answer| {
+                state.time = match answer {
+                    Answer::Taken => 1,
+                    Answer::Refused => 2,
+                    Answer::Unknown => 3,
+                };
+            })
+        };
+        let mut state = State::new();
+        for (answer, noted) in [(&[0][..], 1), (&[1, 2], 2), (&[15], 2), (&[10], 3)] {
+            state.change = Some(change());
+            state.handle_frame(answer);
+            // once, before the command ends, if it is one of the answers
+            assert_eq!(state.change.is_none(), noted < 3);
+            state.end_command();
+            assert_eq!(state.time, noted);
+        }
+        // an OK that comes later is no answer to it
+        state.handle_frame(&[0]);
+        assert_eq!(state.time, 3);
+        // another device's self info leaves the command in flight alone
+        state.handle_frame(&self_info_frame());
+        state.change = Some(change());
+        let mut other = self_info_frame();
+        other[4] = 8;
+        state.handle_frame(&other);
+        state.handle_frame(&[0]);
+        assert_eq!(state.time, 1);
+    }
+
+    #[test]
+    fn a_partial_answer_to_a_full_request_may_lack_a_reported_change() {
+        // the late answer to an earlier request since a time
+        let mut state = State::new();
+        state.contacts_request_since = Some(0);
+        state.handle_frame(&[2, 2, 0, 0, 0]);
+        state.handle_frame(&contact_frame(3, 1, "a"));
+        state.handle_frame(&contact_frame(3, 2, "b"));
+        state.handle_frame(&end_frame(30));
+        state.handle_frame(&[&[0x80][..], &[1; 32]].concat());
+        state.contacts_request_since = Some(0);
+        state.handle_frame(&[2, 2, 0, 0, 0]);
+        state.handle_frame(&contact_frame(3, 2, "b"));
+        state.handle_frame(&end_frame(40));
+        assert!(state.contacts_dirty);
+        assert_eq!(state.contacts_lastmod, 0);
+    }
+
+    #[test]
+    fn an_advert_cut_short_changes_nothing() {
+        let mut state = State::new();
+        state.contacts_request_since = Some(0);
+        state.handle_frame(&[2, 1, 0, 0, 0]);
+        state.handle_frame(&contact_frame(3, 1, "a"));
+        state.handle_frame(&end_frame(7));
+        assert!(!state.contacts_dirty);
+        // an advert and a path update without a whole key
+        for code in [0x80, 0x81] {
+            assert!(state.handle_frame(&[code, 1, 2, 3]).is_empty());
+            assert!(!state.contacts_dirty);
+        }
+    }
+
+    #[test]
+    fn a_list_no_request_here_waits_for_is_merged_only() {
+        // another app's on another link, or one that came after get_contacts
+        // gave up: it may start after a time not known here
+        let mut state = State::new();
+        state.handle_frame(&[2, 2, 0, 0, 0]);
+        state.handle_frame(&contact_frame(3, 1, "a"));
+        state.handle_frame(&end_frame(30));
+        assert_eq!(state.contacts.len(), 1);
+        assert!(!state.contacts_listed && state.contacts_dirty);
+        assert_eq!(state.contacts_lastmod, 0);
+        state.contacts_request_since = Some(0);
+        state.handle_frame(&[2, 1, 0, 0, 0]);
+        state.handle_frame(&contact_frame(3, 1, "a"));
+        state.handle_frame(&end_frame(30));
+        assert!(state.contacts_listed && !state.contacts_dirty);
+        // an advert changed a contact the other app has read already
+        let mut advert = vec![0x80];
+        advert.extend([1; 32]);
+        state.handle_frame(&advert);
+        state.handle_frame(&[2, 3, 0, 0, 0]);
+        state.handle_frame(&contact_frame(3, 3, "c"));
+        state.handle_frame(&end_frame(50));
+        assert_eq!(state.contacts.len(), 2);
+        assert!(state.contacts_dirty);
+        assert_eq!(state.contacts_lastmod, 30);
+    }
+
+    #[test]
+    fn a_transient_entry_stays_out_of_the_cache() {
+        // the device keeps a node asked anonymously without a type
+        let mut transient = contact_frame(3, 1, "");
+        transient[33] = 0;
+        let mut state = State::new();
+        let events = state.handle_frame(&transient);
+        assert_eq!(events[0].kind(), EventKind::NextContact);
+        assert_eq!(state.contacts, Vec::<Contact>::new());
+        // one the cache holds is refreshed whatever its type
+        state.handle_frame(&contact_frame(3, 1, "a"));
+        state.handle_frame(&transient);
+        assert_eq!(state.contacts.len(), 1);
+        assert_eq!(state.contacts[0].contact_type, ContactType::None);
     }
 
     #[test]
@@ -884,6 +1425,43 @@ mod tests {
         assert_eq!(acl.entries.len(), 1);
         // matched once
         assert_eq!(state.handle_frame(&response).len(), 1);
+    }
+
+    #[test]
+    fn another_device_does_not_get_the_state_of_the_one_before() {
+        let mut state = State::new();
+        state.parser.decrypt_channels = true;
+        state.handle_frame(&self_info_frame());
+        state.handle_frame(&contact_frame(3, 1, "a"));
+        state.handle_frame(&contact_frame(0x8a, 5, "new"));
+        state.handle_frame(&[9, 0x10, 0, 0, 0]);
+        state.contacts_lastmod = 5;
+        state.contacts_listed = true;
+        state.contacts_dirty = false;
+        let channel = crate::ChannelInfo {
+            channel_idx: 0,
+            channel_name: "#x".into(),
+            channel_secret: [1; 16],
+        };
+        state.parser.add_channel(&channel);
+        // the same device, as after a reconnect
+        state.handle_frame(&self_info_frame());
+        assert_eq!(state.contacts.len(), 1);
+        assert!(!state.contacts_dirty);
+        assert!(state.parser.knows_channels());
+        // one with another key
+        let mut other = self_info_frame();
+        other[4] = 8;
+        state.handle_frame(&other);
+        assert_eq!(state.self_info.as_ref().unwrap().public_key.prefix()[0], 8);
+        assert_eq!(state.name_len, 4);
+        assert_eq!(state.contacts, Vec::<Contact>::new());
+        assert_eq!(state.pending_contacts, Vec::<Contact>::new());
+        assert_eq!((state.contacts_lastmod, state.time), (0, 0));
+        assert!(state.contacts_dirty && !state.contacts_listed);
+        assert!(!state.parser.knows_channels());
+        // the client's own settings stay
+        assert!(state.parser.decrypt_channels && state.parser.keep_channel_secrets());
     }
 
     #[test]

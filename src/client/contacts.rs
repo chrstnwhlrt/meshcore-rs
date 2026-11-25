@@ -2,43 +2,47 @@
 
 use std::time::Duration;
 
-use super::{MeshCore, reply, wait_reply};
+use super::{MeshCore, Turn, reply, wait_reply};
 use crate::error::{Error, Result};
 use crate::event::{Event, Subscription};
 use crate::protocol::codes::CommandType;
 use crate::protocol::path::{MAX_PATH_SIZE, PathLen};
+use crate::state::{Answer, Change, State};
 use crate::types::{AdvertPath, AutoAddConfig, Contact, ContactList, PublicKey};
 
 /// How long a contact list may pause between contacts. meshcore_py looks every
 /// 5 s whether a contact came, so it lets a list pause 5 to 10 s.
 const CONTACTS_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Reads a contact list the device sends on the link with generation `link`:
-/// its start, any number of contacts, then the end marker. The list may pause
-/// up to [`CONTACTS_IDLE_TIMEOUT`] between them. `sub` was taken before the
-/// request went out, so an end without a start since belongs to an earlier
-/// list that went on after its request gave up.
-async fn read_contacts(sub: &mut Subscription, link: u64) -> Result<ContactList> {
+/// Reads a contact list that has started on the link with generation `link`:
+/// any number of contacts, then the end marker. The list may pause up to
+/// [`CONTACTS_IDLE_TIMEOUT`] between them.
+async fn read_contacts(link: u64, events: &mut Subscription) -> Result<ContactList> {
     let mut deadline = tokio::time::Instant::now() + CONTACTS_IDLE_TIMEOUT;
-    let mut started = false;
     loop {
-        let event = tokio::time::timeout_at(deadline, sub.recv_on_link(link))
+        let event = tokio::time::timeout_at(deadline, events.recv_on_link(link))
             .await
             .map_err(|_| Error::Timeout)??;
         match event {
-            Event::ContactsStart { .. } => {
-                started = true;
-                deadline = tokio::time::Instant::now() + CONTACTS_IDLE_TIMEOUT;
-            }
             Event::NextContact(_) => {
                 deadline = tokio::time::Instant::now() + CONTACTS_IDLE_TIMEOUT;
             }
-            Event::Contacts(list) if started => return Ok((*list).clone()),
+            Event::Contacts(list) => return Ok((*list).clone()),
             Event::Error(info) => return Err(super::error_from_info(info)),
             Event::Disconnected { .. } => return Err(Error::ConnectionLost),
             _ => {}
         }
     }
+}
+
+/// A change of the contact `key` that `taken` makes in the cache. When it is
+/// not known whether the device made it, the next list has to bring the contact.
+fn contact_change(key: PublicKey, taken: impl FnOnce(&mut State) + Send + 'static) -> Change {
+    Box::new(move |state, answer| match answer {
+        Answer::Taken => taken(state),
+        Answer::Refused => state.contact_refused(key),
+        Answer::Unknown => state.contact_changed(key),
+    })
 }
 
 fn key_frame(command: CommandType, key: &PublicKey) -> Vec<u8> {
@@ -104,61 +108,68 @@ fn as_stored(contact: &Contact, lastmod: Option<u32>) -> Contact {
     stored
 }
 
-impl MeshCore {
-    /// Reads the contact list: all contacts with `lastmod` 0, else those
-    /// changed since. A list asked for in full that brings as many contacts
-    /// as the device reports to hold replaces the cache; any other is merged.
-    /// A contact that changes in the cache while the list comes in (written
-    /// or removed by this client, or deleted by the device) keeps that
-    /// change, as the list may hold it from before.
-    ///
-    /// When the list stalls for 5 s (no start, contact or end), this fails
-    /// with [`Error::Timeout`]; a list that only starts after that is merged
-    /// into the cache, as it may be partial. A call takes only the end of a
-    /// list whose start came after its request: the end of an earlier list
-    /// that goes on late is not its answer, and the device refuses the
-    /// request with [`ErrorCode::BadState`](crate::ErrorCode::BadState) while
-    /// such a list is still coming.
-    pub async fn get_contacts(&self, lastmod: u32) -> Result<ContactList> {
-        let _guard = self.inner.cmd_lock.lock().await;
-        let mut sub = self.subscribe();
-        let link = self.send_contacts_request(lastmod).await?;
-        let result = read_contacts(&mut sub, link).await;
-        if result.is_err() {
-            self.state().contacts_request_since = None;
-        }
-        result
-    }
-
-    /// Asks for the contact list without waiting; the contacts arrive as
-    /// [`Event::NextContact`] and [`Event::Contacts`], and the cache takes
-    /// them as with [`get_contacts`](Self::get_contacts).
-    pub async fn get_contacts_async(&self, lastmod: u32) -> Result<()> {
-        let _guard = self.inner.cmd_lock.lock().await;
-        self.send_contacts_request(lastmod).await.map(|_| ())
-    }
-
-    /// Asks for the contacts; returns the generation of the link the request
-    /// went out on.
-    async fn send_contacts_request(&self, lastmod: u32) -> Result<u64> {
+impl Turn<'_> {
+    /// Asks for the contacts and waits for the list to start; returns the
+    /// generation of its link and the events from then on. An end before the
+    /// start belongs to an earlier list that went on after its request gave up.
+    async fn start_contacts(&self, lastmod: u32) -> Result<(u64, Subscription)> {
         let mut frame = vec![CommandType::GetContacts.code()];
         if lastmod > 0 {
             frame.extend_from_slice(&lastmod.to_le_bytes());
         }
-        self.state().contacts_request_since = Some(lastmod);
-        let sent = self.send_frame(&frame).await;
-        if sent.is_err() {
-            self.state().contacts_request_since = None;
-        }
-        sent
+        let expect = |state: &mut State| state.contacts_request_since = Some(lastmod);
+        let (link, mut events) = self.send(&frame, expect).await?;
+        let start = reply!(Event::ContactsStart { .. } => ());
+        wait_reply(link, &mut events, CONTACTS_IDLE_TIMEOUT, start).await?;
+        Ok((link, events))
+    }
+}
+
+impl MeshCore {
+    /// Reads the contact list: all contacts with `lastmod` 0, else those
+    /// changed since, which tells neither of contacts removed on the device
+    /// nor of changes it stamped with an earlier time, its clock set back. A
+    /// list asked for in full that brings as many contacts as the device
+    /// reports to hold (or is as short as the one before, as firmware 1.16.0
+    /// counts entries it does not list) replaces the cache; any other is
+    /// merged. When the cache then holds another number of contacts than the
+    /// device, the next list has to be a full one:
+    /// [`contacts_dirty`](Self::contacts_dirty) is true and
+    /// [`contacts_lastmod`](Self::contacts_lastmod) 0. A contact that changes
+    /// in the cache while the list comes in (written or removed by this
+    /// client, or deleted by the device) keeps that change, as the list may
+    /// hold it from before.
+    ///
+    /// When the list stalls for 5 s (no start, contact or end), this fails
+    /// with [`Error::Timeout`]. A list that only starts after that, or another
+    /// app's on another link, is merged into the cache but does not count as
+    /// read, as it may be partial. A call takes only the end of a list whose
+    /// start came after its request: the end of an earlier list that goes on
+    /// late is not its answer, and the device refuses the request with
+    /// [`ErrorCode::BadState`](crate::ErrorCode::BadState) while such a list
+    /// is still coming.
+    pub async fn get_contacts(&self, lastmod: u32) -> Result<ContactList> {
+        let turn = self.turn().await;
+        let (link, mut events) = turn.start_contacts(lastmod).await?;
+        read_contacts(link, &mut events).await
+    }
+
+    /// Asks for the contact list and returns once it starts, without waiting
+    /// for the rest; the contacts arrive as [`Event::NextContact`] and
+    /// [`Event::Contacts`], and the cache takes them as with
+    /// [`get_contacts`](Self::get_contacts).
+    pub async fn get_contacts_async(&self, lastmod: u32) -> Result<()> {
+        let turn = self.turn().await;
+        turn.start_contacts(lastmod).await.map(drop)
     }
 
     /// Forgets a contact's path, so messages to it are flooded.
     pub async fn reset_path(&self, key: &PublicKey) -> Result<()> {
-        self.request_ok(&key_frame(CommandType::ResetPath, key))
-            .await?;
-        self.state().reset_contact_path(key);
-        Ok(())
+        let key = *key;
+        let frame = key_frame(CommandType::ResetPath, &key);
+        let change = contact_change(key, move |state| state.reset_contact_path(&key));
+        self.request_change(&frame, change, reply!(Event::Ok { .. } => ()))
+            .await
     }
 
     /// Sends a contact's advert zero-hop, for nodes nearby to add it.
@@ -195,22 +206,34 @@ impl MeshCore {
         self.request_ok(&frame).await.map(drop)
     }
 
-    /// Removes a contact from the device and the cache.
+    /// Removes a contact from the device and the cache. A list on its way
+    /// meanwhile (as with [`get_contacts_async`](Self::get_contacts_async))
+    /// does not count as read then: the firmware leaves another contact out
+    /// of it.
     pub async fn remove_contact(&self, key: &PublicKey) -> Result<()> {
-        self.request_ok(&key_frame(CommandType::RemoveContact, key))
-            .await?;
-        self.state().remove_contact(key);
-        Ok(())
+        let key = *key;
+        let frame = key_frame(CommandType::RemoveContact, &key);
+        let change = contact_change(key, move |state| drop(state.remove_contact(&key)));
+        let turn = self.turn().await;
+        self.state().removing_contact();
+        turn.request_change(&frame, change, reply!(Event::Ok { .. } => ()))
+            .await
     }
 
     /// Writes a contact to the device (adding it if new) and the cache.
     /// Without `lastmod` the device stamps the record with its clock, which
-    /// the cache does not learn: it keeps the contact's `lastmod` then.
+    /// the cache does not learn: it keeps the contact's `lastmod` then. A new
+    /// contact without a type ([`ContactType::None`](crate::ContactType::None))
+    /// the device keeps only for a while (firmware 1.16 and later) and leaves
+    /// out of its lists, so it stays out of the cache too.
     pub async fn update_contact(&self, contact: &Contact, lastmod: Option<u32>) -> Result<()> {
         let frame = update_contact_frame(contact, lastmod)?;
-        self.request_ok(&frame).await?;
-        self.state().upsert_contact(as_stored(contact, lastmod));
-        Ok(())
+        let stored = as_stored(contact, lastmod);
+        let change = contact_change(contact.public_key, move |state| {
+            state.cache_device_contact(stored);
+        });
+        self.request_change(&frame, change, reply!(Event::Ok { .. } => ()))
+            .await
     }
 
     /// Adds a contact (same as [`update_contact`](Self::update_contact)).
@@ -221,7 +244,7 @@ impl MeshCore {
     /// Sets a contact's path: whole hops of `hash_mode + 1` bytes, at most 63
     /// hops and 64 bytes (hash mode 3 is reserved). Without a hash mode the
     /// device's mode is used (one [`send_device_query`](Self::send_device_query)).
-    /// Returns the contact as the cache now holds it.
+    /// Returns the contact as the device took it.
     pub async fn change_contact_path(
         &self,
         contact: &Contact,
@@ -248,7 +271,7 @@ impl MeshCore {
         Ok(as_stored(&changed, None))
     }
 
-    /// Sets a contact's flags. Returns the contact as the cache now holds it.
+    /// Sets a contact's flags. Returns the contact as the device took it.
     pub async fn change_contact_flags(&self, contact: &Contact, flags: u8) -> Result<Contact> {
         let mut changed = contact.clone();
         changed.flags = flags;
@@ -258,7 +281,11 @@ impl MeshCore {
 
     /// Sets which adverts the device adds as contacts by itself, and
     /// optionally the hop limit: adverts that came over fewer hops are added
-    /// (1: direct ones only, 0: no limit; the firmware caps it at 64).
+    /// (1: direct ones only, 0: no limit; the firmware caps it at 64). The
+    /// type flags (see [`autoadd_flags`](crate::autoadd_flags)) count while
+    /// contacts are added manually
+    /// ([`set_manual_add_contacts`](Self::set_manual_add_contacts)); otherwise
+    /// the device adds every type.
     pub async fn set_autoadd_config(&self, flags: u8, max_hops: Option<u8>) -> Result<()> {
         let mut frame = vec![CommandType::SetAutoaddConfig.code(), flags];
         frame.extend(max_hops);
@@ -276,18 +303,24 @@ impl MeshCore {
         .await
     }
 
-    /// Reads one contact from the device (and refreshes it in the cache).
+    /// Reads one contact from the device (and refreshes it in the cache). A
+    /// node the device knows only from an anonymous request is read too, with
+    /// [`ContactType::None`](crate::ContactType::None), but stays out of the
+    /// cache, as it stays out of the device's lists. A cached one that the
+    /// device refuses to hand out marks the contacts as changed
+    /// ([`contacts_dirty`](Self::contacts_dirty)).
     pub async fn get_contact_by_key(&self, key: &PublicKey) -> Result<Contact> {
-        let frame = key_frame(CommandType::GetContactByKey, key);
-        let wanted = *key;
-        let _guard = self.inner.cmd_lock.lock().await;
-        let mut sub = self.subscribe();
-        let link = self.send_frame(&frame).await?;
-        wait_reply(
-            &mut sub,
-            link,
-            self.default_timeout(),
-            reply!(Event::NextContact(c) if c.public_key == wanted => (**c).clone()),
+        let key = *key;
+        let frame = key_frame(CommandType::GetContactByKey, &key);
+        let change = Box::new(move |state: &mut State, answer| {
+            if answer == Answer::Refused {
+                state.contact_refused(key);
+            }
+        });
+        self.request_change(
+            &frame,
+            change,
+            reply!(Event::NextContact(c) if c.public_key == key => (**c).clone()),
         )
         .await
     }

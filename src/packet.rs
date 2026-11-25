@@ -58,9 +58,14 @@ impl PacketParser {
     pub(crate) fn set_keep_channel_secrets(&mut self, keep: bool) {
         self.keep_channel_secrets = keep;
         if !keep {
-            self.channels = vec![None; 40];
-            self.log.clear();
+            self.forget_channels();
         }
+    }
+
+    /// Drops the channels held and the channel log.
+    pub(crate) fn forget_channels(&mut self) {
+        self.channels = vec![None; 40];
+        self.log.clear();
     }
 
     /// Remembers a channel the device reported or was set to (when secrets
@@ -74,6 +79,11 @@ impl PacketParser {
             self.channels.resize(idx + 1, None);
         }
         self.channels[idx] = Some(channel.clone());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn knows_channels(&self) -> bool {
+        self.channels.iter().any(Option::is_some)
     }
 
     /// The logged packet whose decrypted message has this hash.

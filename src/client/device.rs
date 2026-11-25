@@ -2,10 +2,11 @@
 
 use std::time::Duration;
 
-use super::{MeshCore, reply};
+use super::{MeshCore, reply, wait_reply};
 use crate::error::{Error, Result};
 use crate::event::Event;
 use crate::protocol::codes::{CommandType, StatsType};
+use crate::state::{Answer, Change, State};
 use crate::types::{
     BatteryStatus, ChannelInfo, CoreStats, CustomVars, DeviceInfo, FreqRange, OtherParams,
     PacketStats, PrivateKey, PublicKey, RadioStats, SelfInfo, TelemetryResponse, TuningParams,
@@ -36,6 +37,36 @@ fn reported_radio_value(thousandths: u32) -> u32 {
 }
 
 impl MeshCore {
+    /// Sends a command that changes a setting, which `taken` notes in the
+    /// state once the device takes it.
+    async fn change_setting(
+        &self,
+        frame: &[u8],
+        taken: impl FnOnce(&mut State) + Send + 'static,
+    ) -> Result<()> {
+        let change = Box::new(move |state: &mut State, answer| {
+            if answer == Answer::Taken {
+                taken(state);
+            }
+        });
+        self.request_change(frame, change, reply!(Event::Ok { .. } => ()))
+            .await
+    }
+
+    /// [`change_setting`](Self::change_setting) for one the self info holds.
+    async fn change_self_info(
+        &self,
+        frame: &[u8],
+        taken: impl FnOnce(&mut SelfInfo) + Send + 'static,
+    ) -> Result<()> {
+        self.change_setting(frame, move |state| {
+            if let Some(info) = &mut state.self_info {
+                taken(info);
+            }
+        })
+        .await
+    }
+
     /// Starts the session (`CMD_APP_START`) and returns the device's own
     /// information. Also stops a contact list the device is still sending.
     pub async fn send_appstart(&self) -> Result<SelfInfo> {
@@ -51,8 +82,9 @@ impl MeshCore {
         .await
     }
 
-    /// Queries the firmware (`CMD_DEVICE_QUERY`, protocol version 3). From then
-    /// on until it restarts, the device sends messages as v3 frames, with SNR.
+    /// Queries the firmware (`CMD_DEVICE_QUERY`, protocol version 3). Messages
+    /// the device receives from then on until it restarts come as v3 frames,
+    /// with SNR.
     pub async fn send_device_query(&self) -> Result<DeviceInfo> {
         let frame = [CommandType::DeviceQuery.code(), 0x03];
         self.request(
@@ -64,7 +96,10 @@ impl MeshCore {
     }
 
     /// Runs a CLI command (at least 2 bytes) on the device (firmware code 14
-    /// and later) and returns its reply.
+    /// and later) and returns its reply. One that restarts the device or turns
+    /// it off (`reboot`, `poweroff`) gets no reply, so the call fails. Settings
+    /// it changes get into [`self_info`](Self::self_info) only with the next
+    /// [`send_appstart`](Self::send_appstart).
     pub async fn run_cli_command(&self, command: &str) -> Result<String> {
         if command.len() < 2 || command.contains('\0') {
             return Err(Error::invalid(format!(
@@ -119,11 +154,14 @@ impl MeshCore {
         }
         let mut frame = vec![CommandType::SetAdvertName.code()];
         frame.extend_from_slice(name.as_bytes());
-        self.request_ok(&frame).await?;
-        if let Some(info) = &mut self.state().self_info {
-            info.name = name.to_string();
-        }
-        Ok(())
+        let name = name.to_string();
+        self.change_setting(&frame, move |state| {
+            state.name_len = name.len();
+            if let Some(info) = &mut state.self_info {
+                info.name = name;
+            }
+        })
+        .await
     }
 
     /// Sets the node's location in degrees. They go out in millionths, rounded
@@ -146,12 +184,11 @@ impl MeshCore {
         frame.extend_from_slice(&lat.to_le_bytes());
         frame.extend_from_slice(&lon.to_le_bytes());
         frame.extend_from_slice(&0i32.to_le_bytes());
-        self.request_ok(&frame).await?;
-        if let Some(info) = &mut self.state().self_info {
+        self.change_self_info(&frame, move |info| {
             info.latitude_e6 = reported_coordinate(lat);
             info.longitude_e6 = reported_coordinate(lon);
-        }
-        Ok(())
+        })
+        .await
     }
 
     /// Reboots the device. The device does not answer, so this only sends.
@@ -193,15 +230,15 @@ impl MeshCore {
     pub async fn set_tx_power(&self, dbm: i8) -> Result<()> {
         let mut frame = vec![CommandType::SetRadioTxPower.code()];
         frame.extend_from_slice(&i32::from(dbm).to_le_bytes());
-        self.request_ok(&frame).await?;
-        if let Some(info) = &mut self.state().self_info {
-            info.tx_power = dbm;
-        }
-        Ok(())
+        self.change_self_info(&frame, move |info| info.tx_power = dbm)
+            .await
     }
 
     /// Sets the radio: frequency in MHz, bandwidth in kHz, spreading factor,
-    /// coding rate (5-8) and, on firmware code 9 and later, whether to repeat.
+    /// coding rate (5-8) and, on firmware code 9 and later, whether to repeat:
+    /// `Some(true)` needs a frequency of
+    /// [`get_allowed_repeat_freq`](Self::get_allowed_repeat_freq), and `None`
+    /// leaves the setting out, which turns repeating off too.
     /// The frequency goes out in whole kHz and the bandwidth in whole Hz,
     /// rounded (meshcore_py cuts off the rest). [`self_info`](Self::self_info)
     /// takes them as the device reports them back: a few values, none of a
@@ -232,15 +269,14 @@ impl MeshCore {
         if let Some(repeat) = repeat {
             frame.push(u8::from(repeat));
         }
-        self.request_ok(&frame).await?;
         // The firmware switches the radio at once.
-        if let Some(info) = &mut self.state().self_info {
+        self.change_self_info(&frame, move |info| {
             info.radio_freq = f64::from(reported_radio_value(freq)) / 1000.0;
             info.radio_bw = f64::from(reported_radio_value(bw)) / 1000.0;
             info.radio_sf = sf;
             info.radio_cr = cr;
-        }
-        Ok(())
+        })
+        .await
     }
 
     /// Sets the RX delay base and the airtime factor, both times 1000.
@@ -264,7 +300,10 @@ impl MeshCore {
     }
 
     /// Writes all settings of `CMD_SET_OTHER_PARAMS` (meshcore_py's
-    /// `set_other_params_from_infos`).
+    /// `set_other_params_from_infos`). The single setters, such as
+    /// [`set_multi_acks`](Self::set_multi_acks), change one of them and write
+    /// the others as [`self_info`](Self::self_info) holds them, which undoes
+    /// what another app changed since the last `APP_START`.
     pub async fn set_other_params(&self, params: &OtherParams) -> Result<()> {
         let _settings = self.inner.settings_lock.lock().await;
         self.write_other_params(params).await
@@ -279,11 +318,9 @@ impl MeshCore {
             params.adv_loc_policy,
             params.multi_acks,
         ];
-        self.request_ok(&frame).await?;
-        if let Some(info) = &mut self.state().self_info {
-            info.apply_other_params(*params);
-        }
-        Ok(())
+        let params = *params;
+        self.change_self_info(&frame, move |info| info.apply_other_params(params))
+            .await
     }
 
     /// Changes one of the `CMD_SET_OTHER_PARAMS` settings and keeps the others.
@@ -338,7 +375,9 @@ impl MeshCore {
         self.set_other_param(|p| p.multi_acks = multi_acks).await
     }
 
-    /// Sets the BLE PIN: 0 or six digits.
+    /// Sets the BLE PIN, which the device uses from its next start on: six
+    /// digits, or 0 for the firmware's own (on boards with a display usually a
+    /// random one).
     pub async fn set_devicepin(&self, pin: u32) -> Result<()> {
         let mut frame = vec![CommandType::SetDevicePin.code()];
         frame.extend_from_slice(&pin.to_le_bytes());
@@ -348,17 +387,20 @@ impl MeshCore {
     /// The device's own telemetry.
     pub async fn get_self_telemetry(&self) -> Result<TelemetryResponse> {
         let frame = [CommandType::SendTelemetryReq.code(), 0, 0, 0];
+        let turn = self.turn().await;
         // The answer carries the device's own key prefix; an answer to an
         // earlier send_telemetry_req carries the other node's.
-        let own = self.self_info().map(|info| info.public_key.prefix());
-        self.request(
-            &frame,
-            self.default_timeout(),
-            reply!(Event::TelemetryResponse(t)
-                if t.tag.is_none() && own.is_none_or(|own| t.pubkey_prefix == own)
-                => (**t).clone()),
-        )
-        .await
+        let own = self.state().own_key.map(|key| key.prefix());
+        let (telemetry, _) = turn
+            .request(
+                &frame,
+                self.default_timeout(),
+                reply!(Event::TelemetryResponse(t)
+                    if t.tag.is_none() && own.is_none_or(|own| t.pubkey_prefix == own)
+                    => (**t).clone()),
+            )
+            .await?;
+        Ok(telemetry)
     }
 
     /// The custom variables, in the device's order.
@@ -432,13 +474,13 @@ impl MeshCore {
         let mut frame = vec![CommandType::SetChannel.code(), index];
         frame.extend_from_slice(&name_field);
         frame.extend_from_slice(&secret);
-        self.request_ok(&frame).await?;
-        self.state().parser.add_channel(&ChannelInfo {
+        let channel = ChannelInfo {
             channel_idx: index,
             channel_name: kept.to_string(),
             channel_secret: secret,
-        });
-        Ok(())
+        };
+        self.change_setting(&frame, move |state| state.parser.add_channel(&channel))
+            .await
     }
 
     /// Exports the private key; [`Error::Disabled`] when the firmware does not
@@ -458,11 +500,18 @@ impl MeshCore {
     /// Imports a private key (the 64 bytes
     /// [`export_private_key`](Self::export_private_key) gives);
     /// [`Error::Disabled`] when the firmware does not allow it.
+    /// [`self_info`](Self::self_info) takes the new public key from the next
+    /// [`send_appstart`](Self::send_appstart).
     pub async fn import_private_key(&self, key: &[u8; 64]) -> Result<()> {
         let mut frame = vec![CommandType::ImportPrivateKey.code()];
         frame.extend_from_slice(key);
+        let change = Box::new(|state: &mut State, answer| {
+            if answer != Answer::Refused {
+                state.own_key_imported();
+            }
+        });
         let done = self
-            .request(&frame, self.default_timeout(), |event| match event {
+            .request_change(&frame, change, |event| match event {
                 Event::Ok { .. } => Some(true),
                 Event::Disabled => Some(false),
                 _ => None,
@@ -602,10 +651,12 @@ impl MeshCore {
         token
     }
 
-    /// Step 2 of a factory reset: erases the device and reboots it.
+    /// Step 2 of a factory reset: erases the device and reboots it. The client
+    /// forgets what it holds of the device (self info, contacts, channels).
     ///
-    /// The firmware may drop the link before it answers, so a missing reply
-    /// counts as done.
+    /// The firmware turns its links off first and may not answer (from 1.17 on
+    /// it never does), so a missing reply counts as done once the command went
+    /// out, also one that is not waited for (with a timeout around this).
     pub async fn confirm_factory_reset(&self, token: &str) -> Result<()> {
         {
             let mut stored = super::lock(&self.inner.factory_reset_token);
@@ -618,16 +669,23 @@ impl MeshCore {
         }
         // meshcore_py's text, dash included.
         log::warn!(target: "meshcore", "Executing factory reset — all device data will be erased");
-        match self
-            .request(
-                b"\x33reset",
-                self.default_timeout(),
-                reply!(Event::Ok { .. } => ()),
-            )
-            .await
-        {
+        let turn = self.turn().await;
+        let reset: Change = Box::new(|state, answer| {
+            if answer != Answer::Refused {
+                state.forget_device();
+            }
+        });
+        let expect = |state: &mut State| state.change = Some(reset);
+        let sent = turn.send(b"\x33reset", expect).await;
+        if sent.is_err() {
+            // It did not go out.
+            self.state().change = None;
+        }
+        let (link, mut events) = sent?;
+        let done = reply!(Event::Ok { .. } => ());
+        match wait_reply(link, &mut events, self.default_timeout(), done).await {
             Err(Error::Timeout | Error::ConnectionLost) => Ok(()),
-            other => other,
+            result => result,
         }
     }
 

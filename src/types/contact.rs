@@ -156,11 +156,12 @@ impl ContactType {
 pub mod contact_flags {
     /// The contact is a favourite.
     pub const FAVOURITE: u8 = 0x01;
-    /// The contact may request base telemetry when the mode is "use flags".
+    /// The contact may request base telemetry when its mode is 1 (by contact
+    /// flags).
     pub const TELEMETRY_BASE: u8 = 0x02;
-    /// The contact may request location telemetry when the mode is "use flags".
+    /// The contact may request location telemetry when its mode is 1.
     pub const TELEMETRY_LOCATION: u8 = 0x04;
-    /// The contact may request environment telemetry when the mode is "use flags".
+    /// The contact may request environment telemetry when its mode is 1.
     pub const TELEMETRY_ENVIRONMENT: u8 = 0x08;
     /// The contact may run CLI commands on this node.
     pub const REMOTE_CLI: u8 = 0x10;
@@ -277,7 +278,8 @@ fn name_field_of(name: &str) -> [u8; 32] {
 pub struct ContactList {
     /// The contacts in the order the device sent them.
     pub contacts: Vec<Contact>,
-    /// The most recent `lastmod` of the list, to pass as `since` next time.
+    /// The most recent `lastmod` of the list (0 when it brought no contacts),
+    /// to pass as `since` next time.
     pub lastmod: u32,
 }
 

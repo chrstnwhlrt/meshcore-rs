@@ -5,7 +5,7 @@ use std::time::Duration;
 use super::binary::RequestOptions;
 use super::{MeshCore, reply, wait_response};
 use crate::error::{Error, Result};
-use crate::event::Event;
+use crate::event::{Event, Subscription};
 use crate::protocol::codes::{CommandType, ControlType};
 use crate::protocol::path::PathLen;
 use crate::types::{
@@ -171,6 +171,17 @@ pub fn parse_trace_path(text: &str) -> Result<(Vec<u8>, u8)> {
     Ok((path, flags))
 }
 
+/// The attempt an event acknowledges.
+fn acked_attempt(event: &Event, sent: &[SentInfo]) -> Option<SentInfo> {
+    let Event::Ack(ack) = event else { return None };
+    sent.iter().find(|s| s.expected_ack == ack.code).copied()
+}
+
+/// The attempt that an ACK among the events so far acknowledges.
+fn queued_ack(events: &mut Subscription, sent: &[SentInfo]) -> Option<SentInfo> {
+    std::iter::from_fn(|| events.try_recv()).find_map(|event| acked_attempt(&event, sent))
+}
+
 /// The path length byte and path for commands that take an optional path.
 fn path_with_len(path: &[u8], hash_mode: u8) -> Result<Vec<u8>> {
     let hash_size = usize::from(hash_mode) + 1;
@@ -202,13 +213,26 @@ impl MeshCore {
         .await
     }
 
-    /// Fetches all queued messages.
+    /// Fetches all queued messages (they arrive as events too). When fetching
+    /// fails after some, returns those: the device has already taken them out
+    /// of its queue.
+    ///
+    /// # Errors
+    ///
+    /// The first message could not be fetched.
     pub async fn fetch_messages(&self) -> Result<Vec<ReceivedMessage>> {
         let mut messages = Vec::new();
-        while let Some(message) = self.get_msg().await? {
-            messages.push(message);
+        loop {
+            match self.get_msg().await {
+                Ok(Some(message)) => messages.push(message),
+                Ok(None) => return Ok(messages),
+                Err(err) if messages.is_empty() => return Err(err),
+                Err(err) => {
+                    log::debug!(target: "meshcore", "stopped fetching messages: {err}");
+                    return Ok(messages);
+                }
+            }
         }
-        Ok(messages)
     }
 
     /// Sends a private message of at most [`MAX_TEXT_LENGTH`] bytes (2 fewer
@@ -235,18 +259,17 @@ impl MeshCore {
         frame.extend_from_slice(&timestamp.unwrap_or_else(unix_now).to_le_bytes());
         frame.extend_from_slice(&dst.prefix());
         frame.extend_from_slice(text.as_bytes());
-        self.request(
-            &frame,
-            self.default_timeout(),
-            reply!(Event::MessageSent(s) => *s),
-        )
-        .await
+        let (sent, _) = self.request_sent(&frame).await?;
+        Ok(sent)
     }
 
     /// Sends a CLI command (at most [`MAX_TEXT_LENGTH`] bytes) to a node.
     /// Companions (chat nodes) get `TXT_TYPE_CLI_COMMAND`, others
     /// `TXT_TYPE_CLI_DATA`. Without a type, the destination's or the cached
-    /// contact's type is used; unknown is taken for a repeater.
+    /// contact's type is used; unknown is taken for a repeater. A command gets
+    /// no ACK; the node's reply arrives as a private message
+    /// ([`TextType::CliData`]). From firmware 1.12 on the device sends its own
+    /// time in place of `timestamp`.
     pub async fn send_cmd(
         &self,
         dst: impl Into<Destination>,
@@ -280,12 +303,8 @@ impl MeshCore {
         frame.extend_from_slice(&timestamp.unwrap_or_else(unix_now).to_le_bytes());
         frame.extend_from_slice(&dst.prefix());
         frame.extend_from_slice(command.as_bytes());
-        self.request(
-            &frame,
-            self.default_timeout(),
-            reply!(Event::MessageSent(s) => *s),
-        )
-        .await
+        let (sent, _) = self.request_sent(&frame).await?;
+        Ok(sent)
     }
 
     /// Sends a message and waits for its ACK, retrying; after
@@ -311,11 +330,6 @@ impl MeshCore {
         };
         check_text(text, limit, "message")?;
         let dst = dst.into();
-        let mut full_key = dst.public_key().or_else(|| {
-            self.state()
-                .contact_by_prefix(dst.key_bytes())
-                .map(|c| c.public_key)
-        });
         let timestamp = options.timestamp.unwrap_or_else(unix_now);
         // Subscribed before sending: the ACK can come right behind MSG_SENT.
         let mut sub = self.subscribe();
@@ -324,44 +338,22 @@ impl MeshCore {
         let mut flood_attempts = 0u32;
         let mut flood = false;
 
-        while attempts < options.max_attempts
-            && (!flood || flood_attempts < options.max_flood_attempts)
-        {
-            // The log texts at info and above are meshcore_py's, spelling
-            // included, so that both read the same.
+        // The log texts at info and above are meshcore_py's, spelling included,
+        // so that both read the same.
+        loop {
+            // The ACK may have come while the last attempt failed.
+            if let Some(acked) = queued_ack(&mut sub, &sent) {
+                return Ok(Some(acked));
+            }
+            if attempts >= options.max_attempts
+                || (flood && flood_attempts >= options.max_flood_attempts)
+            {
+                return Ok(None);
+            }
             if attempts == options.flood_after && !flood {
-                if full_key.is_none() {
-                    log::info!(
-                        target: "meshcore",
-                        "Don't have full key, retreiving contacts so we can reset path"
-                    );
-                    if let Err(err) = self.get_contacts(0).await {
-                        log::debug!(target: "meshcore", "could not read contacts: {err}");
-                    }
-                    full_key = self
-                        .state()
-                        .contact_by_prefix(dst.key_bytes())
-                        .map(|c| c.public_key);
-                }
-                match full_key {
-                    Some(key) => {
-                        log::info!(target: "meshcore", "Resetting path");
-                        match self.reset_path(&key).await {
-                            Ok(()) => flood = true,
-                            Err(err) => {
-                                log::debug!(target: "meshcore", "could not reset path: {err}");
-                                log::error!(
-                                    target: "meshcore",
-                                    "Couldn't reset path Event(type=<EventType.ERROR: \
-                                     'command_error'>, payload={}, attributes={{}}) continuing ...",
-                                    super::python_payload(&err)
-                                );
-                            }
-                        }
-                    }
-                    None => {
-                        log::error!(target: "meshcore", "no full key to reset the path, continuing");
-                    }
+                flood = self.reset_path_to(&dst).await;
+                if let Some(acked) = queued_ack(&mut sub, &sent) {
+                    return Ok(Some(acked));
                 }
             }
             if attempts > 0 {
@@ -392,12 +384,11 @@ impl MeshCore {
                         })
                         .max(options.min_timeout);
                     // An ACK for any earlier attempt counts too.
-                    let acked = super::wait_event(&mut sub, wait, |event| {
-                        matches!(event, Event::Ack(ack) if sent.iter().any(|s| s.expected_ack == ack.code))
-                    })
-                    .await;
-                    if let Some(Event::Ack(ack)) = acked {
-                        return Ok(sent.into_iter().find(|s| s.expected_ack == ack.code));
+                    let acked = |event: &Event| acked_attempt(event, &sent);
+                    let event =
+                        super::wait_event(&mut sub, wait, |event| acked(event).is_some()).await;
+                    if let Some(acked) = event.as_ref().and_then(acked) {
+                        return Ok(Some(acked));
                     }
                 }
             }
@@ -406,7 +397,45 @@ impl MeshCore {
                 flood_attempts += 1;
             }
         }
-        Ok(None)
+    }
+
+    /// Resets the path to `dst` for the retries to flood; whether it did. A
+    /// key prefix needs its contact for that.
+    async fn reset_path_to(&self, dst: &Destination) -> bool {
+        let full_key = || {
+            dst.public_key().or_else(|| {
+                self.state()
+                    .contact_by_prefix(dst.key_bytes())
+                    .map(|c| c.public_key)
+            })
+        };
+        let mut key = full_key();
+        if key.is_none() {
+            log::info!(
+                target: "meshcore",
+                "Don't have full key, retreiving contacts so we can reset path"
+            );
+            if let Err(err) = self.get_contacts(0).await {
+                log::debug!(target: "meshcore", "could not read contacts: {err}");
+            }
+            key = full_key();
+        }
+        let Some(key) = key else {
+            log::error!(target: "meshcore", "no full key to reset the path, continuing");
+            return false;
+        };
+        log::info!(target: "meshcore", "Resetting path");
+        if let Err(err) = self.reset_path(&key).await {
+            log::debug!(target: "meshcore", "could not reset path: {err}");
+            log::error!(
+                target: "meshcore",
+                "Couldn't reset path Event(type=<EventType.ERROR: 'command_error'>, payload={}, \
+                 attributes={{}}) continuing ...",
+                super::python_payload(&err)
+            );
+            return false;
+        }
+        true
     }
 
     /// Sends a channel message. The device sends it as `"<node name>: <text>"`
@@ -418,14 +447,11 @@ impl MeshCore {
         text: &str,
         timestamp: Option<u32>,
     ) -> Result<()> {
+        let turn = self.turn().await;
         // An empty channel message is fine with the firmware ("<name>: "). The
         // node name is known once connected; before, the limit is the one for
         // the shortest name.
-        let name_len = self
-            .state()
-            .self_info
-            .as_ref()
-            .map_or(0, |info| info.name.len());
+        let name_len = self.state().name_len;
         if !text.is_empty() {
             let limit = MAX_TEXT_LENGTH.saturating_sub(name_len + 2);
             check_text(text, limit, "channel message")?;
@@ -437,7 +463,10 @@ impl MeshCore {
         ];
         frame.extend_from_slice(&timestamp.unwrap_or_else(unix_now).to_le_bytes());
         frame.extend_from_slice(text.as_bytes());
-        self.request_ok(&frame).await.map(drop)
+        let done = reply!(Event::Ok { .. } => ());
+        turn.request(&frame, self.default_timeout(), done)
+            .await
+            .map(drop)
     }
 
     /// Sends a login to a repeater, room server or sensor without waiting for
@@ -446,10 +475,15 @@ impl MeshCore {
     /// use [`send_login_sync`](Self::send_login_sync).
     pub async fn send_login(&self, dst: &PublicKey, password: &str) -> Result<SentInfo> {
         log::warn!(target: "meshcore", "*** please consider using send_login_sync instead of send_login");
-        self.send_login_raw(dst, password).await
+        let (sent, _) = self.send_login_raw(dst, password).await?;
+        Ok(sent)
     }
 
-    async fn send_login_raw(&self, dst: &PublicKey, password: &str) -> Result<SentInfo> {
+    async fn send_login_raw(
+        &self,
+        dst: &PublicKey,
+        password: &str,
+    ) -> Result<(SentInfo, Subscription)> {
         if password.len() > 15 || password.contains('\0') {
             return Err(Error::invalid(
                 "a login password has at most 15 bytes and no NUL, the firmware cuts it there",
@@ -458,15 +492,14 @@ impl MeshCore {
         let mut frame = vec![CommandType::SendLogin.code()];
         frame.extend_from_slice(dst.as_bytes());
         frame.extend_from_slice(password.as_bytes());
-        self.request(
-            &frame,
-            self.default_timeout(),
-            reply!(Event::MessageSent(s) => *s),
-        )
-        .await
+        self.request_sent(&frame).await
     }
 
-    /// Logs in and waits for the answer; [`Error::LoginFailed`] when refused.
+    /// Logs in and waits for the answer. [`Error::LoginFailed`] when the device
+    /// reports a refused login; repeaters, room servers and sensors (firmware
+    /// 1.18) do not answer a wrong password, which ends in [`Error::Timeout`].
+    /// The device takes the node's next answer for the login's, so a late one
+    /// to an earlier request can pass for it.
     pub async fn send_login_sync(
         &self,
         dst: &PublicKey,
@@ -474,12 +507,11 @@ impl MeshCore {
         options: RequestOptions,
     ) -> Result<LoginSuccess> {
         let _mesh = self.inner.mesh_lock.lock().await;
-        let mut sub = self.subscribe();
-        let sent = self.send_login_raw(dst, password).await?;
+        let (sent, events) = self.send_login_raw(dst, password).await?;
         let prefix = dst.prefix();
         let matches = |p: Option<[u8; 6]>| p.is_none_or(|p| p == prefix);
         wait_response(
-            &mut sub,
+            events,
             options.wait(sent.suggested_timeout),
             |event| match event {
                 Event::LoginSuccess(login) if matches(login.pubkey_prefix) => Some(Ok(*login)),
@@ -506,12 +538,8 @@ impl MeshCore {
         log::warn!(target: "meshcore", "*** please consider using req_status_sync instead of send_statusreq");
         let mut frame = vec![CommandType::SendStatusReq.code()];
         frame.extend_from_slice(dst.as_bytes());
-        self.request(
-            &frame,
-            self.default_timeout(),
-            reply!(Event::MessageSent(s) => *s),
-        )
-        .await
+        let (sent, _) = self.request_sent(&frame).await?;
+        Ok(sent)
     }
 
     /// Asks a node for telemetry the old way; the answer arrives as
@@ -524,12 +552,8 @@ impl MeshCore {
         );
         let mut frame = vec![CommandType::SendTelemetryReq.code(), 0, 0, 0];
         frame.extend_from_slice(dst.as_bytes());
-        self.request(
-            &frame,
-            self.default_timeout(),
-            reply!(Event::MessageSent(s) => *s),
-        )
-        .await
+        let (sent, _) = self.request_sent(&frame).await?;
+        Ok(sent)
     }
 
     /// Starts a path discovery; the answer arrives as [`Event::PathResponse`].
@@ -540,18 +564,14 @@ impl MeshCore {
             target: "meshcore",
             "*** please consider using send_path_discovery_sync instead of send_path_discovery"
         );
-        self.send_path_discovery_raw(dst).await
+        let (sent, _) = self.send_path_discovery_raw(dst).await?;
+        Ok(sent)
     }
 
-    async fn send_path_discovery_raw(&self, dst: &PublicKey) -> Result<SentInfo> {
+    async fn send_path_discovery_raw(&self, dst: &PublicKey) -> Result<(SentInfo, Subscription)> {
         let mut frame = vec![CommandType::SendPathDiscoveryReq.code(), 0];
         frame.extend_from_slice(dst.as_bytes());
-        self.request(
-            &frame,
-            self.default_timeout(),
-            reply!(Event::MessageSent(s) => *s),
-        )
-        .await
+        self.request_sent(&frame).await
     }
 
     /// Discovers the paths to and from a node and waits for the answer.
@@ -561,11 +581,10 @@ impl MeshCore {
         options: RequestOptions,
     ) -> Result<PathDiscovery> {
         let _mesh = self.inner.mesh_lock.lock().await;
-        let mut sub = self.subscribe();
-        let sent = self.send_path_discovery_raw(dst).await?;
+        let (sent, events) = self.send_path_discovery_raw(dst).await?;
         let prefix = dst.prefix();
         wait_response(
-            &mut sub,
+            events,
             options.wait(sent.suggested_timeout),
             reply!(Event::PathResponse(p) if p.pubkey_prefix == prefix => (**p).clone()),
         )
@@ -575,6 +594,11 @@ impl MeshCore {
     /// Sends a trace along a path; the answer arrives as [`Event::TraceData`]
     /// with the tag in [`SentInfo::expected_ack`].
     pub async fn send_trace(&self, request: &TraceRequest) -> Result<SentInfo> {
+        let (sent, _) = self.send_trace_raw(request).await?;
+        Ok(sent)
+    }
+
+    async fn send_trace_raw(&self, request: &TraceRequest) -> Result<(SentInfo, Subscription)> {
         // The firmware traces only along a path of at least one hop.
         if request.path.is_empty() {
             return Err(Error::invalid("a trace needs a path of at least one hop"));
@@ -585,12 +609,7 @@ impl MeshCore {
         frame.extend_from_slice(&request.auth_code.to_le_bytes());
         frame.push(request.flags.unwrap_or(0));
         frame.extend_from_slice(&request.path);
-        self.request(
-            &frame,
-            self.default_timeout(),
-            reply!(Event::MessageSent(s) => *s),
-        )
-        .await
+        self.request_sent(&frame).await
     }
 
     /// Sends a trace and waits for its result.
@@ -599,10 +618,9 @@ impl MeshCore {
         request: &TraceRequest,
         options: RequestOptions,
     ) -> Result<TraceData> {
-        let mut sub = self.subscribe();
-        let sent = self.send_trace(request).await?;
+        let (sent, events) = self.send_trace_raw(request).await?;
         wait_response(
-            &mut sub,
+            events,
             options.wait(sent.suggested_timeout),
             reply!(Event::TraceData(t) if t.tag == sent.expected_ack => (**t).clone()),
         )
@@ -625,8 +643,8 @@ impl MeshCore {
     /// Sends a binary datagram to a channel, flooded or along a path of whole
     /// hops as in [`change_contact_path`](Self::change_contact_path).
     /// `data_type` 0 is reserved; the payload takes at most
-    /// [`MAX_CHANNEL_DATA_LENGTH`] bytes, fewer with a path (the command has
-    /// to fit the device's 176-byte frame).
+    /// [`MAX_CHANNEL_DATA_LENGTH`] bytes, fewer with a path of more than 8
+    /// bytes (the command has to fit the device's 176-byte frame).
     pub async fn send_channel_data(
         &self,
         channel: u8,

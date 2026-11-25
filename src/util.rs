@@ -1,7 +1,10 @@
 //! Small helpers shared by the modules.
 
+use std::future::{Future, poll_fn};
 use std::hash::{BuildHasher, Hasher};
+use std::pin::pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::Poll;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The current time as Unix seconds, as the protocol's 32-bit timestamps use it.
@@ -53,6 +56,23 @@ pub(crate) fn deadline_after(timeout: Duration) -> tokio::time::Instant {
         .unwrap_or_else(|| now + Duration::from_secs(30 * 365 * 24 * 60 * 60))
 }
 
+/// What `future` gives, or `None` once `end` is done (what is ready by then
+/// counts).
+pub(crate) async fn until<T>(
+    end: impl Future + Send,
+    future: impl Future<Output = T> + Send,
+) -> Option<T> {
+    let mut end = pin!(end);
+    let mut future = pin!(future);
+    poll_fn(|cx| {
+        if let Poll::Ready(value) = future.as_mut().poll(cx) {
+            return Poll::Ready(Some(value));
+        }
+        end.as_mut().poll(cx).map(|_| None)
+    })
+    .await
+}
+
 /// How long to wait for a remote answer, given the device's suggested timeout
 /// in milliseconds: meshcore_py waits `suggested_timeout / 800` seconds, i.e.
 /// a quarter longer than suggested.
@@ -63,6 +83,14 @@ pub(crate) fn suggested_wait(suggested_ms: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn until_gives_what_is_ready_first() {
+        use std::future::{pending, ready};
+        assert_eq!(until(pending::<()>(), ready(1)).await, Some(1));
+        assert_eq!(until(ready(()), ready(1)).await, Some(1));
+        assert_eq!(until(ready(()), pending::<u8>()).await, None);
+    }
 
     #[test]
     fn suggested_wait_is_a_quarter_longer() {

@@ -16,11 +16,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::protocol::frame::{FrameDecoder, encode};
 
 /// A boxed future, as the object-safe transport traits return.
@@ -37,10 +39,14 @@ pub enum LinkEvent {
 
 /// Writes frames to the device.
 pub trait FrameWriter: Send {
-    /// Writes one frame (the payload; the transport adds any framing).
+    /// Writes one frame (the payload; the transport adds any framing). When
+    /// it cannot, it also reports the link [closed](LinkEvent::Closed), so that
+    /// the client takes it down. The future is dropped unfinished only when the
+    /// link is taken down.
     fn write_frame<'a>(&'a mut self, frame: &'a [u8]) -> BoxFuture<'a, Result<()>>;
 
-    /// Closes the link.
+    /// Closes the link: when the client disconnects or is dropped, and after
+    /// the link went down.
     fn close(&mut self) -> BoxFuture<'_, ()>;
 }
 
@@ -64,7 +70,10 @@ impl std::fmt::Debug for Link {
 
 /// A way to reach the device.
 pub trait Transport: Send + Sync + 'static {
-    /// Opens a link.
+    /// Opens a link. The one before is closed by then, unless closing it
+    /// takes more than 5 s. The client runs this in a task of its own and drops
+    /// it unfinished when the caller of `connect` gives up, or when the client
+    /// is connected, disconnected or dropped meanwhile.
     fn open(&self) -> BoxFuture<'_, Result<Link>>;
 
     /// A short description for logs (serial port, `host:port`, BLE device).
@@ -74,6 +83,11 @@ pub trait Transport: Send + Sync + 'static {
 /// How many received frames a link buffers before the reader waits.
 pub(crate) const LINK_CAPACITY: usize = 256;
 
+/// How long writing to a byte stream may take before the link counts as lost
+/// (as long as over BLE, where meshcore_py sets it). The system takes a frame
+/// at once unless its buffer is full: the device has stopped reading.
+const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Reads a framed byte stream into link events until it ends. `received`
 /// counts the frames (the TCP transport's liveness check uses it); `name`
 /// prefixes the close reason.
@@ -82,7 +96,7 @@ pub(crate) fn spawn_stream_reader<R>(
     events: mpsc::Sender<LinkEvent>,
     name: &'static str,
     received: Option<Arc<AtomicU32>>,
-) -> tokio::task::JoinHandle<()>
+) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -115,54 +129,93 @@ where
     })
 }
 
-/// Writes frames to a serial port with the `<` framing.
+/// Writes frames to a byte stream with the `<` framing. A write that fails
+/// takes the link down, as in meshcore_py, and so does one that does not
+/// finish, as there over BLE.
 pub(crate) struct StreamWriter<W> {
-    writer: W,
-    reader_task: Option<tokio::task::JoinHandle<()>>,
+    /// `None` once closed.
+    writer: Option<W>,
+    /// As [`spawn_stream_reader`] gets it.
+    name: &'static str,
+    reader_task: Option<JoinHandle<()>>,
     events: mpsc::Sender<LinkEvent>,
 }
 
 impl<W> StreamWriter<W> {
     pub(crate) const fn new(
         writer: W,
-        reader_task: tokio::task::JoinHandle<()>,
+        name: &'static str,
+        reader_task: JoinHandle<()>,
         events: mpsc::Sender<LinkEvent>,
     ) -> Self {
         Self {
-            writer,
+            writer: Some(writer),
+            name,
             reader_task: Some(reader_task),
             events,
         }
     }
+
+    /// Reports the link lost.
+    pub(crate) async fn report_lost(&mut self, reason: String) {
+        let _ = self.events.send(LinkEvent::Closed(reason)).await;
+        if let Some(task) = &self.reader_task {
+            task.abort();
+        }
+    }
 }
 
-impl<W: AsyncWrite + Unpin + Send> FrameWriter for StreamWriter<W> {
+impl<W: AsyncWrite + Unpin> StreamWriter<W> {
+    /// Writes a frame that has its framing.
+    pub(crate) async fn write(&mut self, framed: &[u8]) -> Result<()> {
+        let writer = self.writer.as_mut().ok_or(Error::NotConnected)?;
+        // Not flushed: the bytes are the system's then, and flushing a serial
+        // port blocks the thread until they are out.
+        let written = tokio::time::timeout(STREAM_WRITE_TIMEOUT, writer.write_all(framed)).await;
+        // meshcore_py's log texts, a timeout's as over BLE.
+        let label = if self.name == "tcp" { "TCP" } else { "Serial" };
+        let (reason, err) = match written {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(err)) => {
+                log::warn!(target: "meshcore", "{label} write failed: {err}");
+                (format!("{}_write_failed: {err}", self.name), err.into())
+            }
+            Err(_) => {
+                log::warn!(
+                    target: "meshcore",
+                    "{label} write timed out after {:?}s",
+                    STREAM_WRITE_TIMEOUT.as_secs_f64()
+                );
+                (
+                    format!("{}_write_timeout", self.name),
+                    Error::ConnectionLost,
+                )
+            }
+        };
+        self.report_lost(reason).await;
+        Err(err)
+    }
+}
+
+impl<W: AsyncWrite + Unpin + Send + 'static> FrameWriter for StreamWriter<W> {
     fn write_frame<'a>(&'a mut self, frame: &'a [u8]) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let framed = encode(frame)?;
-            let written = match self.writer.write_all(&framed).await {
-                Ok(()) => self.writer.flush().await,
-                Err(err) => Err(err),
-            };
-            if let Err(err) = written {
-                // As in meshcore_py: the link counts as lost.
-                log::warn!(target: "meshcore", "Serial write failed: {err}");
-                if let Some(task) = self.reader_task.take() {
-                    task.abort();
-                }
-                let reason = format!("serial_write_failed: {err}");
-                let _ = self.events.send(LinkEvent::Closed(reason)).await;
-                return Err(err.into());
-            }
-            Ok(())
+            self.write(&framed).await
         })
     }
 
     fn close(&mut self) -> BoxFuture<'_, ()> {
         Box::pin(async move {
-            let _ = self.writer.shutdown().await;
+            // The stream closes once both halves are gone, and only then can a
+            // serial port be opened again. Closing one blocks the thread while
+            // bytes are still on their way out.
             if let Some(task) = self.reader_task.take() {
                 task.abort();
+                let _ = task.await;
+            }
+            if let Some(writer) = self.writer.take() {
+                let _ = tokio::task::spawn_blocking(move || drop(writer)).await;
             }
         })
     }
@@ -182,36 +235,97 @@ mod tests {
 
     use super::*;
 
-    /// A port that refuses every write, as one that was unplugged.
-    struct UnpluggedPort;
+    type Write = dyn FnMut(&[u8]) -> Poll<std::io::Result<usize>> + Send;
 
-    impl AsyncWrite for UnpluggedPort {
+    /// A port whose writes go this way, and that must not be flushed:
+    /// flushing a real one blocks the thread.
+    struct Port(Box<Write>);
+
+    impl AsyncWrite for Port {
         fn poll_write(
-            self: Pin<&mut Self>,
+            mut self: Pin<&mut Self>,
             _: &mut Context<'_>,
-            _: &[u8],
+            buf: &[u8],
         ) -> Poll<std::io::Result<usize>> {
-            Poll::Ready(Err(std::io::Error::other("unplugged")))
+            (self.0)(buf)
         }
 
         fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
+            panic!("flushed the port");
         }
 
         fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
+            panic!("shut the port down, which flushes it");
         }
+    }
+
+    fn writer_on(
+        write: impl FnMut(&[u8]) -> Poll<std::io::Result<usize>> + Send + 'static,
+    ) -> (StreamWriter<Port>, mpsc::Receiver<LinkEvent>) {
+        let (sender, events) = mpsc::channel(4);
+        let reader = tokio::spawn(std::future::pending());
+        let port = Port(Box::new(write));
+        (StreamWriter::new(port, "serial", reader, sender), events)
+    }
+
+    #[tokio::test]
+    async fn frames_are_written_without_flushing() {
+        let (mut writer, mut events) = writer_on(|buf| Poll::Ready(Ok(buf.len())));
+        writer.write_frame(&[22, 3]).await.unwrap();
+        writer.close().await;
+        assert!(events.try_recv().is_err());
+        assert!(matches!(
+            writer.write_frame(&[22, 3]).await,
+            Err(Error::NotConnected)
+        ));
     }
 
     #[tokio::test]
     async fn a_failed_write_takes_the_link_down() {
-        let (sender, mut events) = mpsc::channel(4);
-        let reader = tokio::spawn(std::future::pending::<()>());
-        let mut writer = StreamWriter::new(UnpluggedPort, reader, sender);
-        assert!(writer.write_frame(&[22, 3]).await.is_err());
+        // as on a port that was unplugged
+        let (mut writer, mut events) =
+            writer_on(|_| Poll::Ready(Err(std::io::Error::other("unplugged"))));
+        assert!(matches!(
+            writer.write_frame(&[22, 3]).await,
+            Err(Error::Io(_))
+        ));
         assert_eq!(
             events.recv().await,
             Some(LinkEvent::Closed("serial_write_failed: unplugged".into()))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_that_does_not_finish_takes_the_link_down() {
+        // as when the device has stopped reading
+        let (mut writer, mut events) = writer_on(|_| Poll::Pending);
+        assert!(matches!(
+            writer.write_frame(&[22, 3]).await,
+            Err(Error::ConnectionLost)
+        ));
+        assert_eq!(
+            events.recv().await,
+            Some(LinkEvent::Closed("serial_write_timeout".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn frames_are_written_whole() {
+        // a port that takes four bytes at a time
+        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut writer, _events) = writer_on({
+            let written = Arc::clone(&written);
+            move |buf| {
+                let len = buf.len().min(4);
+                written.lock().unwrap().extend_from_slice(&buf[..len]);
+                Poll::Ready(Ok(len))
+            }
+        });
+        writer.write_frame(&[1, 2, 3]).await.unwrap();
+        writer.write_frame(&[9]).await.unwrap();
+        assert_eq!(
+            *written.lock().unwrap(),
+            [0x3c, 3, 0, 1, 2, 3, 0x3c, 1, 0, 9]
         );
     }
 }

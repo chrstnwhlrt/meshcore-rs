@@ -61,8 +61,9 @@ pub struct ContactMessage {
     pub signature: Option<[u8; 4]>,
     /// The text.
     pub text: String,
-    /// SNR in dB of the received packet (v3 frames only, which the device
-    /// sends once [`MeshCore::send_device_query`](crate::MeshCore::send_device_query)
+    /// SNR in dB of the received packet (v3 frames only: of messages the
+    /// device received after
+    /// [`MeshCore::send_device_query`](crate::MeshCore::send_device_query)
     /// asked for protocol version 3).
     pub snr: Option<f32>,
 }
@@ -80,8 +81,9 @@ pub struct ChannelMessage {
     pub sender_timestamp: u32,
     /// The text, usually `"sender: message"`.
     pub text: String,
-    /// SNR in dB of the received packet (v3 frames only, which the device
-    /// sends once [`MeshCore::send_device_query`](crate::MeshCore::send_device_query)
+    /// SNR in dB of the received packet (v3 frames only: of messages the
+    /// device received after
+    /// [`MeshCore::send_device_query`](crate::MeshCore::send_device_query)
     /// asked for protocol version 3).
     pub snr: Option<f32>,
     /// Hash of timestamp and text, computed when channel log decryption is
@@ -141,7 +143,9 @@ pub enum ReceivedMessage {
 pub struct SentInfo {
     /// True when the device flooded the packet, false for a direct send.
     pub flood: bool,
-    /// The ACK code to expect, or the tag the response will carry.
+    /// The ACK code to expect (0 for a CLI command, which gets none), or the
+    /// tag the answer will carry (for a login the first 4 bytes of the
+    /// server's key).
     pub expected_ack: u32,
     /// How long the device suggests to wait, in milliseconds.
     pub suggested_timeout: u32,

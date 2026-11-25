@@ -59,11 +59,12 @@ const MAX_PIN: u32 = 999_999;
 const LINK_DROP_WAIT: Duration = Duration::from_secs(3);
 
 /// BLE settings.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BleConfig {
     /// The device: its address (`AA:BB:CC:DD:EE:FF`), a part of its name, or
     /// `None` for the first MeshCore device in range. As in meshcore_py, text
-    /// with a `:` is taken for an address.
+    /// with a `:` is taken for an address, and a reconnect looks for the device
+    /// the same way (a name may find another one then).
     pub address: Option<String>,
     /// The PIN to pair with when the device is not paired yet, or has
     /// forgotten the pairing (shown on the device's display, or set in its
@@ -87,6 +88,18 @@ impl Default for BleConfig {
             connect_timeout: Duration::from_secs(20),
             write_timeout: Duration::from_secs(10),
         }
+    }
+}
+
+impl fmt::Debug for BleConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BleConfig")
+            .field("address", &self.address)
+            .field("pin", &self.pin.map(|_| "<redacted>"))
+            .field("scan_timeout", &self.scan_timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("write_timeout", &self.write_timeout)
+            .finish()
     }
 }
 
@@ -714,10 +727,10 @@ impl FrameWriter for BleWriter {
             // A write that failed or stalled leaves the link unusable (a second
             // write racing a stalled one drops it anyway): report it closed so
             // the client can reconnect.
+            let _ = self.events.send(LinkEvent::Closed(reason)).await;
             if let Some(task) = self.reader_task.take() {
                 task.abort();
             }
-            let _ = self.events.send(LinkEvent::Closed(reason)).await;
             Err(err)
         })
     }
@@ -741,7 +754,7 @@ impl Drop for BleWriter {
         if let Some(task) = self.reader_task.take() {
             task.abort();
         }
-        // Dropped without closing, as when the client is dropped.
+        // Dropped without closing, as when the runtime shuts down.
         if let Some(device) = self.device.take() {
             disconnect_in_background(device);
         }
@@ -815,6 +828,14 @@ mod tests {
         let defaults = BleConfig::default();
         assert_eq!(defaults.write_timeout, Duration::from_secs(10));
         assert_eq!(defaults.address, None);
+    }
+
+    #[test]
+    fn the_pin_stays_out_of_debug_output() {
+        let config = BleConfig::new("MeshCore-1").pin(Some(123_456));
+        let output = format!("{config:?} {:?}", BleTransport::new(config.clone()));
+        assert!(output.contains("MeshCore-1"));
+        assert!(!output.contains("123456"));
     }
 
     #[test]

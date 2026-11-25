@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{device_info_frame, err, self_info_frame};
-use meshcore::{Error, Event, MeshCore, Options, Subscription};
+use meshcore::{Error, Event, MeshCore, Options, Subscription, TcpTransport, Transport};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::timeout;
@@ -298,6 +298,26 @@ async fn tcp_link_without_answers_is_dropped_after_five_frames() {
 }
 
 #[tokio::test]
+async fn tcp_factory_reset_that_is_not_sent_is_not_done() {
+    let device = TcpDevice::start(|command| match command.first() {
+        Some(1) => answer(command),
+        _ => Reply::Write(vec![]),
+    })
+    .await;
+    let mc = device.connect(quick_options()).await;
+    for _ in 0..4 {
+        assert!(matches!(mc.get_bat().await, Err(Error::Timeout)));
+    }
+    // a missing reply counts as done, but this command is never sent
+    let token = mc.request_factory_reset();
+    assert!(matches!(
+        mc.confirm_factory_reset(&token).await,
+        Err(Error::ConnectionLost)
+    ));
+    assert_eq!(device.commands().len(), 5);
+}
+
+#[tokio::test]
 async fn tcp_pushes_count_as_answers() {
     // the device never answers commands but keeps sending pushes
     let device = TcpDevice::start(|command| match command.first() {
@@ -310,6 +330,22 @@ async fn tcp_pushes_count_as_answers() {
         assert!(matches!(mc.get_bat().await, Err(Error::Timeout)));
     }
     assert!(mc.is_connected());
+}
+
+#[tokio::test]
+async fn tcp_frames_too_long_to_send_do_not_count() {
+    let device = TcpDevice::start(|_| Reply::Write(vec![])).await;
+    let transport = TcpTransport::new("127.0.0.1", device.port);
+    let mut link = transport.open().await.unwrap();
+    let too_long = vec![0; usize::from(u16::MAX) + 1];
+    for _ in 0..5 {
+        assert!(matches!(
+            link.writer.write_frame(&too_long).await,
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+    // nothing went out, so the link is not taken for dead
+    link.writer.write_frame(&[20]).await.unwrap();
 }
 
 #[tokio::test]
@@ -338,7 +374,7 @@ async fn tcp_refused_connection_fails_at_once() {
 #[cfg(unix)]
 mod serial {
     use super::*;
-    use meshcore::SerialConfig;
+    use meshcore::{SelfInfo, SerialConfig, SerialTransport};
     use tokio_serial::{SerialPort, SerialStream};
 
     /// A device on the master side of a pseudo terminal. The client opens the
@@ -398,6 +434,88 @@ mod serial {
         assert!(!mc.is_connected());
         let commands = device.commands.lock().unwrap().clone();
         assert_eq!(commands, [APP_START.to_vec(), vec![20]]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn serial_port_is_closed_when_disconnect_returns() {
+        let device = PtyDevice::start(&[], answer).await;
+        let mc = device.connect(device.config()).await;
+        // the device's end of the terminal stays open
+        assert_eq!(open_files(&device.path), 2);
+        mc.disconnect().await.unwrap();
+        assert_eq!(open_files(&device.path), 1);
+        // also when it comes in while a connect opens the port
+        let (mc, connecting) = opening_the_port(&device).await;
+        assert_eq!(open_files(&device.path), 2);
+        mc.disconnect().await.unwrap();
+        assert_eq!(open_files(&device.path), 1);
+        assert!(matches!(
+            connecting.await.unwrap(),
+            Err(Error::NotConnected)
+        ));
+    }
+
+    /// A client whose `connect` has the port open and waits for it to settle.
+    async fn opening_the_port(
+        device: &PtyDevice,
+    ) -> (
+        MeshCore,
+        tokio::task::JoinHandle<meshcore::Result<SelfInfo>>,
+    ) {
+        let config = device.config().settle_delay(Duration::from_secs(1));
+        let mc = MeshCore::new(SerialTransport::new(config), Options::default());
+        let connecting = tokio::spawn({
+            let mc = mc.clone();
+            async move { mc.connect().await }
+        });
+        #[cfg(target_os = "linux")]
+        timeout(PATIENCE, async {
+            while open_files(&device.path) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the port was not opened");
+        #[cfg(not(target_os = "linux"))]
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        (mc, connecting)
+    }
+
+    #[tokio::test]
+    async fn serial_connect_takes_over_from_one_that_is_opening_the_port() {
+        let device = PtyDevice::start(&[], answer).await;
+        let (mc, first) = opening_the_port(&device).await;
+        let info = timeout(PATIENCE, mc.connect())
+            .await
+            .expect("connect took too long")
+            .unwrap();
+        assert_eq!(info.name, "Node");
+        assert!(matches!(first.await.unwrap(), Err(Error::NotConnected)));
+        assert!(mc.is_connected());
+    }
+
+    /// How often this process has `path` open.
+    #[cfg(target_os = "linux")]
+    fn open_files(path: &str) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| std::fs::read_link(entry.unwrap().path()).ok())
+            .filter(|target| target.as_path() == std::path::Path::new(path))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn serial_connect_replaces_a_link_that_is_up() {
+        // the port takes one program at a time, so it has to be free again
+        let device = PtyDevice::start(&[], answer).await;
+        let mc = device.connect(device.config()).await;
+        let info = timeout(PATIENCE, mc.connect())
+            .await
+            .expect("connect took too long")
+            .unwrap();
+        assert_eq!(info.name, "Node");
+        assert_eq!(mc.get_bat().await.unwrap().level, 3540);
     }
 
     #[tokio::test]

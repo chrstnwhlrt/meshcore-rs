@@ -1,8 +1,8 @@
 //! # meshcore
 //!
 //! A client library for [MeshCore](https://meshcore.co.uk) companion radios
-//! over serial (USB), TCP (WiFi) and BLE, ported from the Python library
-//! [meshcore_py](https://github.com/meshcore-dev/meshcore_py).
+//! over serial (USB), TCP (WiFi, Ethernet) and BLE, ported from the Python
+//! library [meshcore_py](https://github.com/meshcore-dev/meshcore_py).
 //!
 //! ```no_run
 //! use meshcore::{MeshCore, Options, SerialConfig};
@@ -24,10 +24,11 @@
 //!
 //! ## How it works
 //!
-//! - Every command is an async method on [`MeshCore`], named as in
-//!   meshcore_py, that waits for the device's reply and returns it typed.
-//!   Device errors come back as [`Error::Device`] with the firmware's
-//!   [`ErrorCode`]. One command is in flight at a time.
+//! - Every command is an async method on [`MeshCore`], named as in meshcore_py
+//!   (a few are this library's own), that waits for the device's reply, if it
+//!   sends one, and returns it typed. Device errors come back as
+//!   [`Error::Device`] with the firmware's [`ErrorCode`]. One command is in
+//!   flight at a time.
 //! - Every frame the device sends becomes an [`Event`] (an empty frame or a
 //!   push that cannot be read is only logged); [`MeshCore::subscribe`]
 //!   delivers them, [`MeshCore::wait_for`] waits for one.
@@ -42,7 +43,7 @@
 //! ## Transports
 //!
 //! [`MeshCore::create_serial`] for USB/serial companions and
-//! [`MeshCore::create_tcp`] for WiFi companions are always built;
+//! [`MeshCore::create_tcp`] for WiFi and Ethernet companions are always built;
 //! `MeshCore::create_ble` for BLE companions comes with the `ble` feature.
 //! Other links implement [`Transport`].
 //!

@@ -32,7 +32,7 @@ pub fn encode(payload: &[u8]) -> Result<Vec<u8>> {
     if payload.len() > DEVICE_MAX_FRAME_SIZE {
         log::warn!(
             target: "meshcore",
-            "sending a {} byte frame, the firmware keeps only {DEVICE_MAX_FRAME_SIZE}",
+            "sending a {} byte frame, the firmware takes at most {DEVICE_MAX_FRAME_SIZE}",
             payload.len()
         );
     }

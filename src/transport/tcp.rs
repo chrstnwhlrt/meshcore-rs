@@ -1,10 +1,9 @@
-//! TCP transport for companion radios on WiFi.
+//! TCP transport for companion radios on WiFi or Ethernet.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::mpsc;
@@ -12,7 +11,7 @@ use tokio::sync::mpsc;
 use crate::error::{Error, Result};
 use crate::protocol::frame::encode;
 use crate::transport::{
-    BoxFuture, FrameWriter, LINK_CAPACITY, Link, LinkEvent, Transport, spawn_stream_reader,
+    BoxFuture, FrameWriter, LINK_CAPACITY, Link, StreamWriter, Transport, spawn_stream_reader,
 };
 
 /// When the next frame would make this many more sent than received, the
@@ -69,9 +68,7 @@ impl Transport for TcpTransport {
                 info: target,
                 events,
                 writer: Box::new(TcpWriter {
-                    writer,
-                    reader_task: Some(reader_task),
-                    events: sender,
+                    stream: StreamWriter::new(writer, "tcp", reader_task, sender),
                     sent: 0,
                     received,
                 }),
@@ -85,9 +82,7 @@ impl Transport for TcpTransport {
 }
 
 struct TcpWriter {
-    writer: OwnedWriteHalf,
-    reader_task: Option<tokio::task::JoinHandle<()>>,
-    events: mpsc::Sender<LinkEvent>,
+    stream: StreamWriter<OwnedWriteHalf>,
     sent: u32,
     received: Arc<AtomicU32>,
 }
@@ -95,6 +90,8 @@ struct TcpWriter {
 impl FrameWriter for TcpWriter {
     fn write_frame<'a>(&'a mut self, frame: &'a [u8]) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            // A frame that does not fit is refused and does not count as sent.
+            let framed = encode(frame)?;
             self.sent = self.sent.wrapping_add(1);
             let received = self.received.load(Ordering::Relaxed);
             // More frames received than sent (pushes) counts as answered.
@@ -104,44 +101,14 @@ impl FrameWriter for TcpWriter {
                     "TCP link taken for dead: {} frames sent, {received} received",
                     self.sent
                 );
-                if let Some(task) = self.reader_task.take() {
-                    task.abort();
-                }
-                let _ = self
-                    .events
-                    .send(LinkEvent::Closed("tcp_no_response".into()))
-                    .await;
+                self.stream.report_lost("tcp_no_response".into()).await;
                 return Err(Error::ConnectionLost);
             }
-            let framed = encode(frame)?;
-            if let Err(err) = self.writer.write_all(&framed).await {
-                // As in meshcore_py: the link counts as lost.
-                log::warn!(target: "meshcore", "TCP write failed: {err}");
-                if let Some(task) = self.reader_task.take() {
-                    task.abort();
-                }
-                let reason = format!("tcp_write_failed: {err}");
-                let _ = self.events.send(LinkEvent::Closed(reason)).await;
-                return Err(err.into());
-            }
-            Ok(())
+            self.stream.write(&framed).await
         })
     }
 
     fn close(&mut self) -> BoxFuture<'_, ()> {
-        Box::pin(async move {
-            let _ = self.writer.shutdown().await;
-            if let Some(task) = self.reader_task.take() {
-                task.abort();
-            }
-        })
-    }
-}
-
-impl Drop for TcpWriter {
-    fn drop(&mut self) {
-        if let Some(task) = self.reader_task.take() {
-            task.abort();
-        }
+        self.stream.close()
     }
 }

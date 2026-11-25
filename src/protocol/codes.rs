@@ -275,7 +275,7 @@ impl PacketType {
 code_enum! {
     /// Request types of `CMD_SEND_BINARY_REQ`.
     pub enum BinaryReqType {
-        /// Status of a repeater, room server or sensor.
+        /// Status of a repeater or room server.
         Status = 0x01,
         /// Keep-alive.
         KeepAlive = 0x02,
@@ -297,13 +297,13 @@ code_enum! {
 }
 
 code_enum! {
-    /// Request types of `CMD_SEND_ANON_REQ`.
+    /// Request types of `CMD_SEND_ANON_REQ`, which repeaters answer.
     pub enum AnonReqType {
-        /// Regions the node serves.
+        /// Regions whose floods the repeater forwards.
         Regions = 0x01,
-        /// Name and owner info.
+        /// The repeater's name and owner info.
         Owner = 0x02,
-        /// Basic info (the remote clock).
+        /// Basic info: the repeater's clock and flags.
         Basic = 0x03,
     }
 }

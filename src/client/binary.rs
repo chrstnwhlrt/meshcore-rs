@@ -7,14 +7,14 @@
 
 use std::time::Duration;
 
-use super::{MeshCore, reply, wait_response};
+use super::{MeshCore, reply, wait_reply, wait_response};
 use crate::error::{Error, Result};
-use crate::event::Event;
+use crate::event::{Event, Subscription};
 use crate::lpp::Telemetry;
 use crate::protocol::bytes::lossy_ignore;
 use crate::protocol::codes::{AnonReqType, BinaryReqType, CommandType};
 use crate::protocol::path::{PathLen, encode_reply_path};
-use crate::state::{PreparedRequest, RequestKind};
+use crate::state::{PreparedRequest, RequestKind, State};
 use crate::types::{
     AclEntry, AnonOwner, BinaryResponse, MmaEntry, NeighboursQuery, NeighboursResponse, OwnerInfo,
     PublicKey, SensorSubscription, SentInfo, StatusResponse,
@@ -104,6 +104,19 @@ impl MeshCore {
         data: &[u8],
         options: RequestOptions,
     ) -> Result<SentInfo> {
+        let (sent, _) = self
+            .send_binary_raw(dst, request_type, data, options)
+            .await?;
+        Ok(sent)
+    }
+
+    async fn send_binary_raw(
+        &self,
+        dst: &PublicKey,
+        request_type: BinaryReqType,
+        data: &[u8],
+        options: RequestOptions,
+    ) -> Result<(SentInfo, Subscription)> {
         // A neighbours answer lists key prefixes of the length the request
         // asks for, which the repeater reads from the sixth byte of the data.
         let neighbours_prefix_len = match request_type {
@@ -130,20 +143,17 @@ impl MeshCore {
 
     /// Sends a request whose answer is matched by tag; the tag is bound
     /// before any later frame is read.
-    async fn send_tracked(&self, frame: &[u8], prepared: PreparedRequest) -> Result<SentInfo> {
-        let _guard = self.inner.cmd_lock.lock().await;
-        self.state().prepared = Some(prepared);
-        let result = self
-            .request_locked(
-                frame,
-                self.default_timeout(),
-                reply!(Event::MessageSent(s) => *s),
-            )
-            .await;
-        if result.is_err() {
-            self.state().prepared = None;
-        }
-        result
+    async fn send_tracked(
+        &self,
+        frame: &[u8],
+        prepared: PreparedRequest,
+    ) -> Result<(SentInfo, Subscription)> {
+        let turn = self.turn().await;
+        let expect = |state: &mut State| state.prepared = Some(prepared);
+        let (link, mut events) = turn.send(frame, expect).await?;
+        let sent = reply!(Event::MessageSent(sent) => *sent);
+        let sent = wait_reply(link, &mut events, self.default_timeout(), sent).await?;
+        Ok((sent, events))
     }
 
     /// Sends a binary request and waits for its typed answer.
@@ -156,18 +166,17 @@ impl MeshCore {
         extract: impl Fn(&Event, u32) -> Option<T>,
     ) -> Result<T> {
         let _mesh = self.inner.mesh_lock.lock().await;
-        let mut sub = self.subscribe();
-        let sent = self
-            .send_binary_req(dst, request_type, data, options)
+        let (sent, events) = self
+            .send_binary_raw(dst, request_type, data, options)
             .await?;
         let tag = sent.expected_ack;
-        wait_response(&mut sub, options.wait(sent.suggested_timeout), |event| {
+        wait_response(events, options.wait(sent.suggested_timeout), |event| {
             extract(event, tag)
         })
         .await
     }
 
-    /// A node's status.
+    /// The status of a repeater or room server.
     pub async fn req_status_sync(
         &self,
         dst: &PublicKey,
@@ -429,11 +438,13 @@ impl MeshCore {
     }
 
     /// Sends an anonymous request (`CMD_SEND_ANON_REQ`), which needs no login
-    /// and no contact. The answer arrives as [`Event::BinaryResponse`].
+    /// and, from firmware 1.16 on, no contact. Repeaters answer it when it
+    /// comes direct; the answer arrives as [`Event::BinaryResponse`] and starts
+    /// with the repeater's clock (4 bytes).
     ///
-    /// The request carries the reply path: the contact's out path, or
-    /// zero-hop. A contact the cache holds as flood is read from the device
-    /// first; if the device holds it as flood too, it is set to zero-hop for
+    /// The request carries the reply path: the out path of the device's own
+    /// record of the node, which is read first, or zero-hop for a node that is
+    /// no contact. A contact the device holds as flood is set to zero-hop for
     /// the request and reset to flood afterwards, also when the request is
     /// given up halfway (the reset then runs in the background) and when
     /// setting zero-hop got no answer, which the device may have taken anyway.
@@ -443,25 +454,31 @@ impl MeshCore {
         request_type: AnonReqType,
         options: RequestOptions,
     ) -> Result<SentInfo> {
-        let mut contact = self.contact(dst);
-        if contact
-            .as_ref()
-            .is_some_and(crate::types::Contact::is_flood)
-        {
-            // The cache can be out of date: read the device's own record.
-            match self.get_contact_by_key(dst).await {
-                Ok(device_contact) => contact = Some(device_contact),
-                Err(Error::Device(crate::ErrorCode::NotFound)) => contact = None,
-                Err(err) => {
-                    log::debug!(target: "meshcore", "could not read the contact: {err}");
-                    log::error!(
-                        target: "meshcore",
-                        "Could not read the contact from the device, aborting anon request"
-                    );
-                    return Err(err);
-                }
+        let (sent, _) = self.send_anon_raw(dst, request_type, options).await?;
+        Ok(sent)
+    }
+
+    async fn send_anon_raw(
+        &self,
+        dst: &PublicKey,
+        request_type: AnonReqType,
+        options: RequestOptions,
+    ) -> Result<(SentInfo, Subscription)> {
+        // The device sends along the path of its own record, and the answer
+        // has to come back along it: the cache may lack the contact or hold
+        // an older path.
+        let contact = match self.get_contact_by_key(dst).await {
+            Ok(contact) => Some(contact),
+            Err(Error::Device(crate::ErrorCode::NotFound)) => None,
+            Err(err) => {
+                log::debug!(target: "meshcore", "could not read the contact: {err}");
+                log::error!(
+                    target: "meshcore",
+                    "Could not read the contact from the device, aborting anon request"
+                );
+                return Err(err);
             }
-        }
+        };
 
         // Set when the contact goes zero-hop for the request: it goes back to
         // flood afterwards, in the background if the request is given up.
@@ -525,10 +542,10 @@ impl MeshCore {
             }
             flood_again.client = None;
         }
-        let mut sent = result?;
+        let (mut sent, events) = result?;
         // the reply comes back over every hop of the reply path
         sent.suggested_timeout = sent.suggested_timeout.saturating_mul(emitted_hops + 1);
-        Ok(sent)
+        Ok((sent, events))
     }
 
     async fn anon_answer(
@@ -538,10 +555,9 @@ impl MeshCore {
         options: RequestOptions,
     ) -> Result<BinaryResponse> {
         let _mesh = self.inner.mesh_lock.lock().await;
-        let mut sub = self.subscribe();
-        let sent = self.send_anon_req(dst, request_type, options).await?;
+        let (sent, events) = self.send_anon_raw(dst, request_type, options).await?;
         wait_response(
-            &mut sub,
+            events,
             options.wait(sent.suggested_timeout),
             reply!(Event::BinaryResponse(r) if r.tag == sent.expected_ack => (**r).clone()),
         )
@@ -557,14 +573,15 @@ impl MeshCore {
         self.send_anon_req(dst, AnonReqType::Regions, options).await
     }
 
-    /// The regions a node serves.
+    /// The regions whose floods a repeater forwards: their names without the
+    /// leading `#`, separated by commas, `*` for floods without a scope.
     pub async fn req_regions_sync(
         &self,
         dst: &PublicKey,
         options: RequestOptions,
     ) -> Result<String> {
         let answer = self.anon_answer(dst, AnonReqType::Regions, options).await?;
-        // the answer repeats a 4-byte tag first
+        // the answer starts with the repeater's clock
         Ok(lossy_ignore(answer.data.get(4..).unwrap_or_default())
             .trim_matches('\0')
             .to_string())
@@ -579,7 +596,7 @@ impl MeshCore {
         self.send_anon_req(dst, AnonReqType::Owner, options).await
     }
 
-    /// A node's name and owner info.
+    /// A repeater's name and owner info.
     pub async fn req_owner_sync(
         &self,
         dst: &PublicKey,
@@ -587,7 +604,7 @@ impl MeshCore {
     ) -> Result<AnonOwner> {
         let answer = self.anon_answer(dst, AnonReqType::Owner, options).await?;
         let text = lossy_ignore(answer.data.get(4..).unwrap_or_default());
-        // The node answers "name\nowner", NUL padded.
+        // After its clock the repeater sends "name\nowner", NUL padded.
         let (name, owner) = text
             .split_once('\n')
             .unwrap_or((text.trim_end_matches('\0'), ""));
@@ -606,7 +623,9 @@ impl MeshCore {
         self.send_anon_req(dst, AnonReqType::Basic, options).await
     }
 
-    /// A node's basic answer (its clock), raw.
+    /// A repeater's basic answer, raw: its clock (4 bytes), then a byte of
+    /// flags (bit 0: it is a bridge, bit 1: over ESP-NOW, bit 7: forwarding is
+    /// off).
     pub async fn req_basic_sync(
         &self,
         dst: &PublicKey,

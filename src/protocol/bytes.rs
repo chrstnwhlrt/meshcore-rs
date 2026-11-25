@@ -101,11 +101,16 @@ impl<'a> ByteReader<'a> {
     }
 }
 
+/// The bytes of a NUL-padded field up to the first NUL.
+pub(crate) fn until_nul(field: &[u8]) -> &[u8] {
+    let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+    &field[..end]
+}
+
 /// Decodes a NUL-padded text field: the text ends at the first NUL, invalid
 /// UTF-8 is dropped (as meshcore_py's `decode("utf-8", "ignore")`).
 pub(crate) fn text_until_nul(field: &[u8]) -> String {
-    let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
-    lossy_ignore(&field[..end])
+    lossy_ignore(until_nul(field))
 }
 
 /// Decodes text, dropping invalid UTF-8 sequences instead of replacing them.

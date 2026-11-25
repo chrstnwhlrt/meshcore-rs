@@ -43,12 +43,12 @@ pub struct PacketStats {
     pub flood_rx: u32,
     /// Direct packets received.
     pub direct_rx: u32,
-    /// Packets received with errors (firmware 1.12 and later).
+    /// Packets received with errors (firmware 1.13 and later).
     pub recv_errors: Option<u32>,
 }
 
-/// The status of a repeater, room server or sensor
-/// (`PUSH_CODE_STATUS_RESPONSE`, or a binary status request).
+/// The status of a repeater or room server (`PUSH_CODE_STATUS_RESPONSE`, or a
+/// binary status request).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatusResponse {
     /// The node's 6-byte key prefix.
@@ -87,8 +87,10 @@ pub struct StatusResponse {
     pub direct_dups: u16,
     /// Flood duplicates dropped.
     pub flood_dups: u16,
-    /// Total receive airtime in seconds.
+    /// Total receive airtime in seconds. A room server sends its counts of
+    /// posts (low 16 bits) and of posts pushed to clients (high 16 bits) here.
     pub rx_airtime: u32,
-    /// Packets received with errors (firmware 1.12 and later).
+    /// Packets received with errors (repeater firmware 1.12 and later; the
+    /// zeros that fill up the answer of other nodes read as 0).
     pub recv_errors: Option<u32>,
 }

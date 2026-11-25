@@ -3,7 +3,7 @@
 
 use crate::error::{Error, Result};
 use crate::lpp::{Telemetry, parse_mma};
-use crate::protocol::bytes::{ByteReader, lossy_ignore, text_until_nul};
+use crate::protocol::bytes::{ByteReader, lossy_ignore, text_until_nul, until_nul};
 use crate::protocol::path::PathLen;
 use crate::types::{
     Ack, AclEntry, AdvertPath, AutoAddConfig, BatteryStatus, ChannelData, ChannelInfo,
@@ -45,8 +45,10 @@ pub(crate) fn contact(data: &[u8]) -> Result<Contact> {
     })
 }
 
-/// The device's own information (`RESP_CODE_SELF_INFO`).
-pub(crate) fn self_info(data: &[u8]) -> Result<SelfInfo> {
+/// The device's own information (`RESP_CODE_SELF_INFO`); returns it with the
+/// length of the name on the device (decoded, it lacks the bytes of a
+/// character cut short).
+pub(crate) fn self_info(data: &[u8]) -> Result<(SelfInfo, usize)> {
     let mut r = ByteReader::new(data);
     let adv_type = r.u8()?;
     let tx_power = r.i8()?;
@@ -62,7 +64,8 @@ pub(crate) fn self_info(data: &[u8]) -> Result<SelfInfo> {
     let radio_bw = f64::from(r.u32()?) / 1000.0;
     let radio_sf = r.u8()?;
     let radio_cr = r.u8()?;
-    Ok(SelfInfo {
+    let name = until_nul(r.rest());
+    let info = SelfInfo {
         adv_type,
         tx_power,
         max_tx_power,
@@ -79,8 +82,9 @@ pub(crate) fn self_info(data: &[u8]) -> Result<SelfInfo> {
         radio_bw,
         radio_sf,
         radio_cr,
-        name: text_until_nul(r.rest()),
-    })
+        name: lossy_ignore(name),
+    };
+    Ok((info, name.len()))
 }
 
 /// Firmware information (`RESP_CODE_DEVICE_INFO`).
@@ -660,10 +664,14 @@ mod tests {
         data.extend(250_000u32.to_le_bytes());
         data.extend([11, 5]);
         data.extend(b"MyNode");
-        let info = self_info(&data).unwrap();
+        let (info, name_len) = self_info(&data).unwrap();
         assert_eq!(info.tx_power, -9);
-        assert_eq!(info.name, "MyNode");
+        assert_eq!((info.name.as_str(), name_len), ("MyNode", 6));
         assert!((info.radio_freq - 869.525).abs() < 1e-9);
+        // a name cut inside a character
+        data.push(0xc3);
+        let (info, name_len) = self_info(&data).unwrap();
+        assert_eq!((info.name.as_str(), name_len), ("MyNode", 7));
     }
 
     #[test]
