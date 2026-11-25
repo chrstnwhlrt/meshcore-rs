@@ -305,19 +305,34 @@ firmware behaves differently from what meshcore_py expects:
   is sent; meshcore_py sends it, and the firmware cuts it short over serial and
   drops it over BLE.
 - A text the firmware would not send whole is refused too: a private message
-  or CLI command over 160 bytes (`MAX_TEXT_LENGTH`), which the firmware answers
-  with `ERR_CODE_TABLE_FULL`, a channel message that does not fit 160 bytes
-  together with the node name and `": "`, and a login password over 15 bytes;
-  the firmware cuts these two short.
-- Input the firmware would answer as an unknown command is refused as well,
-  such as an empty message, node name or CLI command, a contact card under 98
-  bytes or a control type without its top bit. So is input it would read
+  or CLI command to a node over 160 bytes (`MAX_TEXT_LENGTH`), which the
+  firmware answers with `ERR_CODE_TABLE_FULL`, a channel message that does not
+  fit 160 bytes together with the node name and `": "`, and a login password
+  over 15 bytes; the firmware cuts these two short.
+- Input the firmware would answer as an unknown command is refused as well:
+  an empty private message, node name or CLI command to a node, a CLI command
+  on the device (`run_cli_command`) under 2 bytes, a custom variable whose
+  name and value have fewer than 2 bytes together, an empty chunk to sign, a
+  raw packet under 2 bytes, a contact card under 98 bytes, a control type
+  without its top bit and a private key under 64 bytes
+  (`import_private_key` takes exactly 64). So is input it would read
   differently: a NUL byte in a text, name or password (it ends them there) and
   a `:` in a custom variable's name (it splits there).
-- `set_coords` refuses a latitude beyond -90 to 90 or a longitude beyond -180
-  to 180 (after rounding to millionths, as the firmware checks) before
-  sending; meshcore_py sends it, and the firmware answers with
-  `ERR_CODE_ILLEGAL_ARG`.
+- Input the firmware answers with `ERR_CODE_ILLEGAL_ARG` is refused before
+  sending too: coordinates beyond -90 to 90 degrees latitude or -180 to 180
+  degrees longitude after rounding to millionths (`set_coords`; the firmware
+  checks the rounded values) and a custom variable without a name. meshcore_py
+  sends both.
+- A path its length byte cannot describe is refused before sending: one that
+  is not a whole number of hops, has more than 63 hops or more than 64 bytes,
+  or uses hash mode 3 (reserved) or above (`change_contact_path`,
+  `send_channel_data`, `send_raw_data` and `parse_path_hex`), and a contact
+  path that does not match its length byte or is longer than 64 bytes
+  (`update_contact`). meshcore_py sends such a path. It counts only whole
+  hops, so the firmware takes fewer and, in channel data, reads the rest as
+  the data type. It packs hop count and hash mode into one byte unchecked, so
+  more hops spill into the mode bits, and mode 4 and above raise an error. A
+  contact path over 64 bytes goes out uncut and shifts the fields after it.
 - A BLE scan or name search also finds a device this computer is still
   connected to, for example right after another program let go of it;
   meshcore_py finds only advertising devices and misses it for a few seconds.

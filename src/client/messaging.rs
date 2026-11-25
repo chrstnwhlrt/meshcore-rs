@@ -545,7 +545,9 @@ impl MeshCore {
         .await
     }
 
-    /// Sends raw data (at least 4 bytes) direct along a path (empty: zero-hop).
+    /// Sends raw data (at least 4 bytes) direct along a path (empty: zero-hop),
+    /// which takes whole hops as in
+    /// [`change_contact_path`](Self::change_contact_path).
     pub async fn send_raw_data(&self, payload: &[u8], path: &[u8], hash_mode: u8) -> Result<()> {
         if payload.len() < 4 {
             return Err(Error::invalid("raw data needs at least 4 bytes"));
@@ -556,7 +558,8 @@ impl MeshCore {
         self.request_ok(&frame).await.map(drop)
     }
 
-    /// Sends a binary datagram to a channel, flooded or along a path.
+    /// Sends a binary datagram to a channel, flooded or along a path of whole
+    /// hops as in [`change_contact_path`](Self::change_contact_path).
     /// `data_type` 0 is reserved; the payload takes at most
     /// [`MAX_CHANNEL_DATA_LENGTH`] bytes, fewer with a path (the command has
     /// to fit the device's 176-byte frame).

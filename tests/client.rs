@@ -288,6 +288,53 @@ async fn contact_changes_are_written_and_cached() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn paths_the_length_byte_cannot_describe_are_refused() {
+    let (mc, device) = client(Options::default(), |_| vec![ok()]);
+    mc.connect().await.unwrap();
+    let contact = Contact::new(key(), ContactType::Repeater, "Rep");
+    let refused = |result: meshcore::Result<()>| matches!(result, Err(Error::InvalidArgument(_)));
+
+    // 3 bytes are no whole number of 2-byte hops; meshcore_py announces one
+    let (path, mode) = meshcore::protocol::parse_path_hex("5f107c:1").unwrap();
+    assert!(refused(
+        mc.change_contact_path(&contact, &path, mode)
+            .await
+            .map(drop)
+    ));
+    // 64 hops do not fit the 6 bits of the hop count
+    assert!(refused(
+        mc.change_contact_path(&contact, &[7; 64], Some(0))
+            .await
+            .map(drop)
+    ));
+    // 33 hops of 2 bytes exceed the 64 bytes the firmware stores
+    assert!(refused(
+        mc.change_contact_path(&contact, &[7; 66], Some(1))
+            .await
+            .map(drop)
+    ));
+    // hash mode 3 (4-byte hashes) is reserved
+    assert!(refused(
+        mc.change_contact_path(&contact, &[1, 2, 3, 4], Some(3))
+            .await
+            .map(drop)
+    ));
+    // a length byte announcing 2 hops for a path of 1 byte
+    let mut mismatched = contact.clone();
+    mismatched.out_path_len = PathLen::new(2, 0).unwrap();
+    mismatched.out_path = vec![1];
+    assert!(refused(mc.update_contact(&mismatched, None).await));
+    assert_eq!(device.commands_with(9).len(), 0);
+
+    assert!(refused(
+        mc.send_channel_data(1, 1, &[1], Some(&[1, 2, 3]), 1).await
+    ));
+    assert!(refused(mc.send_raw_data(&[1, 2, 3, 4], &[7; 64], 0).await));
+    assert_eq!(device.commands_with(62).len(), 0);
+    assert_eq!(device.commands_with(25).len(), 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn new_adverts_are_pending_not_cached() {
     let (mc, device) = client(Options::default(), |_| vec![]);
     mc.connect().await.unwrap();
