@@ -127,19 +127,17 @@ pub struct TraceRequest {
 }
 
 /// Parses a trace path as meshcore_py takes it: comma-separated hex hashes
-/// (`"23,5f,3a"`), all as long as the first (1, 2, 4 or 8 bytes). Returns the
-/// path and the flags that give its hash size.
+/// (`"23,5f,3a"`) up to the first empty element, all as long as the first
+/// element as written (1, 2, 4 or 8 bytes). Returns the path and the flags
+/// that give its hash size.
 ///
 /// # Errors
 ///
-/// [`Error::InvalidArgument`] for bad hex or mixed or unsupported hash sizes.
+/// [`Error::InvalidArgument`] for bad hex or mixed or unsupported hash sizes,
+/// an empty first element included.
 pub fn parse_trace_path(text: &str) -> Result<(Vec<u8>, u8)> {
-    let mut parts = text
-        .split(',')
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .peekable();
-    let hash_len = parts.peek().map_or(1, |p| p.len() / 2);
+    // meshcore_py takes the hash size from the first element before trimming.
+    let hash_len = text.split(',').next().map_or(0, str::len) / 2;
     let flags = match hash_len {
         1 => 0,
         2 => 1,
@@ -152,7 +150,8 @@ pub fn parse_trace_path(text: &str) -> Result<(Vec<u8>, u8)> {
         }
     };
     let mut path = Vec::new();
-    for part in parts {
+    // meshcore_py ends the path at the first empty element.
+    for part in text.split(',').map(str::trim).take_while(|p| !p.is_empty()) {
         if part.len() != hash_len * 2 {
             return Err(Error::invalid(format!(
                 "trace hash {part:?} is not {} hex digits",
@@ -703,17 +702,24 @@ mod tests {
 
     #[test]
     fn trace_paths() {
-        assert_eq!(
-            parse_trace_path("23,5f,3a").unwrap(),
-            (vec![0x23, 0x5f, 0x3a], 0)
-        );
-        assert_eq!(
-            parse_trace_path("2301,5f02").unwrap(),
-            (vec![0x23, 1, 0x5f, 2], 1)
-        );
-        assert_eq!(parse_trace_path("").unwrap(), (Vec::new(), 0));
-        assert!(parse_trace_path("23,5f02").is_err());
-        assert!(parse_trace_path("235f02").is_err());
+        // meshcore_py's send_trace gives the same for each of these
+        let parsed = [
+            ("23,5f,3a", Some((vec![0x23, 0x5f, 0x3a], 0))),
+            ("2301,5f02", Some((vec![0x23, 1, 0x5f, 2], 1))),
+            ("23,5f,", Some((vec![0x23, 0x5f], 0))),
+            ("23,,5f", Some((vec![0x23], 0))),
+            (" 23, 5f", Some((vec![0x23, 0x5f], 0))),
+            ("AB,cd", Some((vec![0xab, 0xcd], 0))),
+            ("  23,5f", None),
+            ("", None),
+            (",23", None),
+            ("23,5f02", None),
+            ("235f02", None),
+            ("23,zz", None),
+        ];
+        for (text, expected) in parsed {
+            assert_eq!(parse_trace_path(text).ok(), expected, "{text:?}");
+        }
         let Err(Error::InvalidArgument(message)) = parse_trace_path("abc") else {
             panic!()
         };
