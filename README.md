@@ -22,6 +22,9 @@ The library follows meshcore_py 2.3.19 and the companion protocol of firmware
 response and push code that firmware sends. A parity test runs the same 61 device
 frames through meshcore_py and through this library and compares the JSON of
 the resulting events; they match except for the deliberate fixes listed below.
+The size checks assume frames of 176 bytes, which the firmware takes from 1.16
+on; before, it took 172, so there a private message holds at most 159 bytes
+(see `MAX_TEXT_LENGTH`).
 
 Serial and TCP are tested end to end against a simulated device on a pseudo
 terminal and on a local socket. BLE (feature `ble`) runs through BlueZ and is

@@ -21,6 +21,11 @@ pub const MAX_CHANNEL_DATA_LENGTH: usize = 163;
 /// The longest text of a message or CLI command in bytes (the firmware's
 /// `MAX_TEXT_LEN`). In a channel message the sender's name and `": "` count
 /// against it too.
+///
+/// Companion firmware before 1.16 takes frames of 172 bytes instead of 176.
+/// A device with such firmware sends a private message of at most 159 bytes
+/// (the command for a longer one does not fit), and of one it receives it
+/// passes at most 156 bytes to its app (159 without v3 frames).
 pub const MAX_TEXT_LENGTH: usize = 160;
 
 /// Refuses a text the firmware would reject or cut short.
