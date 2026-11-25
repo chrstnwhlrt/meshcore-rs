@@ -9,7 +9,8 @@ use crate::protocol::codes::CommandType;
 use crate::protocol::path::{MAX_PATH_SIZE, PathLen};
 use crate::types::{AdvertPath, AutoAddConfig, Contact, ContactList, PublicKey};
 
-/// How long a contact list may pause between contacts (meshcore_py: 5 s).
+/// How long a contact list may pause between contacts. meshcore_py looks every
+/// 5 s whether a contact came, so it lets a list pause 5 to 10 s.
 const CONTACTS_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Reads a contact list the device sends on the link with generation `link`:
@@ -78,12 +79,17 @@ pub(crate) fn update_contact_frame(contact: &Contact, lastmod: Option<u32>) -> R
     Ok(frame)
 }
 
-/// A contact as the device stores it from [`update_contact_frame`]: the name
-/// as written (cut to the field). Without `lastmod` the device stamps the
-/// record with its clock, which is not known here.
+/// A contact as the device holds it after [`update_contact_frame`], in the
+/// form it hands contacts back: it keeps the name field as written and
+/// returns it up to the first NUL, at most 31 bytes, then NULs. Without
+/// `lastmod` the device stamps the record with its clock, which is not known
+/// here.
 fn as_stored(contact: &Contact, lastmod: Option<u32>) -> Contact {
     let mut stored = contact.clone();
-    stored.name_raw = contact.name_field();
+    let field = contact.name_field();
+    let len = field[..31].iter().position(|&b| b == 0).unwrap_or(31);
+    stored.name_raw = [0; 32];
+    stored.name_raw[..len].copy_from_slice(&field[..len]);
     stored.name = crate::protocol::bytes::text_until_nul(&stored.name_raw);
     if let Some(lastmod) = lastmod {
         stored.lastmod = lastmod;
@@ -95,7 +101,7 @@ impl MeshCore {
     /// Reads the contact list: all contacts with `lastmod` 0, else those
     /// changed since. A full list replaces the cache, a partial one is merged.
     ///
-    /// When the device sends nothing for 5 s before the list ends, this fails
+    /// When the list stalls for 5 s (no start, contact or end), this fails
     /// with [`Error::Timeout`]; a list that only starts after that is merged
     /// into the cache, as it may be partial.
     pub async fn get_contacts(&self, lastmod: u32) -> Result<ContactList> {
@@ -203,7 +209,7 @@ impl MeshCore {
     /// Sets a contact's path: whole hops of `hash_mode + 1` bytes, at most 63
     /// hops and 64 bytes (hash mode 3 is reserved). Without a hash mode the
     /// device's mode is used (one [`send_device_query`](Self::send_device_query)).
-    /// Returns the contact as written.
+    /// Returns the contact as the cache now holds it.
     pub async fn change_contact_path(
         &self,
         contact: &Contact,
@@ -230,7 +236,7 @@ impl MeshCore {
         Ok(as_stored(&changed, None))
     }
 
-    /// Sets a contact's flags. Returns the contact as written.
+    /// Sets a contact's flags. Returns the contact as the cache now holds it.
     pub async fn change_contact_flags(&self, contact: &Contact, flags: u8) -> Result<Contact> {
         let mut changed = contact.clone();
         changed.flags = flags;
@@ -319,6 +325,26 @@ mod tests {
         assert!(update_contact_frame(&contact, None).is_err());
         contact.out_path.push(3);
         assert!(update_contact_frame(&contact, None).is_ok());
+    }
+
+    #[test]
+    fn the_cache_gets_the_name_as_the_device_hands_it_back() {
+        let mut contact = Contact::new(PublicKey::new([3; 32]), ContactType::Chat, "");
+        // written as given, handed back up to the NUL
+        contact.set_name("a\0b");
+        assert_eq!(contact.name_field()[..3], *b"a\0b");
+        let stored = as_stored(&contact, None);
+        assert_eq!(stored.name, "a");
+        let mut expected = [0u8; 32];
+        expected[0] = b'a';
+        assert_eq!(stored.name_raw, expected);
+        // a field without a NUL comes back as 31 bytes
+        contact.name_raw = [b'x'; 32];
+        contact.name = "x".repeat(32);
+        let stored = as_stored(&contact, Some(5));
+        assert_eq!(stored.name, "x".repeat(31));
+        assert_eq!(stored.name_raw[31], 0);
+        assert_eq!(stored.lastmod, 5);
     }
 
     #[test]

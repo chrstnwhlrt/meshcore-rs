@@ -279,7 +279,8 @@ pub struct ContactList {
     pub lastmod: u32,
 }
 
-/// Where a message goes: a full public key or a 6-byte key prefix.
+/// Where a message goes: a full public key or a key prefix of 6 bytes or more
+/// (messages are addressed with the first 6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Destination {
     bytes: Vec<u8>,
@@ -292,7 +293,8 @@ impl Destination {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidArgument`] for bad hex or fewer than 6 bytes.
+    /// [`Error::InvalidArgument`] for bad hex, or fewer than 6 or more than 32
+    /// bytes.
     pub fn from_hex(text: &str) -> Result<Self> {
         let bytes = crate::hex::decode(text)
             .ok_or_else(|| Error::invalid(format!("{text:?} is not hex")))?;

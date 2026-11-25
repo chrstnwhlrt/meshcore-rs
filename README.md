@@ -299,6 +299,8 @@ meshcore_py leaves a gap:
   type, and an answer cut short is dropped).
 - A full contact fetch replaces the cache instead of merging into it, so
   contacts removed on the device disappear.
+- `get_contacts` fails when the list stalls for 5 s; meshcore_py looks every
+  5 s whether a contact came, so it waits 5 to 10 s.
 - The contact cache follows what the client does to the device's contacts
   (`add_contact`, `update_contact`, `remove_contact`, `reset_path`,
   `change_contact_path`, `change_contact_flags`, `get_contact_by_key`) and
@@ -317,11 +319,16 @@ meshcore_py leaves a gap:
 - `send_login_sync` returns `Error::LoginFailed` as soon as the node rejects
   the password; meshcore_py waits for a successful login only and runs into its
   timeout.
+- `import_private_key` returns `Error::Disabled` as soon as the firmware
+  answers that importing keys is disabled; meshcore_py waits for `OK` or an
+  error only and runs into its timeout.
 - `send_cmd` looks up the node type of a bare key in the contact cache to pick
   the text type; meshcore_py assumes a repeater then.
 - `send_msg_with_retry` to a key prefix whose contact is not found, not even
   in the contacts read for the path reset, goes on without the reset;
   meshcore_py raises an error there.
+- `get_path_hash_mode`, which `change_contact_path` without a hash mode uses,
+  fails when the device query fails; meshcore_py takes mode 0 then.
 - A command fails at once when its link drops instead of waiting for its
   timeout.
 - `send_trace` refuses an empty path before sending; the firmware only traces
@@ -347,7 +354,10 @@ meshcore_py leaves a gap:
 - A group text in the RX log that ends within its channel hash and MAC, or an
   advert that ends within the fields its flags announce, gets no decoded
   fields; meshcore_py reports the parts it could read (a location from the
-  bytes that are left).
+  bytes that are left). A group text that matches a known channel but whose
+  encrypted part is empty or not a whole number of 16-byte blocks comes
+  undecrypted; with decryption on, meshcore_py logs a parse error for it and
+  drops the packet.
 - A push too short to read is only logged, and a reply too short to read
   ends its command with an error (reason `invalid_frame_length`); meshcore_py
   fills the missing fields of most frames with zeros, or reports a
@@ -396,6 +406,9 @@ meshcore_py leaves a gap:
   into one byte unchecked, so more hops spill into the mode bits, and mode 4
   and above raise an error. A contact path over 64 bytes goes out uncut and
   shifts the fields after it.
+- `connect` takes the link down again when the device does not answer
+  `APP_START`, and returns the error; meshcore_py's `connect` returns `None`
+  and leaves the link up (its `create_*` functions take it down).
 - Over serial, the client waits 300 ms after opening the port, then reads and
   drops for 500 ms what the board sent before (boot output, an answer of an
   earlier session); meshcore_py reads from the first byte on, where a stale

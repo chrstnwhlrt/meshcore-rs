@@ -1,9 +1,9 @@
 //! Cayenne LPP telemetry.
 //!
 //! Readings are decoded with the type table of pycayennelpp, which meshcore_py
-//! uses. Decoding stops at the first reading on channel 0 (encrypted answers
-//! are padded with zero bytes) and at the first reading of an unknown type or
-//! one cut short; the bytes from there on are kept as `undecoded`.
+//! uses. Decoding ends at channel 0, where the zero bytes that pad encrypted
+//! answers begin. It also ends at the first reading of an unknown type or one
+//! cut short, which is kept with the bytes after it as `undecoded`.
 
 use crate::types::remote::MmaEntry;
 
@@ -476,7 +476,7 @@ fn mma_layout(code: u8) -> (usize, f64, bool) {
 /// Decodes the series of a min/max/average answer: per series the channel, the
 /// type and three values (min, max, average). Returns the series and the bytes
 /// from the first one that could not be decoded, and logs why as meshcore_py
-/// does (which then drops the whole answer).
+/// does (which then reports no series at all).
 #[must_use]
 pub fn parse_mma(buf: &[u8]) -> (Vec<MmaEntry>, Vec<u8>) {
     let mut entries = Vec::new();

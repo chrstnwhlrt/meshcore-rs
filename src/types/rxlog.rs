@@ -215,7 +215,8 @@ pub struct GroupText {
     pub crypted: Vec<u8>,
     /// The channel's name, when a known channel's MAC matches.
     pub chan_name: Option<String>,
-    /// The decrypted message, when channel log decryption is on.
+    /// The decrypted message, when channel log decryption is on, the channel
+    /// is known and the encrypted part is one or more whole 16-byte blocks.
     pub decrypted: Option<DecryptedGroupText>,
 }
 

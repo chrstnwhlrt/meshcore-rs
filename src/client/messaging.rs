@@ -303,7 +303,7 @@ impl MeshCore {
         options: RetryOptions,
     ) -> Result<Option<SentInfo>> {
         // From the fifth attempt on the text has to be 2 bytes shorter: check
-        // the strictest limit the attempts reach before sending any.
+        // the strictest limit the attempts may reach before sending any.
         let limit = if options.max_attempts > 4 {
             MAX_TEXT_LENGTH - 2
         } else {
