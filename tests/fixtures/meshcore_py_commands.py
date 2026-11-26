@@ -6,7 +6,9 @@ read the contacts); only the frames of the case's own calls are recorded.
 
 The stand-in answers as the one in tests/command_parity.rs does: replies at
 once, answers from the mesh (binary responses, a login) a moment later, as a
-device sends them. A case that raises records the exception's name.
+device sends them. A case may have it refuse commands (with an error reply)
+or leave them unanswered, which its line records for the other side. A case
+that raises records the exception's name.
 
 Regenerate after updating meshcore_py:
 
@@ -184,11 +186,14 @@ def respond(cmd):
 
 
 class Device:
-    """The stand-in: records what is written and answers as respond() says."""
+    """The stand-in: records what is written and answers as respond() says,
+    but for the command codes it refuses or leaves unanswered."""
 
     def __init__(self):
         self.reader = None
         self.written = []
+        self.refuse = []
+        self.silent = []
 
     async def connect(self):
         return "stand-in"
@@ -205,7 +210,10 @@ class Device:
     async def send(self, data):
         data = bytes(data)
         self.written.append(data)
-        now, later = respond(data)
+        if data[0] in self.silent:
+            return
+        # ERR_CODE_UNSUPPORTED_CMD
+        now, later = ([bytes([1, 1])], []) if data[0] in self.refuse else respond(data)
         for frame in now:
             await self.reader.handle_rx(bytearray(frame))
         loop = asyncio.get_running_loop()
@@ -240,7 +248,8 @@ OTHER_PARAMS = {
     "telemetry_mode_env": 0, "adv_loc_policy": 1, "multi_acks": 3,
 }
 
-# (name, whether the contacts are read first, the calls)
+# (name, whether the contacts are read first, the calls[, the command codes the
+# device refuses or leaves unanswered])
 CASES = [
     # the device
     ("appstart", False, lambda mc, c: c.send_appstart()),
@@ -367,6 +376,7 @@ CASES = [
     ("anon_owner_flood_contact", True, lambda mc, c: c.req_owner_sync(KEY2)),
     ("anon_regions_flood_contact", True, lambda mc, c: c.req_regions_async(KEY2)),
     ("anon_basic_flood_contact", True, lambda mc, c: c.req_basic_sync(KEY2)),
+    ("anon_hash_mode_unanswered", True, lambda mc, c: c.req_regions_async(KEY2), {"silent": [22]}),
     # where this library differs (see DEVIATIONS in tests/command_parity.rs)
     ("set_radio_rounding", False, lambda mc, c: c.set_radio(869.4625, 62.5, 9, 8)),
     ("set_radio_rounding_512", False, lambda mc, c: c.set_radio(512.002, 62.5, 9, 8)),
@@ -377,24 +387,58 @@ CASES = [
     ("add_contact_long_name", False, lambda mc, c: c.add_contact(new_contact("n" * 40))),
     ("trace_empty", False, lambda mc, c: c.send_trace(tag=8)),
     ("trace_not_whole_hops", False, lambda mc, c: c.send_trace(tag=9, flags=1, path=b"\xaa\xbb\xcc")),
+    ("trace_too_many_hops", False, lambda mc, c: c.send_trace(tag=10, path=b"\xaa" * 65)),
     ("raw_data_two_byte_hashes", False, lambda mc, c: c.send_raw_data(bytes([1, 2, 3, 4]), b"\xa1\xa2\xb1\xb2")),
     ("change_path_not_whole_hops", True,
      lambda mc, c: c.change_contact_path(mc.contacts[KEY.hex()], "a1b2c3", path_hash_mode=1)),
+    ("change_path_too_many_hops", True,
+     lambda mc, c: c.change_contact_path(mc.contacts[KEY.hex()], "07" * 64, path_hash_mode=0)),
+    ("change_path_too_long", True,
+     lambda mc, c: c.change_contact_path(mc.contacts[KEY.hex()], "07" * 66, path_hash_mode=1)),
+    ("change_path_mode_3", True,
+     lambda mc, c: c.change_contact_path(mc.contacts[KEY.hex()], "a1b2c3d4", path_hash_mode=3)),
+    ("change_path_mode_4", True,
+     lambda mc, c: c.change_contact_path(mc.contacts[KEY.hex()], "a1b2c3d4e5", path_hash_mode=4)),
     ("channel_data_not_whole_hops", False,
      lambda mc, c: c.send_channel_data(1, 0x1234, b"\xaa", path=b"\x01\x02\x03", path_hash_mode=1)),
+    ("channel_data_too_many_hops", False, lambda mc, c: c.send_channel_data(1, 0x1234, b"\xaa", path=b"\x07" * 64)),
+    ("channel_data_mode_3", False,
+     lambda mc, c: c.send_channel_data(1, 0x1234, b"\xaa", path=b"\x01\x02\x03\x04", path_hash_mode=3)),
+    ("channel_data_mode_4", False,
+     lambda mc, c: c.send_channel_data(1, 0x1234, b"\xaa", path=b"\x01\x02\x03\x04\x05", path_hash_mode=4)),
+    ("raw_data_too_many_hops", False, lambda mc, c: c.send_raw_data(bytes([1, 2, 3, 4]), b"\x07" * 64)),
+    ("update_contact_path_mismatch", True,
+     lambda mc, c: c.update_contact(
+         dict(mc.contacts[KEY.hex()], out_path="01", out_path_len=2, out_path_hash_mode=0))),
+    ("update_contact_flood_with_path", True,
+     lambda mc, c: c.update_contact(dict(mc.contacts[KEY.hex()], out_path="01", out_path_len=-1))),
+    ("update_contact_path_too_long", True,
+     lambda mc, c: c.update_contact(
+         dict(mc.contacts[KEY.hex()], out_path="01" * 66, out_path_len=33, out_path_hash_mode=1))),
     ("send_cmd_bare_key", True, lambda mc, c: c.send_cmd(KEY2, "ver", T)),
+    ("retry_unknown_prefix", False, lambda mc, c: c.send_msg_with_retry(STRANGER[:6], "hi", timestamp=T)),
+    ("change_path_hash_mode_refused", True,
+     lambda mc, c: c.change_contact_path(mc.contacts[KEY.hex()], "a1b2c3d4"), {"refuse": [22]}),
     ("anon_unknown_node", False, lambda mc, c: c.req_regions_async(STRANGER)),
     ("anon_contact_with_path", True, lambda mc, c: c.req_regions_async(KEY)),
+    ("anon_zero_hop_unanswered", True, lambda mc, c: c.req_regions_async(KEY2), {"silent": [9]}),
     ("devicepin_illegal", False, lambda mc, c: c.set_devicepin(12345)),
     ("coords_out_of_range", False, lambda mc, c: c.set_coords(91.0, 0.0)),
     ("radio_out_of_range", False, lambda mc, c: c.set_radio(433.875, 62.5, 4, 8)),
+    ("radio_negative_frequency", False, lambda mc, c: c.set_radio(-1.0, 62.5, 9, 8)),
+    ("radio_negative_bandwidth", False, lambda mc, c: c.set_radio(433.875, -62.5, 9, 8)),
     ("tx_power_above_max", False, lambda mc, c: c.set_tx_power(23)),
+    ("tx_power_below_min", False, lambda mc, c: c.set_tx_power(-10)),
     ("path_hash_mode_reserved", False, lambda mc, c: c.set_path_hash_mode(3)),
     ("custom_var_without_name", False, lambda mc, c: c.set_custom_var("", "1")),
     ("custom_var_colon", False, lambda mc, c: c.set_custom_var("a:b", "c")),
+    ("custom_var_too_short", False, lambda mc, c: c.set_custom_var("a", "")),
+    ("command_too_long", False, lambda mc, c: c.import_contact(bytes([0xAA]) * 176)),
     ("empty_message", False, lambda mc, c: c.send_msg(KEY, "", T)),
     ("message_too_long", False, lambda mc, c: c.send_msg(KEY, "x" * 161, T)),
-    ("message_nul", False, lambda mc, c: c.send_msg(KEY, "a\0b", T)),
+    ("fifth_attempt_too_long", False, lambda mc, c: c.send_msg(KEY, "x" * 159, T, attempt=4)),
+    ("empty_node_command", False, lambda mc, c: c.send_cmd(KEY, "", T, dst_type=2)),
+    ("node_command_too_long", False, lambda mc, c: c.send_cmd(KEY, "x" * 161, T, dst_type=2)),
     ("channel_message_too_long", False, lambda mc, c: c.send_chan_msg(0, "x" * 155, T)),
     ("empty_name", False, lambda mc, c: c.set_name("")),
     ("short_cli_command", False, lambda mc, c: c.run_cli_command("v")),
@@ -403,10 +447,20 @@ CASES = [
     ("short_contact_card", False, lambda mc, c: c.import_contact(bytes([0xAA]) * 97)),
     ("control_type_without_top_bit", False, lambda mc, c: c.send_control_data(0x10, b"\x01")),
     ("long_password", False, lambda mc, c: c.send_login(KEY, "p" * 16)),
+    ("message_nul", False, lambda mc, c: c.send_msg(KEY, "a\0b", T)),
+    ("node_command_nul", False, lambda mc, c: c.send_cmd(KEY, "v\0r", T, dst_type=2)),
+    ("channel_message_nul", False, lambda mc, c: c.send_chan_msg(0, "a\0b", T)),
+    ("cli_command_nul", False, lambda mc, c: c.run_cli_command("ve\0r")),
+    ("name_nul", False, lambda mc, c: c.set_name("a\0b")),
+    ("contact_name_nul", False, lambda mc, c: c.add_contact(new_contact("a\0b"))),
+    ("channel_name_nul", False, lambda mc, c: c.set_channel(1, "#a\0b")),
+    ("custom_var_nul", False, lambda mc, c: c.set_custom_var("gps", "1\0")),
+    ("default_flood_scope_nul", False, lambda mc, c: c.set_default_flood_scope("a\0b")),
+    ("password_nul", False, lambda mc, c: c.send_login(KEY, "pa\0ss")),
 ]
 
 
-async def run(name, read_contacts, calls):
+async def run(name, read_contacts, calls, answers=None):
     device = Device()
     mc = MeshCore(device, default_timeout=2)
     await mc.connect()
@@ -416,6 +470,10 @@ async def run(name, read_contacts, calls):
     line = {"case": name}
     if read_contacts:
         line["contacts"] = True
+    # from the case's own calls on
+    for kind, codes in (answers or {}).items():
+        setattr(device, kind, codes)
+        line[kind] = codes
     try:
         await calls(mc, mc.commands)
     except Exception as err:  # noqa: BLE001 - recorded, the frames before it count

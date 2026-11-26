@@ -451,6 +451,9 @@ impl MeshCore {
     /// the request and reset to flood afterwards, also when the request is
     /// given up halfway (the reset then runs in the background) and when
     /// setting zero-hop got no answer, which the device may have taken anyway.
+    /// The zero-hop path takes the device's hash mode, or mode 0 when the
+    /// device does not tell it, as in meshcore_py: zero hops have no size a
+    /// mode could give.
     pub async fn send_anon_req(
         &self,
         dst: &PublicKey,
@@ -496,8 +499,17 @@ impl MeshCore {
             }
             Some(contact) if contact.is_flood() => {
                 log::info!(target: "meshcore", "No path set trying zero hop");
+                // Asked before the reset is armed: until the path is set,
+                // nothing needs one.
+                let hash_mode = self.get_path_hash_mode().await.unwrap_or_else(|err| {
+                    log::debug!(target: "meshcore", "could not read the path hash mode: {err}, taking 0");
+                    0
+                });
                 flood_again.client = Some(self.clone());
-                if let Err(err) = self.change_contact_path(contact, &[], None).await {
+                if let Err(err) = self
+                    .change_contact_path(contact, &[], Some(hash_mode))
+                    .await
+                {
                     // Without an answer that could be read the device may have
                     // taken the change.
                     if matches!(

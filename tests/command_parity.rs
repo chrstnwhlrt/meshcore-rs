@@ -5,10 +5,12 @@
 
 mod common;
 
+use std::sync::{Arc, Mutex};
+
 use common::{client_on_device, device_info_frame, self_info_frame, status_fields};
 use meshcore::{
     BinaryReqType, Contact, ContactType, FloodScope, MeshCore, NeighboursQuery, Options,
-    OtherParams, PublicKey, RequestOptions, RetryOptions, TraceRequest,
+    OtherParams, PathLen, PublicKey, RequestOptions, RetryOptions, TraceRequest,
 };
 
 /// A repeater with a path of one 2-byte hop.
@@ -78,9 +80,19 @@ const DEVIATIONS: &[(&str, &[&str], &[&str])] = &[
             "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e00000000000000000000000000"
         )],
     ),
-    // A trace path that is empty or no whole number of hops is refused.
+    // A trace path that is empty, no whole number of hops or longer than 64
+    // hops is refused.
     ("trace_empty", &["2408000000000000000000"], &[]),
     ("trace_not_whole_hops", &["24090000000000000001aabbcc"], &[]),
+    (
+        "trace_too_many_hops",
+        &[concat!(
+            "240a0000000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaa"
+        )],
+        &[],
+    ),
     // Raw data has hop count and hash mode in its length byte, as firmware 1.18
     // reads it.
     (
@@ -100,11 +112,120 @@ const DEVIATIONS: &[(&str, &[&str], &[&str])] = &[
         &[],
     ),
     ("channel_data_not_whole_hops", &["3e01410102033412aa"], &[]),
+    (
+        "change_path_too_many_hops",
+        &[concat!(
+            "091111111111111111111111111111111111111111111111111111111111111111020040",
+            "070707070707070707070707070707070707070707070707070707070707070707070707",
+            "070707070707070707070707070707070707070707070707070707075265700000000000",
+            "000000000000000000000000000000000000000000000000e8030000fc1f3103e47d9800"
+        )],
+        &[],
+    ),
+    (
+        "change_path_too_long",
+        &[concat!(
+            "091111111111111111111111111111111111111111111111111111111111111111020061",
+            "070707070707070707070707070707070707070707070707070707070707070707070707",
+            "070707070707070707070707070707070707070707070707070707070707526570000000",
+            "0000000000000000000000000000000000000000000000000000e8030000fc1f3103e47d",
+            "9800"
+        )],
+        &[],
+    ),
+    (
+        "change_path_mode_3",
+        &[concat!(
+            "0911111111111111111111111111111111111111111111111111111111111111110200c1",
+            "a1b2c3d40000000000000000000000000000000000000000000000000000000000000000",
+            "000000000000000000000000000000000000000000000000000000005265700000000000",
+            "000000000000000000000000000000000000000000000000e8030000fc1f3103e47d9800"
+        )],
+        &[],
+    ),
+    (
+        "channel_data_too_many_hops",
+        &[concat!(
+            "3e0140070707070707070707070707070707070707070707070707070707070707070707",
+            "070707070707070707070707070707070707070707070707070707070707073412aa"
+        )],
+        &[],
+    ),
+    ("channel_data_mode_3", &["3e01c1010203043412aa"], &[]),
+    (
+        "raw_data_too_many_hops",
+        &[concat!(
+            "194007070707070707070707070707070707070707070707070707070707070707070707",
+            "07070707070707070707070707070707070707070707070707070707070701020304"
+        )],
+        &[],
+    ),
+    (
+        "update_contact_path_mismatch",
+        &[concat!(
+            "091111111111111111111111111111111111111111111111111111111111111111020002",
+            "010000000000000000000000000000000000000000000000000000000000000000000000",
+            "000000000000000000000000000000000000000000000000000000005265700000000000",
+            "000000000000000000000000000000000000000000000000e8030000fc1f3103e47d9800"
+        )],
+        &[],
+    ),
+    (
+        "update_contact_flood_with_path",
+        &[concat!(
+            "0911111111111111111111111111111111111111111111111111111111111111110200ff",
+            "010000000000000000000000000000000000000000000000000000000000000000000000",
+            "000000000000000000000000000000000000000000000000000000005265700000000000",
+            "000000000000000000000000000000000000000000000000e8030000fc1f3103e47d9800"
+        )],
+        &[],
+    ),
+    (
+        "update_contact_path_too_long",
+        &[concat!(
+            "091111111111111111111111111111111111111111111111111111111111111111020061",
+            "010101010101010101010101010101010101010101010101010101010101010101010101",
+            "010101010101010101010101010101010101010101010101010101010101526570000000",
+            "0000000000000000000000000000000000000000000000000000e8030000fc1f3103e47d",
+            "9800"
+        )],
+        &[],
+    ),
     // The node type of a bare key comes from the contact cache.
     (
         "send_cmd_bare_key",
         &["02010000f15365333333333333766572"],
         &["02030000f15365333333333333766572"],
+    ),
+    // Retries to a key prefix no contact has go on without the path reset.
+    (
+        "retry_unknown_prefix",
+        &[
+            "02000000f153655555555555556869",
+            "02000100f153655555555555556869",
+            "04",
+        ],
+        &[
+            "02000000f153655555555555556869",
+            "02000100f153655555555555556869",
+            "04",
+            "02000200f153655555555555556869",
+        ],
+    ),
+    // A path without hash mode fails when the device does not tell its own;
+    // meshcore_py takes mode 0.
+    (
+        "change_path_hash_mode_refused",
+        &[
+            "1603",
+            concat!(
+                "091111111111111111111111111111111111111111111111111111111111111111020004",
+                "a1b2c3d40000000000000000000000000000000000000000000000000000000000000000",
+                "000000000000000000000000000000000000000000000000000000005265700000000000",
+                "000000000000000000000000000000000000000000000000e8030000fc1f3103e47d9800"
+            ),
+        ],
+        &["1603"],
     ),
     // An anonymous request takes its reply path from the device's own record.
     (
@@ -121,6 +242,32 @@ const DEVIATIONS: &[(&str, &[&str], &[&str])] = &[
         &[
             "1e1111111111111111111111111111111111111111111111111111111111111111",
             "3911111111111111111111111111111111111111111111111111111111111111110141a1a2",
+        ],
+    ),
+    // A contact set to zero-hop for one goes back to flood also when setting
+    // zero-hop got no answer.
+    (
+        "anon_zero_hop_unanswered",
+        &[
+            "1e3333333333333333333333333333333333333333333333333333333333333333",
+            "1603",
+            concat!(
+                "093333333333333333333333333333333333333333333333333333333333333333010040",
+                "000000000000000000000000000000000000000000000000000000000000000000000000",
+                "000000000000000000000000000000000000000000000000000000004368617400000000",
+                "000000000000000000000000000000000000000000000000e8030000fc1f3103e47d9800"
+            ),
+        ],
+        &[
+            "1e3333333333333333333333333333333333333333333333333333333333333333",
+            "1603",
+            concat!(
+                "093333333333333333333333333333333333333333333333333333333333333333010040",
+                "000000000000000000000000000000000000000000000000000000000000000000000000",
+                "000000000000000000000000000000000000000000000000000000004368617400000000",
+                "000000000000000000000000000000000000000000000000e8030000fc1f3103e47d9800"
+            ),
+            "0d3333333333333333333333333333333333333333333333333333333333333333",
         ],
     ),
     // Input the firmware answers with ERR_CODE_ILLEGAL_ARG is refused.
@@ -179,10 +326,97 @@ const DEVIATIONS: &[(&str, &[&str], &[&str])] = &[
         )],
         &[],
     ),
+    (
+        "fifth_attempt_too_long",
+        &[concat!(
+            "02000400f153651111111111117878787878787878787878787878787878787878787878",
+            "787878787878787878787878787878787878787878787878787878787878787878787878",
+            "787878787878787878787878787878787878787878787878787878787878787878787878",
+            "787878787878787878787878787878787878787878787878787878787878787878787878",
+            "78787878787878787878787878787878787878787878787878787878"
+        )],
+        &[],
+    ),
+    ("empty_node_command", &["02010000f15365111111111111"], &[]),
+    (
+        "node_command_too_long",
+        &[concat!(
+            "02010000f153651111111111117878787878787878787878787878787878787878787878",
+            "787878787878787878787878787878787878787878787878787878787878787878787878",
+            "787878787878787878787878787878787878787878787878787878787878787878787878",
+            "787878787878787878787878787878787878787878787878787878787878787878787878",
+            "787878787878787878787878787878787878787878787878787878787878"
+        )],
+        &[],
+    ),
+    ("custom_var_too_short", &["29613a"], &[]),
+    (
+        "node_command_nul",
+        &["02010000f15365111111111111760072"],
+        &[],
+    ),
+    ("channel_message_nul", &["03000000f15365610062"], &[]),
+    ("cli_command_nul", &["4276650072"], &[]),
+    ("name_nul", &["08610062"], &[]),
+    (
+        "contact_name_nul",
+        &[concat!(
+            "0944444444444444444444444444444444444444444444444444444444444444440200ff",
+            "000000000000000000000000000000000000000000000000000000000000000000000000",
+            "000000000000000000000000000000000000000000000000000000006100620000000000",
+            "000000000000000000000000000000000000000000000000000000000000000000000000"
+        )],
+        &[],
+    ),
+    (
+        "channel_name_nul",
+        &[concat!(
+            "20012361006200000000000000000000000000000000000000000000000000000000be50",
+            "862227f5ab13176fe412a04969e3"
+        )],
+        &[],
+    ),
+    ("custom_var_nul", &["296770733a3100"], &[]),
+    (
+        "default_flood_scope_nul",
+        &[concat!(
+            "3f23610062000000000000000000000000000000000000000000000000000000be508622",
+            "27f5ab13176fe412a04969e3"
+        )],
+        &[],
+    ),
+    (
+        "password_nul",
+        &["1a11111111111111111111111111111111111111111111111111111111111111117061007373"],
+        &[],
+    ),
+    // A command longer than the firmware takes is refused.
+    (
+        "command_too_long",
+        &[concat!(
+            "12aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        )],
+        &[],
+    ),
 ];
 
 /// The cases in which meshcore_py raises an error, with its name.
-const RAISED: &[(&str, &str)] = &[("set_tx_power_negative", "OverflowError")];
+const RAISED: &[(&str, &str)] = &[
+    // values it cannot encode
+    ("set_tx_power_negative", "OverflowError"),
+    ("tx_power_below_min", "OverflowError"),
+    ("radio_negative_frequency", "OverflowError"),
+    ("radio_negative_bandwidth", "OverflowError"),
+    // a hash mode that spills out of the length byte
+    ("change_path_mode_4", "OverflowError"),
+    ("channel_data_mode_4", "ValueError"),
+    // the path reset for a key prefix no contact has
+    ("retry_unknown_prefix", "ValueError"),
+];
 
 /// A contact the device holds.
 fn contact_frame(key: [u8; 32]) -> Option<Vec<u8>> {
@@ -460,7 +694,8 @@ async fn act(case: &str, mc: &MeshCore) {
         "update_contact" => drop(mc.update_contact(&cached(&key), None).await),
         "update_contact_lastmod" => drop(mc.update_contact(&cached(&key), Some(7000)).await),
         "add_contact" => drop(mc.add_contact(&new_contact("New")).await),
-        "change_path_device_mode" => {
+        // the latter with a device that refuses the hash mode query
+        "change_path_device_mode" | "change_path_hash_mode_refused" => {
             let path = [0xa1, 0xb2, 0xc3, 0xd4];
             drop(mc.change_contact_path(&cached(&key), &path, None).await);
         }
@@ -611,7 +846,11 @@ async fn act(case: &str, mc: &MeshCore) {
             );
         }
         "anon_owner_flood_contact" => drop(mc.req_owner_sync(&chat, options).await),
-        "anon_regions_flood_contact" => drop(mc.req_regions_async(&chat, options).await),
+        // the latter two with a device that leaves the hash mode query or the
+        // zero-hop change unanswered
+        "anon_regions_flood_contact" | "anon_hash_mode_unanswered" | "anon_zero_hop_unanswered" => {
+            drop(mc.req_regions_async(&chat, options).await);
+        }
         "anon_basic_flood_contact" => drop(mc.req_basic_sync(&chat, options).await),
         // where this library differs
         "set_radio_rounding" => drop(mc.set_radio(869.4625, 62.5, 9, 8, None).await),
@@ -630,6 +869,7 @@ async fn act(case: &str, mc: &MeshCore) {
         "trace_not_whole_hops" => {
             drop(mc.send_trace(&trace(9, Some(1), &[0xaa, 0xbb, 0xcc])).await);
         }
+        "trace_too_many_hops" => drop(mc.send_trace(&trace(10, None, &[0xaa; 65])).await),
         "raw_data_two_byte_hashes" => {
             drop(
                 mc.send_raw_data(&[1, 2, 3, 4], &[0xa1, 0xa2, 0xb1, 0xb2], 1)
@@ -640,13 +880,72 @@ async fn act(case: &str, mc: &MeshCore) {
             let path = [0xa1, 0xb2, 0xc3];
             drop(mc.change_contact_path(&cached(&key), &path, Some(1)).await);
         }
+        "change_path_too_many_hops" => {
+            drop(
+                mc.change_contact_path(&cached(&key), &[7; 64], Some(0))
+                    .await,
+            );
+        }
+        "change_path_too_long" => {
+            drop(
+                mc.change_contact_path(&cached(&key), &[7; 66], Some(1))
+                    .await,
+            );
+        }
+        "change_path_mode_3" | "change_path_mode_4" => {
+            let (path, mode): (&[u8], u8) = if case == "change_path_mode_3" {
+                (&[0xa1, 0xb2, 0xc3, 0xd4], 3)
+            } else {
+                (&[0xa1, 0xb2, 0xc3, 0xd4, 0xe5], 4)
+            };
+            drop(
+                mc.change_contact_path(&cached(&key), path, Some(mode))
+                    .await,
+            );
+        }
         "channel_data_not_whole_hops" => {
             drop(
                 mc.send_channel_data(1, 0x1234, &[0xaa], Some(&[1, 2, 3]), 1)
                     .await,
             );
         }
+        "channel_data_too_many_hops" => {
+            drop(
+                mc.send_channel_data(1, 0x1234, &[0xaa], Some(&[7; 64]), 0)
+                    .await,
+            );
+        }
+        "channel_data_mode_3" | "channel_data_mode_4" => {
+            let (path, mode): (&[u8], u8) = if case == "channel_data_mode_3" {
+                (&[1, 2, 3, 4], 3)
+            } else {
+                (&[1, 2, 3, 4, 5], 4)
+            };
+            drop(
+                mc.send_channel_data(1, 0x1234, &[0xaa], Some(path), mode)
+                    .await,
+            );
+        }
+        "raw_data_too_many_hops" => drop(mc.send_raw_data(&[1, 2, 3, 4], &[7; 64], 0).await),
+        "update_contact_path_mismatch"
+        | "update_contact_flood_with_path"
+        | "update_contact_path_too_long" => {
+            let (path_len, path) = match case {
+                "update_contact_path_mismatch" => (PathLen::new(2, 0).unwrap(), vec![1]),
+                "update_contact_flood_with_path" => (PathLen::NONE, vec![1]),
+                // 33 hops of 2 bytes
+                _ => (PathLen::from_byte(0x40 | 0x21), vec![1; 66]),
+            };
+            let mut contact = cached(&key);
+            contact.out_path_len = path_len;
+            contact.out_path = path;
+            drop(mc.update_contact(&contact, None).await);
+        }
         "send_cmd_bare_key" => drop(mc.send_cmd(chat, "ver", Some(T), None).await),
+        "retry_unknown_prefix" => {
+            let prefix: [u8; 6] = STRANGER[..6].try_into().unwrap();
+            drop(mc.send_msg_with_retry(prefix, "hi", retry).await);
+        }
         "anon_unknown_node" => {
             drop(
                 mc.req_regions_async(&PublicKey::new(STRANGER), options)
@@ -657,13 +956,27 @@ async fn act(case: &str, mc: &MeshCore) {
         "devicepin_illegal" => drop(mc.set_devicepin(12_345).await),
         "coords_out_of_range" => drop(mc.set_coords(91.0, 0.0).await),
         "radio_out_of_range" => drop(mc.set_radio(433.875, 62.5, 4, 8, None).await),
+        "radio_negative_frequency" => drop(mc.set_radio(-1.0, 62.5, 9, 8, None).await),
+        "radio_negative_bandwidth" => drop(mc.set_radio(433.875, -62.5, 9, 8, None).await),
         "tx_power_above_max" => drop(mc.set_tx_power(23).await),
+        "tx_power_below_min" => drop(mc.set_tx_power(-10).await),
         "path_hash_mode_reserved" => drop(mc.set_path_hash_mode(3).await),
         "custom_var_without_name" => drop(mc.set_custom_var("", "1").await),
         "custom_var_colon" => drop(mc.set_custom_var("a:b", "c").await),
+        "custom_var_too_short" => drop(mc.set_custom_var("a", "").await),
+        "command_too_long" => drop(mc.import_contact(&[0xaa; 176]).await),
         "empty_message" => drop(mc.send_msg(key, "", Some(T), 0).await),
         "message_too_long" => drop(mc.send_msg(key, &"x".repeat(161), Some(T), 0).await),
-        "message_nul" => drop(mc.send_msg(key, "a\0b", Some(T), 0).await),
+        "fifth_attempt_too_long" => drop(mc.send_msg(key, &"x".repeat(159), Some(T), 4).await),
+        "empty_node_command" | "node_command_too_long" | "node_command_nul" => {
+            let command = match case {
+                "empty_node_command" => String::new(),
+                "node_command_too_long" => "x".repeat(161),
+                _ => "v\0r".to_string(),
+            };
+            let repeater = Some(ContactType::Repeater);
+            drop(mc.send_cmd(key, &command, Some(T), repeater).await);
+        }
         "channel_message_too_long" => drop(mc.send_chan_msg(0, &"x".repeat(155), Some(T)).await),
         "empty_name" => drop(mc.set_name("").await),
         "short_cli_command" => drop(mc.run_cli_command("v").await),
@@ -672,18 +985,58 @@ async fn act(case: &str, mc: &MeshCore) {
         "short_contact_card" => drop(mc.import_contact(&[0xaa; 97]).await),
         "control_type_without_top_bit" => drop(mc.send_control_data(0x10, &[1]).await),
         "long_password" => drop(mc.send_login(&key, &"p".repeat(16)).await),
+        "message_nul" => drop(mc.send_msg(key, "a\0b", Some(T), 0).await),
+        "channel_message_nul" => drop(mc.send_chan_msg(0, "a\0b", Some(T)).await),
+        "cli_command_nul" => drop(mc.run_cli_command("ve\0r").await),
+        "name_nul" => drop(mc.set_name("a\0b").await),
+        "contact_name_nul" => {
+            // set as a name; Contact::new would cut it at the NUL
+            let mut contact = new_contact("");
+            contact.name = "a\0b".into();
+            drop(mc.add_contact(&contact).await);
+        }
+        "channel_name_nul" => drop(mc.set_channel(1, "#a\0b", None).await),
+        "custom_var_nul" => drop(mc.set_custom_var("gps", "1\0").await),
+        "default_flood_scope_nul" => drop(mc.set_default_flood_scope(Some("a\0b")).await),
+        "password_nul" => drop(mc.send_login(&key, "pa\0ss").await),
         other => panic!("no calls for the case {other}"),
     }
 }
 
+/// The command codes a case has the device refuse (with an error reply) and
+/// leave unanswered.
+#[derive(Default)]
+struct Answers {
+    refuse: Vec<u8>,
+    silent: Vec<u8>,
+}
+
 /// What a case writes: its calls on a client that has connected and, when
-/// the case says so, read the contacts.
-async fn run(case: &str, read_contacts: bool) -> Vec<Vec<u8>> {
-    let (mc, device) = client_on_device(Options::default(), respond);
+/// the case says so, read the contacts. The device answers them as `answers`
+/// says.
+async fn run(case: &str, read_contacts: bool, answers: Answers) -> Vec<Vec<u8>> {
+    let changed = Arc::new(Mutex::new(Answers::default()));
+    let responder = {
+        let changed = Arc::clone(&changed);
+        move |cmd: &[u8]| {
+            let changed = changed.lock().unwrap();
+            if changed.silent.contains(&cmd[0]) {
+                Vec::new()
+            } else if changed.refuse.contains(&cmd[0]) {
+                // ERR_CODE_UNSUPPORTED_CMD
+                vec![vec![1, 1]]
+            } else {
+                respond(cmd)
+            }
+        }
+    };
+    let (mc, device) = client_on_device(Options::default(), responder);
     mc.connect().await.unwrap();
     if read_contacts {
         mc.get_contacts(0).await.unwrap();
     }
+    // from the case's own calls on
+    *changed.lock().unwrap() = answers;
     let start = device.commands().len();
     act(case, &mc).await;
     device.settle().await;
@@ -720,7 +1073,16 @@ async fn commands_go_out_as_meshcore_py_sends_them() {
             .map(|frame| meshcore::hex::decode(frame.as_str().unwrap()).unwrap())
             .collect();
         let py = comparable(&py);
-        let rs = comparable(&run(&case, recorded["contacts"] == true).await);
+        let codes = |kind: &str| -> Vec<u8> {
+            let codes = recorded[kind].as_array().map_or(&[][..], Vec::as_slice);
+            let code = |code: &serde_json::Value| u8::try_from(code.as_u64().unwrap()).unwrap();
+            codes.iter().map(code).collect()
+        };
+        let answers = Answers {
+            refuse: codes("refuse"),
+            silent: codes("silent"),
+        };
+        let rs = comparable(&run(&case, recorded["contacts"] == true, answers).await);
         let raised = recorded["raised"].as_str();
         let listed = RAISED.iter().find(|(name, _)| *name == case);
         if raised != listed.map(|(_, error)| *error) {

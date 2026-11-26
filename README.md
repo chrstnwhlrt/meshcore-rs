@@ -23,9 +23,13 @@ response and push code that firmware sends. A parity test runs the same 71 devic
 frames through meshcore_py and through this library, with channel log decryption
 on and a binary request of each kind waiting for its answer, and compares the
 JSON of the resulting events; they match except for the deliberate fixes listed
-below. A second one runs 150 cases of commands through both, against stand-ins
-for a device that answer alike, and compares the frames they write; 116 match
-byte for byte, and the other 34 show the differences listed below.
+below. A second one runs 183 cases of commands through both, against stand-ins
+for a device that answer alike (refusing or leaving unanswered the same
+commands where a case says so), and compares the frames they write. In 122
+cases they write the same frames byte for byte, the random nonce of a
+neighbours request aside (five of these write none: meshcore_py raises an
+error, this library refuses the input). The other 61 show the differences
+listed below.
 The size checks assume frames of 176 bytes, which the firmware takes from 1.16
 on; before, it took 172, so there a private message holds at most 159 bytes
 (see `MAX_TEXT_LENGTH`).
@@ -424,7 +428,9 @@ meshcore_py leaves a gap:
   in the contacts read for the path reset, goes on without the reset;
   meshcore_py raises an error there.
 - `get_path_hash_mode`, which `change_contact_path` without a hash mode uses,
-  fails when the device query fails; meshcore_py takes mode 0 then.
+  fails when the device query fails; meshcore_py takes mode 0 then. An
+  anonymous request takes mode 0 then too, as meshcore_py does, for the
+  zero-hop path it sets: zero hops have no size a mode could give.
 - Commands from several tasks go out one after the other, so each gets its
   own reply; meshcore_py sends them at once, where one's `OK` or error can end
   another. The single setters of the `CMD_SET_OTHER_PARAMS` settings (such as

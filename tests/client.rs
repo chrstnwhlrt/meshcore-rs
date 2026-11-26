@@ -1691,6 +1691,45 @@ async fn a_zero_hop_change_without_an_answer_is_set_back_to_flood() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_zero_hop_path_takes_mode_0_when_the_device_does_not_tell_its_own() {
+    // zero hops have no size a mode could give, so the request goes on, as in
+    // meshcore_py; the hash mode query gets no answer, or is refused
+    for refused in [false, true] {
+        let options = Options {
+            default_timeout: Duration::from_secs(1),
+            ..Options::default()
+        };
+        let (mc, device) = client_on_device(options, move |cmd| match cmd[0] {
+            1 => vec![self_info_frame("Node")],
+            22 if refused => vec![err(1)],
+            30 => vec![contact_frame(3, KEY, "Rep", 0xff, &[])],
+            9 | 13 => vec![ok()],
+            57 => vec![sent_frame(false, 0x78, 1000)],
+            _ => vec![],
+        });
+        mc.connect().await.unwrap();
+        mc.cache_contact(Contact::new(key(), ContactType::Repeater, "Rep"));
+        mc.send_anon_req(
+            &key(),
+            meshcore::AnonReqType::Owner,
+            RequestOptions::default(),
+        )
+        .await
+        .unwrap();
+        let codes: Vec<u8> = device
+            .commands()
+            .iter()
+            .map(|c| c[0])
+            .filter(|&c| c != 1)
+            .collect();
+        assert_eq!(codes, vec![30, 22, 9, 57, 13]);
+        // zero hops of 1-byte hashes
+        assert_eq!(device.commands_with(9)[0][35], 0);
+        assert!(mc.contact(&key()).unwrap().is_flood());
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn login_success_and_failure() {
     let fail = Arc::new(AtomicBool::new(false));
     let fail_flag = Arc::clone(&fail);
