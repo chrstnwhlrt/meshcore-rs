@@ -391,14 +391,35 @@ mod tests {
         let public = channel(0, "#public");
         let mut parser = PacketParser::default();
         parser.add_channel(&public);
-        parser.set_keep_channel_secrets(false);
-        parser.add_channel(&public);
+        parser.decrypt_channels = true;
         let packet = group_packet(&public, 1, "x", &[]);
+        parser.parse(&packet, 0.0, 0, 0).unwrap();
+        let hash = message_hash(1, b"x");
+        assert!(parser.find_by_msg_hash(hash).is_some());
+        parser.set_keep_channel_secrets(false);
+        assert!(parser.find_by_msg_hash(hash).is_none());
+        // and it learns none while they are not kept
+        parser.add_channel(&public);
         let info = parser.parse(&packet, 0.0, 0, 0).unwrap();
         let PacketContent::GroupText(group) = &info.content else {
             panic!()
         };
         assert_eq!(group.chan_name, None);
+    }
+
+    #[test]
+    fn the_channel_log_drops_its_oldest_quarter_past_100_packets() {
+        // as meshcore_py's channels_log
+        let public = channel(0, "#public");
+        let mut parser = PacketParser::default();
+        parser.add_channel(&public);
+        parser.decrypt_channels = true;
+        for time in 0..101 {
+            parser.parse(&group_packet(&public, time, "x", &[]), 0.0, 0, 0);
+        }
+        assert!(parser.find_by_msg_hash(message_hash(24, b"x")).is_none());
+        assert!(parser.find_by_msg_hash(message_hash(25, b"x")).is_some());
+        assert!(parser.find_by_msg_hash(message_hash(100, b"x")).is_some());
     }
 
     #[test]
@@ -409,6 +430,52 @@ mod tests {
         assert!(parser.parse(&[0x14, 1, 2, 3, 4], 0.0, 0, 0).is_none());
         // a path longer than the packet
         assert!(parser.parse(&[0x11, 0x03, 0xaa], 0.0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn payloads_cut_short_are_not_decoded() {
+        // meshcore_py reports the parts it could read
+        let public = channel(0, "#public");
+        let mut parser = PacketParser::default();
+        parser.add_channel(&public);
+        parser.decrypt_channels = true;
+        // a group text that ends within its channel hash and MAC
+        let info = parser
+            .parse(&[(5 << 2) | 1, 0, public.channel_hash(), 0x12], 0.0, 0, 0)
+            .unwrap();
+        assert_eq!(info.payload_type, PayloadType::GrpTxt);
+        assert!(matches!(info.content, PacketContent::None));
+        // an advert that ends within the location its flags announce
+        let mut packet = vec![(4 << 2) | 1, 0];
+        packet.extend([7; 32]);
+        packet.extend(1000u32.to_le_bytes());
+        packet.extend([0; 64]);
+        packet.push(0x80 | 0x10 | 2);
+        packet.extend(53_551_100i32.to_le_bytes());
+        let info = parser.parse(&packet, 0.0, 0, 0).unwrap();
+        assert_eq!(info.payload_type, PayloadType::Advert);
+        assert!(matches!(info.content, PacketContent::None));
+    }
+
+    #[test]
+    fn group_texts_of_no_whole_blocks_stay_encrypted() {
+        // with decryption on, meshcore_py logs a parse error and drops them
+        let public = channel(0, "#public");
+        let mut parser = PacketParser::default();
+        parser.add_channel(&public);
+        parser.decrypt_channels = true;
+        for len in [0, 15, 17] {
+            let crypted = vec![7; len];
+            let mut packet = vec![(5 << 2) | 1, 0, public.channel_hash()];
+            packet.extend(mac2(&public.channel_secret, &crypted));
+            packet.extend(&crypted);
+            let info = parser.parse(&packet, 0.0, 0, 0).unwrap();
+            let PacketContent::GroupText(group) = &info.content else {
+                panic!("{len} bytes")
+            };
+            assert_eq!(group.chan_name.as_deref(), Some("#public"));
+            assert!(group.decrypted.is_none(), "{len} bytes");
+        }
     }
 
     #[test]

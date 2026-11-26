@@ -1,7 +1,9 @@
 //! Cayenne LPP telemetry.
 //!
 //! Readings are decoded with the type table of pycayennelpp, which meshcore_py
-//! uses. Decoding ends at channel 0, where the zero bytes that pad encrypted
+//! uses; voltage and current are read signed, as meshcore_py reads them.
+//! Min/max/average series ([`parse_mma`]) follow the firmware's own table.
+//! Decoding ends at channel 0, where the zero bytes that pad encrypted
 //! answers begin. It also ends at the first reading of an unknown type or one
 //! cut short, which is kept with the bytes after it as `undecoded`.
 
@@ -308,7 +310,9 @@ impl LppType {
     }
 }
 
-/// A big-endian integer of 1 to 8 bytes as `f64`, two's complement when signed.
+/// A big-endian integer as `f64`, in two's complement when signed and shorter
+/// than 8 bytes. Of a longer one the low 8 bytes count: the firmware writes the
+/// value of a GPS series (9 bytes) into the low 4.
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_wrap)]
 fn be_value(bytes: &[u8], signed: bool) -> f64 {
     let raw = bytes.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b));
@@ -452,7 +456,8 @@ impl Telemetry {
 }
 
 /// Size, multiplier and signedness the firmware's `LPPData` helper (which the
-/// sensor uses for min/max/average series) gives a type code.
+/// sensor uses for min/max/average series) gives a type code. Voltage and
+/// current are unsigned there, so they are not read signed as in telemetry.
 fn mma_layout(code: u8) -> (usize, f64, bool) {
     let size = match code {
         136 => 9,
@@ -474,9 +479,10 @@ fn mma_layout(code: u8) -> (usize, f64, bool) {
 }
 
 /// Decodes the series of a min/max/average answer: per series the channel, the
-/// type and three values (min, max, average). Returns the series and the bytes
-/// from the first one that could not be decoded, and logs why as meshcore_py
-/// does (which then reports no series at all).
+/// type and three values (min, max, average), read as the sensor writes them
+/// (humidity in 2 bytes of 0.1 %, voltage and current unsigned). Returns the
+/// series and the bytes from the first one that could not be decoded, and logs
+/// why as meshcore_py does (which then reports no series at all).
 #[must_use]
 pub fn parse_mma(buf: &[u8]) -> (Vec<MmaEntry>, Vec<u8>) {
     let mut entries = Vec::new();
@@ -578,12 +584,11 @@ mod tests {
 
     #[test]
     fn current_and_voltage_wrap_negative_like_meshcore_py() {
-        // 0xfe0c = 65036 -> -0.5 A
-        let buf = [1, 117, 0xfe, 0x0c];
-        assert_eq!(
-            Telemetry::parse(&buf).readings[0].value,
-            LppValue::Scalar(-0.5)
-        );
+        // 0xfe0c = 65036 -> -0.5 A, 0x8000 = 32768 -> -327.68 V
+        let buf = [1, 117, 0xfe, 0x0c, 1, 116, 0x80, 0x00];
+        let readings = Telemetry::parse(&buf).readings;
+        assert_eq!(readings[0].value, LppValue::Scalar(-0.5));
+        assert_eq!(readings[1].value, LppValue::Scalar(-327.68));
     }
 
     #[test]
@@ -612,6 +617,27 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].max, LppValue::Scalar(25.5));
         assert_eq!(entries[1].avg, LppValue::Scalar(50.5));
+
+        // voltage and current above the signed range stay positive (the
+        // sensor writes them unsigned; meshcore_py reads them as negative)
+        let mut buf = Vec::new();
+        for (code, raw) in [(116, 40_000u16), (117, 40_000)] {
+            buf.extend([1, code]);
+            for _ in 0..3 {
+                buf.extend(raw.to_be_bytes());
+            }
+        }
+        let (entries, _) = parse_mma(&buf);
+        assert_eq!(entries[0].min, LppValue::Scalar(400.0));
+        assert_eq!(entries[1].max, LppValue::Scalar(40.0));
+
+        // a GPS series: 9 bytes per value, which the sensor writes into the low 4
+        let mut buf = vec![1, 136];
+        for _ in 0..3 {
+            buf.extend([0, 0, 0, 0, 0, 0, 1, 2, 3]);
+        }
+        let (entries, _) = parse_mma(&buf);
+        assert_eq!(entries[0].avg, LppValue::Scalar(66_051.0));
 
         // an unknown type, a series cut short and a missing type byte end the
         // reading; the series before stay

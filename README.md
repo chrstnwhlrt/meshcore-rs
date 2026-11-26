@@ -19,9 +19,11 @@ and keeps its command names, event types and payload fields.
 
 The library follows meshcore_py 2.3.19 and the companion protocol of firmware
 1.18.0, including paths with 2 and 3 byte hashes per hop. The parser covers every
-response and push code that firmware sends. A parity test runs the same 61 device
-frames through meshcore_py and through this library and compares the JSON of
-the resulting events; they match except for the deliberate fixes listed below.
+response and push code that firmware sends. A parity test runs the same 70 device
+frames through meshcore_py and through this library, with channel log decryption
+on and a binary request of each kind waiting for its answer, and compares the
+JSON of the resulting events; they match except for the deliberate fixes listed
+below.
 The size checks assume frames of 176 bytes, which the firmware takes from 1.16
 on; before, it took 172, so there a private message holds at most 159 bytes
 (see `MAX_TEXT_LENGTH`).
@@ -126,9 +128,9 @@ take one for its own.
 
 `MeshCore::create_ble` (feature `ble`) finds a companion by its address, by a
 part of its name (it advertises as `MeshCore-<node name>`) or as the first one
-in range, as meshcore_py does. A reconnect looks for it the same way and may
-find another device. A companion advertises only while no other app (such as
-the phone app) is connected to it over BLE.
+in range, as meshcore_py does, and as there a reconnect or a later `connect`
+goes to the device found first, by its address. A companion advertises only
+while no other app (such as the phone app) is connected to it over BLE.
 
 ```rust ignore
 use meshcore::{BleConfig, MeshCore, Options};
@@ -162,7 +164,8 @@ advertise meanwhile. So call `disconnect` before the program ends; it waits the
 2 s BlueZ takes, and a shorter timeout around it is fine. A client dropped
 without it, or a connect given up or stopped while it opens the link, takes the
 link down in the background, which needs the Tokio runtime to keep running for a
-moment.
+moment. A link BlueZ reports gone is not taken down again: coming late, that
+would end the next link to the device, such as another program's.
 
 `meshcore::transport::ble::scan` lists the MeshCore devices in range. Frames go
 one per write (with response) and one per notification; a write that takes
@@ -302,13 +305,19 @@ once the attempts have failed, or when a `disconnect` or `connect` ends them.
 The library logs through the `log` crate with the target `meshcore`. Where
 meshcore_py logs the same case at info level or above, the message has its
 wording (spelling included), so a program shows the lines a meshcore_py
-program would show. The one exception is a command without a link: it fails
-at once with `Error::NotConnected` and logs nothing, where meshcore_py tries
-to send and logs that the transport is not connected. Some cases meshcore_py
-does not log at that level get lines of the library's own, such as a lost
-link. A frame or remote answer the library cannot read is logged with
-meshcore_py's error line for it, also where meshcore_py logs nothing at that
-level (it fills in zeros for the missing bytes or skips the frame).
+program would show. A command without a link fails at once with
+`Error::NotConnected` and logs nothing, where meshcore_py tries to send and
+logs that the transport is not connected. Input the library refuses before
+sending comes back as `Error::InvalidArgument` without a line either.
+meshcore_py logs a trace path it cannot read and sends most other such input,
+after which `send_msg_with_retry` logs the device's refusal of each attempt.
+Some cases meshcore_py does not log at that level get lines of the library's
+own, such as a lost link. A frame or remote answer the library cannot read is
+logged with meshcore_py's error line for it, also where meshcore_py logs
+nothing at that level (it fills in zeros for the missing bytes or skips the
+frame). A status or subscription answer, for which meshcore_py has no such
+line, gets one in the form of those (`Error parsing binary STATUS response:
+...`).
 
 ## Differences from meshcore_py
 
@@ -326,10 +335,12 @@ meshcore_py leaves a gap:
   requires; meshcore_py sends the bare command, which the firmware rejects as
   unsupported.
 - MMA readings from sensors use the firmware's LPP table (humidity has 2 bytes
-  in 0.1 % steps), not the CayenneLPP one. A series of a type meshcore_py does
-  not know, or one cut short, ends the reading, and the series before it are
-  kept; meshcore_py then reports no series (`mma_data` is null for an unknown
-  type, and an answer cut short is dropped).
+  in 0.1 % steps, voltage and current are unsigned), not the CayenneLPP one;
+  meshcore_py takes voltages above 327.67 V and currents above 32.767 A for
+  negative there. A series of a type meshcore_py does not know, or one cut
+  short, ends the reading, and the series before it are kept; meshcore_py
+  then reports no series (`mma_data` is null for an unknown type, and an
+  answer cut short is dropped).
 - A full contact fetch replaces the cache instead of merging into it, so
   contacts removed on the device disappear. It does so only when the list
   brings as many contacts as the device reports to hold (or is as short as the
@@ -422,6 +433,9 @@ meshcore_py leaves a gap:
   timeout.
 - `send_trace` refuses an empty path before sending, as the firmware only
   traces along at least one hop; meshcore_py sends a zero byte as its hop.
+  It also refuses a path that is no whole number of hops of the hash size its
+  flags give, or has more than 64 hops, which the firmware answers with
+  `ERR_CODE_ILLEGAL_ARG`; meshcore_py sends such a path given as bytes.
 - `fetch_all_neighbours` stops when a page comes back empty; meshcore_py asks
   again forever.
 - A neighbours answer to a request sent with `send_binary_req` is read too,
@@ -443,11 +457,18 @@ meshcore_py leaves a gap:
   halfway, as by a timeout around it, and when setting zero-hop got no answer,
   which the device may have taken anyway. meshcore_py leaves it at zero-hop in
   both cases.
+- `req_owner_sync` takes an answer without a line break for the name alone,
+  with no owner info; meshcore_py fails on it with an `IndexError`.
+  Repeaters always send the line break.
 - `set_channel` keeps the channel's secret for the RX log as `get_channel`
   does; meshcore_py learns secrets from `get_channel` only.
 - An RX log packet that was logged before its channel was known, or while
   decryption was off, is decrypted when it comes again; meshcore_py takes
   over the empty entry it logged then.
+- A channel message in a v3 frame loses the NUL bytes at either end of its
+  text, as in the older frame, and its hash for the RX log is taken without
+  them, as the log's own is; meshcore_py keeps them in v3 frames (the
+  firmware sends none).
 - A group text in the RX log that ends within its channel hash and MAC, or an
   advert that ends within the fields its flags announce, gets no decoded
   fields; meshcore_py reports the parts it could read (a location from the
@@ -458,9 +479,24 @@ meshcore_py leaves a gap:
 - A push too short to read is only logged, and a reply too short to read
   ends its command with an error (reason `invalid_frame_length`); meshcore_py
   fills the missing fields of most frames with zeros, or reports a
-  `parse_error` where a missing byte raises an exception. A neighbours or
-  node discovery answer cut short likewise comes only as its raw
-  `BinaryResponse` or `ControlData`.
+  `parse_error` where a missing byte raises an exception. A channel datagram
+  with less data than its length byte announces is such a reply too;
+  meshcore_py reports the bytes there are, with the length byte as `data_len`.
+  A neighbours answer cut short likewise comes only as its raw `BinaryResponse`,
+  and a node discovery answer that ends before 8 bytes of the node's key (the
+  firmware's display needs them too) only as its `ControlData`; meshcore_py
+  reports such an answer with the bytes there are, an empty key included. A
+  subscription answer without the 2 bytes of its expiry ends
+  `req_subscribe_sync` with `invalid_frame_length`, where meshcore_py reads
+  zeros for the missing bytes. `get_allowed_repeat_freq` leaves out a last
+  frequency pair that is cut short, and a contact list whose `lastmod` at the
+  end is cut short ends with the `lastmod` 0; meshcore_py fills in zeros for
+  the missing bytes of both.
+- A trace whose path is no whole number of hops (one another node built; the
+  device refuses to send such a path) is read as the firmware sends it: all
+  hash bytes, an SNR for each whole hop, then the final SNR. meshcore_py reads
+  the SNRs right after the whole hops, where the hash cut short begins, so they
+  and the final SNR come from the wrong bytes.
 - A start byte whose header announces more than 300 bytes is skipped alone,
   so a frame that starts right behind it (after console output ending in `>`)
   is still read; meshcore_py drops the whole three byte header and loses that
@@ -469,6 +505,10 @@ meshcore_py leaves a gap:
   contact names, which meshcore_py writes uncut (a name over 32 bytes shifts
   the fields after it), and node and channel names, which the firmware would
   cut in the middle of a character.
+- A contact's name ends at its first NUL byte. When a known contact
+  advertises a shorter name, the firmware leaves the rest of the old one
+  behind that NUL; meshcore_py removes the NUL bytes and shows that rest as
+  part of the name.
 - A command longer than the 176 bytes the firmware takes is refused before it
   is sent; meshcore_py sends it, and the firmware cuts it short over serial and
   Ethernet and drops it over BLE and WiFi.
@@ -488,21 +528,28 @@ meshcore_py leaves a gap:
   differently: a NUL byte in a text, name or password (it ends them there) and
   a `:` in a custom variable's name (it splits there).
 - Input the firmware answers with `ERR_CODE_ILLEGAL_ARG` is refused before
-  sending too: coordinates beyond -90 to 90 degrees latitude or -180 to 180
-  degrees longitude after rounding to millionths (`set_coords`; the firmware
-  checks the rounded values) and a custom variable without a name. meshcore_py
-  sends both.
+  sending too, where the client can tell without asking the device:
+  coordinates beyond -90 to 90 degrees latitude or -180 to 180 degrees
+  longitude after rounding to millionths (`set_coords`; the firmware checks
+  the rounded values), a custom variable without a name, a BLE PIN other than
+  0 or 100000 to 999999 (`set_devicepin`), radio settings beyond 150 to 2500
+  MHz, 7 to 500 kHz, SF 5 to 12 or CR 5 to 8 (`set_radio`), a TX power below
+  -9 dBm or above the device's maximum (`set_tx_power`) and a path hash mode
+  above 2 (`set_path_hash_mode`). A time before the device's own (`set_time`)
+  and repeating on a frequency the device does not allow (`set_radio`) go out.
+  meshcore_py sends all of them, except a negative TX power, frequency or
+  bandwidth, which it cannot encode and raises an error for.
 - A path its length byte cannot describe is refused before sending: one that
   is not a whole number of hops, has more than 63 hops or more than 64 bytes,
   or uses hash mode 3 (reserved) or above (`change_contact_path`,
   `send_channel_data` and `send_raw_data`; `parse_path_hex` refuses such a
-  hash mode too), and a contact path that does not match its length byte or
-  is longer than 64 bytes (`update_contact`). meshcore_py sends such a path.
-  It counts only whole hops, so the firmware takes fewer and, in channel
-  data, reads the rest as the data type. It packs hop count and hash mode
-  into one byte unchecked, so more hops spill into the mode bits, and mode 4
-  and above raise an error. A contact path over 64 bytes goes out uncut and
-  shifts the fields after it.
+  hash mode too), and a contact path that does not match its length byte (a
+  contact that floods has none) or is longer than 64 bytes (`update_contact`).
+  meshcore_py sends such a path. It counts only whole hops, so the firmware
+  takes fewer and, in channel data, reads the rest as the data type. It packs
+  hop count and hash mode into one byte unchecked, so more hops spill into the
+  mode bits, and mode 4 and above raise an error. A contact path over 64 bytes
+  goes out uncut and shifts the fields after it.
 - `connect` takes the link down again when the device does not answer
   `APP_START`, and returns the error; meshcore_py's `connect` returns `None`
   and leaves the link up (its `create_*` functions take it down).
@@ -510,6 +557,10 @@ meshcore_py leaves a gap:
   link counts, and the first one fails with `Error::NotConnected`; meshcore_py
   opens that link all the same. One that comes in while the client reconnects
   reports the connection gone; meshcore_py reports nothing then.
+- With `max_reconnect_attempts` 0, the `Disconnected` event of a lost link
+  serializes with `reconnect_failed` false; meshcore_py reports true there,
+  with or without automatic reconnecting, as its count of attempts (none)
+  has reached the limit.
 - `disconnect` lets the command in flight finish for up to half a second and
   sends none of those that wait for their turn; meshcore_py cuts the one in
   flight off, and a message the automatic fetching has just asked for is lost:
@@ -557,7 +608,10 @@ cargo clippy --all-targets --all-features
 - `tests/parity.rs` (feature `serde`) compares with meshcore_py. After updating
   meshcore_py, regenerate its fixtures as described in
   `tests/fixtures/meshcore_py_reader.py`.
-- `tests/logging.rs` checks the log lines that follow meshcore_py's wording.
+- `tests/logging.rs` checks the log lines at info level and above:
+  meshcore_py's wording where it logs the same case, lines of the library's
+  own where meshcore_py logs nothing at that level (such as for a lost link),
+  and none for a command without a link and input refused before sending.
 
 `examples/check.rs` checks a real device with read-only commands over any
 transport and prints each result with its time; `--watch` then stays connected

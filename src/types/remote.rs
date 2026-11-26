@@ -225,7 +225,8 @@ pub struct TraceData {
     pub auth_code: u32,
     /// The trace's flags (low 2 bits: hash size `1 << n`).
     pub flags: u8,
-    /// The hops.
+    /// The hops; a hash cut short at the end of a trace another node built
+    /// has no SNR and is left out.
     pub hops: Vec<TraceHop>,
     /// The SNR in dB this node received the trace with.
     pub final_snr: Option<f32>,

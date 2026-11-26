@@ -1,16 +1,18 @@
 """Feeds device frames through meshcore_py's MessageReader and prints one JSON
 line per event, the reference the parity test (tests/parity.rs) compares with.
+Channel log decryption is on, and binary requests of every typed kind are
+pending (as the parity test sends them first).
 
 Regenerate the fixtures after updating meshcore_py:
 
     python3 -I make_frames.py > frames.hex
     python3 meshcore_py_reader.py <meshcore_py>/src <pycayennelpp source> frames.hex > meshcore_py.jsonl
 
-meshcore_py needs pycryptodome, which python3 has to find (installed or on
-PYTHONPATH, which -I would leave out), and pycayennelpp, whose source the
-second argument gives; its serial module is stubbed (it does without bleak),
-nothing is opened. RX log receive times are dropped (they are the time of the
-run).
+Both need pycryptodome, which python3 has to find (installed, or for the
+second on PYTHONPATH, which -I would leave out). meshcore_py also needs
+pycayennelpp, whose source the second argument gives; its serial module is
+stubbed (it does without bleak), nothing is opened. Receive times are dropped
+(they are the time of the run).
 """
 import asyncio
 import json
@@ -26,6 +28,7 @@ stub = types.ModuleType("serial_asyncio_fast")
 stub.SerialTransport = type("SerialTransport", (), {})
 sys.modules["serial_asyncio_fast"] = stub
 
+from meshcore.packets import BinaryReqType  # noqa: E402
 from meshcore.reader import MessageReader  # noqa: E402
 
 
@@ -50,6 +53,17 @@ def dumps(value):
 async def main():
     collect = Collect()
     reader = MessageReader(collect)
+    reader.decrypt_channels = True
+    # binary requests to the node with key 11.., tagged 0xa1000000 + type
+    for kind, context in [
+        (BinaryReqType.STATUS, {}),
+        (BinaryReqType.TELEMETRY, {}),
+        (BinaryReqType.MMA, {}),
+        (BinaryReqType.ACL, {}),
+        (BinaryReqType.NEIGHBOURS, {"pubkey_prefix_length": 4}),
+    ]:
+        tag = (0xA1000000 + kind.value).to_bytes(4, "little").hex()
+        reader.register_binary_request("11" * 6, tag, kind, 3600, context=context)
     for line in open(frames_path):
         collect.events.clear()
         await reader.handle_rx(bytearray.fromhex(line.strip()))

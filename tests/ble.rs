@@ -10,7 +10,7 @@ mod common;
 
 use std::time::Duration;
 
-use bluez::{ADDRESS, Bluez, NAME, Reaction, Then, answer, run};
+use bluez::{ADDRESS, Bluez, NAME, Reaction, Then, answer, logged, run};
 use common::Random;
 use meshcore::transport::ble::scan;
 use meshcore::{BleConfig, BleTransport, Error, Event, MeshCore, Options, Subscription};
@@ -27,7 +27,7 @@ const fn millis(millis: u64) -> Duration {
 }
 
 fn client(config: BleConfig) -> MeshCore {
-    MeshCore::new(BleTransport::new(config), Options::default())
+    MeshCore::ble(config)
 }
 
 /// A client for the companion by its address, which is paired already.
@@ -102,6 +102,8 @@ fn a_session_end_to_end() {
         assert_eq!(mc.connect().await.unwrap().name, "Node");
         assert_eq!(mc.connection_info().as_deref(), Some(ADDRESS));
         assert!(mc.is_connected() && bluez.connected());
+        // meshcore_py's lines; it scans only without an address
+        assert_eq!(logged(), ["INFO:BLE Connection started"]);
         works(&mc).await;
         let mut events = mc.subscribe();
         bluez.send(MESSAGES_WAITING);
@@ -160,6 +162,14 @@ fn a_companion_is_found_by_address_and_name() {
             mc.connect().await.unwrap();
             assert_eq!(mc.connection_info().as_deref(), Some(ADDRESS));
             mc.disconnect().await.unwrap();
+            // meshcore_py's lines; it scans without an address
+            let mut lines = Vec::new();
+            if text.is_none_or(|text| !text.contains(':')) {
+                lines.push("INFO:Scanning for devices...".to_string());
+                lines.push(format!("INFO:Found device: {ADDRESS}: {NAME}"));
+            }
+            lines.push("INFO:BLE Connection started".to_string());
+            assert_eq!(logged(), lines, "{text:?}");
         }
         for text in ["Elsewhere", "AA:BB:CC:DD:EE:77"] {
             let absent = client(BleConfig::new(text).scan_timeout(millis(300)));
@@ -168,6 +178,22 @@ fn a_companion_is_found_by_address_and_name() {
                 Err(Error::DeviceNotFound(_))
             ));
         }
+        assert_eq!(
+            logged(),
+            [
+                "INFO:Scanning for devices...",
+                "WARN:No MeshCore device found during scan."
+            ]
+        );
+        // settings refused before anything is asked of BlueZ
+        for config in [
+            BleConfig::new("C0:FF"),
+            BleConfig::new(ADDRESS).pin(Some(1_000_000)),
+        ] {
+            let refused = MeshCore::create_ble(config, Options::default()).await;
+            assert!(matches!(refused, Err(Error::InvalidArgument(_))));
+        }
+        assert_eq!(logged(), Vec::<String>::new());
         bluez.set_powered(false);
         assert!(matches!(
             paired().connect().await,
@@ -181,6 +207,33 @@ fn a_companion_is_found_by_address_and_name() {
 }
 
 #[test]
+fn later_links_go_to_the_companion_found_first() {
+    // as in meshcore_py, which keeps the address of the device it found:
+    // a reconnect and another connect do not look for the name again, which
+    // may find another device
+    run(later_links_go_to_the_companion_found_first, async |bluez| {
+        let options = Options {
+            auto_reconnect: true,
+            ..Options::default()
+        };
+        let mc = MeshCore::new(BleTransport::new(BleConfig::new("Node")), options);
+        mc.connect().await.unwrap();
+        let found = format!("INFO:Found device: {ADDRESS}: {NAME}");
+        let started = "INFO:BLE Connection started";
+        assert_eq!(logged(), ["INFO:Scanning for devices...", &found, started]);
+        let mut events = mc.subscribe();
+        bluez.drop_link();
+        while !matches!(next(&mut events).await, Event::Connected { .. }) {}
+        mc.disconnect().await.unwrap();
+        mc.connect().await.unwrap();
+        works(&mc).await;
+        let lost = "INFO:connection lost: ble_disconnect";
+        assert_eq!(logged(), [lost, started, started]);
+        assert_eq!(mc.connection_info().as_deref(), Some(ADDRESS));
+    });
+}
+
+#[test]
 fn a_device_without_the_uart_service_is_refused() {
     run(
         a_device_without_the_uart_service_is_refused,
@@ -189,6 +242,7 @@ fn a_device_without_the_uart_service_is_refused() {
             let result = paired().connect().await;
             assert!(matches!(result, Err(Error::DeviceNotFound(_))));
             link_is_down(&bluez).await;
+            assert_eq!(logged(), ["ERROR:Could not find UART service"]);
         },
     );
 }
@@ -201,12 +255,23 @@ fn a_companion_is_paired_with_its_pin() {
         assert!(reason.ends_with("is not paired with this computer, give its PIN"));
         // nothing that would leave pairing to the desktop
         assert_eq!(bluez.written(), Vec::<Vec<u8>>::new());
+        assert_eq!(logged(), Vec::<String>::new());
         let reason = failed_pairing(with_pin(111_111).connect().await);
         assert!(reason.contains("did not take the PIN"));
         assert!(!bluez.paired() && !bluez.connected());
+        let lines = logged();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("ERROR:BLE pairing failed: "),
+            "{lines:?}"
+        );
         let mc = with_pin(123_456);
         mc.connect().await.unwrap();
         assert!(bluez.paired());
+        assert_eq!(
+            logged(),
+            ["INFO:BLE pairing successful", "INFO:BLE Connection started"]
+        );
         mc.disconnect().await.unwrap();
         // once paired, it needs none
         connected().await.disconnect().await.unwrap();
@@ -387,6 +452,32 @@ fn a_lost_link_is_reported() {
 }
 
 #[test]
+fn a_link_the_companion_dropped_is_not_taken_down_again() {
+    // a late disconnect would take down the next link to the companion, as
+    // a new client's or another program's
+    run(
+        a_link_the_companion_dropped_is_not_taken_down_again,
+        async |bluez| {
+            let mc = connected().await;
+            let mut events = mc.subscribe();
+            bluez.drop_link();
+            assert_eq!(disconnected(&mut events).await, "ble_disconnect");
+            drop(mc);
+            sleep(millis(200)).await;
+            assert_eq!(bluez.disconnect_calls(), 0);
+            // a link the client takes down itself is taken down
+            let mc = connected().await;
+            mc.disconnect().await.unwrap();
+            assert_eq!(bluez.disconnect_calls(), 1);
+            let mc = connected().await;
+            drop(mc);
+            link_is_down(&bluez).await;
+            assert_eq!(bluez.disconnect_calls(), 2);
+        },
+    );
+}
+
+#[test]
 fn a_command_the_companion_restarts_with_counts_as_sent() {
     run(
         a_command_the_companion_restarts_with_counts_as_sent,
@@ -403,9 +494,15 @@ fn a_command_the_companion_restarts_with_counts_as_sent() {
                 let mc = connected().await;
                 let mut events = mc.subscribe();
                 bluez.on_write(move |_| Reaction::new(vec![], then));
+                logged();
                 mc.reboot().await.unwrap();
                 let reason = disconnected(&mut events).await;
                 assert!(reason.starts_with("ble_write_failed: "), "{reason}");
+                let lines = logged();
+                let failed = lines
+                    .iter()
+                    .filter(|line| line.starts_with("WARN:BLE write failed: "));
+                assert_eq!(failed.count(), 1, "{lines:?}");
                 bluez.on_write(answer);
 
                 mc.connect().await.unwrap();
@@ -472,9 +569,13 @@ fn a_write_that_does_not_end_takes_the_link_down() {
             mc.connect().await.unwrap();
             let mut events = mc.subscribe();
             bluez.on_write(|_| Reaction::new(vec![], Then::Nothing));
+            logged();
             assert!(matches!(mc.get_time().await, Err(Error::ConnectionLost)));
             assert_eq!(disconnected(&mut events).await, "ble_write_timeout");
             link_is_down(&bluez).await;
+            // meshcore_py's line, with the seconds as a float
+            let lines = logged();
+            assert_eq!(lines[0], "WARN:BLE write timed out after 0.3s", "{lines:?}");
         },
     );
 }

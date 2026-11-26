@@ -29,6 +29,11 @@
 //!   sends one, and returns it typed. Device errors come back as
 //!   [`Error::Device`] with the firmware's [`ErrorCode`]. One command is in
 //!   flight at a time.
+//! - Input the firmware would refuse, cut short or read differently, such as
+//!   a text that is too long, empty or holds a NUL byte, or a setting out of
+//!   its range, is refused before sending with [`Error::InvalidArgument`]
+//!   where the client can tell without asking the device. The README lists
+//!   the cases meshcore_py sends.
 //! - Every frame the device sends becomes an [`Event`] (an empty frame or a
 //!   push that cannot be read is only logged); [`MeshCore::subscribe`]
 //!   delivers them, [`MeshCore::wait_for`] waits for one.
@@ -38,7 +43,8 @@
 //!   but not added, and the channel secrets for decoding the RX log.
 //! - It logs through the `log` crate with the target `meshcore`; where
 //!   meshcore_py logs the same case at info level or above, the message has
-//!   its wording (a command without a link fails at once and logs nothing).
+//!   its wording (a command without a link and input refused before sending
+//!   fail without a line).
 //!
 //! ## Transports
 //!

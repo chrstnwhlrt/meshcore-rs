@@ -1,8 +1,12 @@
 """Builds device frames covering every packet type of the companion protocol
-(as firmware v1.18 sends them) and prints them as hex, one per line. The
+(in the layouts of firmware v1.18, some cut short or with content the
+firmware does not send) and prints them as hex, one per line. The
 parity test feeds them to the client and compares the events with what
-meshcore_py makes of the same frames (see meshcore_py_reader.py)."""
-import struct, sys
+meshcore_py makes of the same frames (see meshcore_py_reader.py). It needs
+pycryptodome to encrypt a channel packet."""
+import hashlib, hmac, struct, sys
+
+from Crypto.Cipher import AES
 
 def u32(v): return struct.pack('<I', v)
 def i32(v): return struct.pack('<i', v)
@@ -28,7 +32,9 @@ add(bytes([12]) + u16(3540) + u32(1024) + u32(4096))
 add(bytes([12]) + u16(3540))
 add(bytes([9]) + u32(1700000000))
 add(bytes([2]) + u32(3))
-add(contact(3, KEY, b'Alice', 0xff, b''))
+# renamed from "Alexandra" by an advert: the firmware leaves the old name's
+# tail after the new name's NUL
+add(contact(3, KEY, b'Alice\0dra', 0xff, b''))
 add(contact(3, KEY2, b'Rep\xc3', 0x42, bytes([0xaa, 0x00, 0xbb, 0xcc])))
 add(bytes([4]) + u32(2000))
 add(contact(0x8a, KEY2, b'Stranger', 0x01, bytes([0x5f])))
@@ -62,12 +68,36 @@ adv = KEY2 + u32(1000) + bytes(64) + bytes([0x92]) + i32(53551100) + i32(9993700
 add(bytes([0x88, 0x18, 0xa6]) + bytes([0x11, 0x01, 0x5f]) + adv)
 add(bytes([0x88, 0x18, 0xa6]) + bytes([0x15, 0x00, 0x99, 0x01, 0x02]) + bytes(16))
 add(bytes([0x88, 0x18, 0xa6, 0x15]))
+# A group text of #public (the channel info above: index 2, secret 00..0f)
+# in the RX log, which decrypts it; then the device delivers the message in
+# both frame versions, and they get the path and signal it was logged with.
+secret = bytes(range(16))
+plain = u32(1700000005) + bytes([0]) + b'dave: logged'
+crypted = AES.new(secret, AES.MODE_ECB).encrypt(plain.ljust(32, b'\0'))
+mac = hmac.new(secret, crypted, hashlib.sha256).digest()[:2]
+group = bytes([0x15, 0x02, 0xaa, 0xbb]) + hashlib.sha256(secret).digest()[:1] + mac + crypted
+add(bytes([0x88, 0x18, 0xa6]) + group)
+add(bytes([8, 2, 2, 0]) + u32(1700000005) + b'dave: logged')
+add(bytes([17, 0x16, 0, 0, 2, 2, 0]) + u32(1700000005) + b'dave: logged')
 add(bytes([0x89, 0, 4, 1]) + u32(7) + u32(9) + bytes([0xaa, 0xab, 0xbb, 0xbc, 8, 0xfc, 12]))
+# a trace of no whole hops, as another node may build it
+add(bytes([0x89, 0, 5, 1]) + u32(8) + u32(9) + bytes([0xaa, 0xab, 0xbb, 0xbc, 0xcc, 8, 0xfc, 12]))
 tele = bytes([1, 116, 0x01, 0x9c, 1, 103, 0xff, 0xdd, 2, 136]) + (535511).to_bytes(3, 'big', signed=True) + (-99937).to_bytes(3, 'big', signed=True) + (1234).to_bytes(3, 'big', signed=True) + bytes([3, 117, 0xfe, 0x0c, 4, 113, 0, 10, 0xff, 0xf6, 3, 0xe8, 5, 135, 255, 0, 128]) + bytes(4)
 add(bytes([0x8b, 0]) + KEY[:6] + tele)
 add(bytes([0x8b, 0]) + KEY[:6] + bytes([1, 116, 0x01, 0x9c, 1, 200, 1, 2]))
 add(bytes([26]) + u32(433000) + u32(434000) + u32(869000) + u32(870000))
 add(bytes([0x8c, 0]) + u32(0xdeadbeef) + bytes([1, 2, 3]))
+# Answers to binary requests both sides track (tags 0xa1000000 + request
+# type, see meshcore_py_reader.py and tests/parity.rs): status, telemetry,
+# min/max/average, access list, neighbours.
+def answer(kind, data): return bytes([0x8c, 0]) + u32(0xa1000000 + kind) + data
+status = u16(4100) + u16(1) + struct.pack('<hh', -110, -70) + b''.join(u32(v) for v in (10, 20, 30, 40, 5, 6, 7, 8))
+status += u16(1) + struct.pack('<h', 26) + u16(2) + u16(3) + u32(50) + u32(9)
+add(answer(1, status))
+add(answer(3, bytes([1, 116, 0x01, 0x9c, 2, 103, 0x00, 0xfa, 6, 134, 0x00, 0x64, 0xff, 0x9c, 0x01, 0xf4])))
+add(answer(4, u32(1700000006) + bytes([1, 103, 0, 200, 0, 255, 0, 221, 2, 116, 1, 0x90, 1, 0x9c, 1, 0x96])))
+add(answer(5, KEY[:6] + bytes([3]) + bytes(7)))
+add(answer(6, struct.pack('<hh', 5, 2) + bytes([0xa0] * 4) + struct.pack('<i', 60) + bytes([20]) + bytes([0xa1] * 4) + struct.pack('<i', 90) + bytes([0xf8])))
 add(bytes([0x8d, 0]) + KEY[:6] + bytes([0xff, 0x41, 0xaa, 0xbb]))
 add(bytes([14]) + bytes(range(64)))
 add(bytes([19, 0]) + u32(8192))

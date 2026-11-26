@@ -4,9 +4,9 @@
 //! Each write to the RX characteristic is one frame and each notification of
 //! the TX characteristic is one frame, so no framing bytes are added. As in
 //! meshcore_py's `BLEConnection`, the device is found by its address, by a
-//! part of its name or as the first MeshCore device in range; frames are
-//! written with response, and a write that does not finish within 10 s takes
-//! the link down.
+//! part of its name or as the first MeshCore device in range, and the later
+//! links go to the device found; frames are written with response, and a
+//! write that does not finish within 10 s takes the link down.
 //!
 //! MeshCore takes frames only over a paired link. A PIN pairs a device that is
 //! not paired yet, and pairs it anew when it has forgotten the pairing (after
@@ -25,7 +25,8 @@
 use std::fmt;
 use std::pin::pin;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bluer::agent::Agent;
@@ -90,12 +91,12 @@ const LINK_END_WAIT: Duration = Duration::from_secs(1);
 pub struct BleConfig {
     /// The device: its address (`AA:BB:CC:DD:EE:FF`), a part of its name, or
     /// `None` for the first MeshCore device in range. As in meshcore_py, text
-    /// with a `:` is taken for an address, and a reconnect looks for the device
-    /// the same way (a name may find another one then).
+    /// with a `:` is taken for an address, and once a device was found, the
+    /// later links (a reconnect, another `connect`) go to its address.
     pub address: Option<String>,
-    /// The PIN to pair with when the device is not paired yet, or has
-    /// forgotten the pairing (shown on the device's display, or set in its
-    /// firmware). A paired device needs none.
+    /// The PIN to pair with (six digits at most) when the device is not paired
+    /// yet, or has forgotten the pairing (shown on the device's display, or
+    /// set in its firmware). A paired device needs none.
     pub pin: Option<u32>,
     /// How long to scan for the device (10 s, as meshcore_py's scan).
     pub scan_timeout: Duration,
@@ -560,6 +561,9 @@ pub struct BleTransport {
     /// The D-Bus session to BlueZ, made on the first open and kept for
     /// reconnecting.
     session: Arc<OnceCell<Session>>,
+    /// The address of the device found first, which the later links go to,
+    /// as in meshcore_py: looking for the name again may find another one.
+    found: Arc<Mutex<Option<Address>>>,
 }
 
 impl fmt::Debug for BleTransport {
@@ -577,6 +581,7 @@ impl BleTransport {
         Self {
             config,
             session: Arc::default(),
+            found: Arc::default(),
         }
     }
 
@@ -637,7 +642,15 @@ impl BleTransport {
         let device_events = device.events().await?;
         let (sender, events) = mpsc::channel(LINK_CAPACITY);
         let (writing, writes) = watch::channel(Writing::Nothing);
-        let reader_task = tokio::spawn(read_link(notifications, device_events, sender, writes));
+        let gone = Arc::new(AtomicBool::new(false));
+        let reader = read_link(
+            notifications,
+            device_events,
+            sender,
+            writes,
+            Arc::clone(&gone),
+        );
+        let reader_task = tokio::spawn(reader);
         log::info!(target: "meshcore", "BLE Connection started");
         Ok(Link {
             info: device.address().to_string(),
@@ -648,6 +661,7 @@ impl BleTransport {
                 reader_task: Some(reader_task),
                 writing,
                 write_timeout: self.config.write_timeout,
+                gone,
             }),
         })
     }
@@ -659,9 +673,12 @@ impl Transport for BleTransport {
             let config = &self.config;
             let pin = check_pin(config.pin)?;
             let target = Target::of(config)?;
+            let found = *self.found.lock().unwrap_or_else(PoisonError::into_inner);
+            let target = found.map_or(target, Target::Address);
             let session = self.session.get_or_try_init(Session::new).await?;
             let adapter = powered_adapter(session).await?;
             let device = find_device(&adapter, &target, config.scan_timeout).await?;
+            *self.found.lock().unwrap_or_else(PoisonError::into_inner) = Some(device.address());
             log::debug!(target: "meshcore", "connecting to {}", device.address());
             // Armed for a link this call makes, not for one that was there.
             let mut guard = CancelGuard::default();
@@ -726,16 +743,18 @@ enum Writing {
 }
 
 /// Forwards notified frames until the device disconnects or a frame cannot be
-/// written, and reports the link closed. BlueZ ends a write the link drops with
-/// and tells that the device disconnected in either order. A frame that is being
-/// written when the device disconnects may have gone out, and only the end of the
-/// write tells, so this waits for it. After a write that ended first, this waits
-/// for the disconnect, as the frames from before may come until then.
+/// written, and reports the link closed; sets `gone` when BlueZ tells that the
+/// device disconnected. BlueZ ends a write the link drops with and tells that
+/// the device disconnected in either order. A frame that is being written when
+/// the device disconnects may have gone out, and only the end of the write
+/// tells, so this waits for it. After a write that ended first, this waits for
+/// the disconnect, as the frames from before may come until then.
 async fn read_link(
     notifications: impl Stream<Item = Vec<u8>> + Send,
     device_events: impl Stream<Item = DeviceEvent> + Send,
     events: mpsc::Sender<LinkEvent>,
     mut writes: watch::Receiver<Writing>,
+    gone: Arc<AtomicBool>,
 ) {
     let inputs = stream::select(
         notifications.map(Input::Frame),
@@ -760,6 +779,7 @@ async fn read_link(
             }
             Some(Input::Device(DeviceEvent::PropertyChanged(DeviceProperty::Connected(false)))) => {
                 connected = false;
+                gone.store(true, Ordering::SeqCst);
             }
             Some(Input::Device(_)) => {}
             None => break,
@@ -813,6 +833,10 @@ struct BleWriter {
     /// For the reader, which reports the link closed when a write fails.
     writing: watch::Sender<Writing>,
     write_timeout: Duration,
+    /// BlueZ told that the device disconnected. Such a link is not taken down
+    /// again: a disconnect that comes late would take down the next link to
+    /// the device, another program's or a new client's.
+    gone: Arc<AtomicBool>,
 }
 
 impl FrameWriter for BleWriter {
@@ -869,6 +893,7 @@ impl FrameWriter for BleWriter {
                 task.abort();
             }
             if let Some(device) = self.device.take()
+                && !self.gone.load(Ordering::SeqCst)
                 && let Err(err) = device.disconnect().await
             {
                 log::debug!(target: "meshcore", "BLE disconnect failed: {err}");
@@ -883,7 +908,9 @@ impl Drop for BleWriter {
             task.abort();
         }
         // Dropped without closing, as when the runtime shuts down.
-        if let Some(device) = self.device.take() {
+        if let Some(device) = self.device.take()
+            && !self.gone.load(Ordering::SeqCst)
+        {
             disconnect_in_background(device);
         }
     }
@@ -975,7 +1002,7 @@ mod tests {
         let frames = stream::iter([vec![1], vec![2], vec![3]]).chain(stream::pending());
         let (sender, mut events) = mpsc::channel(8);
         let (_writing, writes) = watch::channel(Writing::Nothing);
-        read_link(frames, gone(), sender, writes).await;
+        read_link(frames, gone(), sender, writes, Arc::default()).await;
         let mut read = Vec::new();
         while let Some(event) = events.recv().await {
             read.push(event);
@@ -993,7 +1020,7 @@ mod tests {
         for ends in [true, false] {
             let (writing, writes) = watch::channel(Writing::Frame);
             let (sender, mut events) = mpsc::channel(8);
-            let reader = read_link(stream::pending(), gone(), sender, writes);
+            let reader = read_link(stream::pending(), gone(), sender, writes, Arc::default());
             let reader = tokio::spawn(reader);
             tokio::time::sleep(LINK_END_WAIT / 2).await;
             assert!(events.try_recv().is_err());
@@ -1030,14 +1057,18 @@ mod tests {
             let (_writing, writes) = watch::channel(Writing::Failed("failed".into(), wait));
             let (sender, mut events) = mpsc::channel(8);
             let start = Instant::now();
+            let disconnected = Arc::new(AtomicBool::new(false));
             let reader = read_link(
                 frame.chain(stream::pending()),
                 gone.chain(stream::pending()),
                 sender,
                 writes,
+                Arc::clone(&disconnected),
             );
             reader.await;
             assert_eq!(start.elapsed().as_millis(), closed.as_millis());
+            // only a disconnect BlueZ told of needs no taking down
+            assert_eq!(disconnected.load(Ordering::SeqCst), told);
             if !wait.is_zero() {
                 assert_eq!(events.recv().await, Some(LinkEvent::Frame(vec![1])));
             }
@@ -1068,6 +1099,8 @@ mod tests {
         assert_eq!(config.connect_timeout, Duration::from_secs(30));
         assert_eq!(config.write_timeout, Duration::from_secs(2));
         let defaults = BleConfig::default();
+        assert_eq!(defaults.scan_timeout, Duration::from_secs(10));
+        assert_eq!(defaults.connect_timeout, Duration::from_secs(20));
         assert_eq!(defaults.write_timeout, Duration::from_secs(10));
         assert_eq!(defaults.address, None);
     }

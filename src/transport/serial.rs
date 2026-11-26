@@ -153,8 +153,18 @@ impl Transport for SerialTransport {
 ///
 /// # Errors
 ///
-/// [`Error::Serial`](crate::Error::Serial) when the ports cannot be listed.
+/// [`Error::Serial`](crate::Error::Serial) when the ports cannot be listed,
+/// as on Linux without a readable `/sys/class/tty` (in some containers).
 pub fn list_ports() -> Result<Vec<String>> {
+    // There the serialport crate would panic.
+    #[cfg(target_os = "linux")]
+    if std::fs::read_dir("/sys/class/tty").is_err() {
+        return Err(tokio_serial::Error::new(
+            tokio_serial::ErrorKind::Unknown,
+            "the serial ports cannot be listed without a readable /sys/class/tty",
+        )
+        .into());
+    }
     Ok(tokio_serial::available_ports()?
         .into_iter()
         .map(|port| port.port_name)
@@ -167,14 +177,23 @@ mod tests {
 
     #[test]
     fn config_defaults_leave_lines_alone() {
-        let config = SerialConfig::new("/dev/ttyUSB0")
-            .baud_rate(9600)
-            .dtr(Some(true));
-        assert_eq!(config.baud_rate, 9600);
-        assert_eq!(config.dtr, Some(true));
-        assert_eq!(config.rts, None);
+        let config = SerialConfig::new("/dev/ttyUSB0");
+        assert_eq!(config.baud_rate, 115_200);
+        assert_eq!((config.dtr, config.rts), (None, None));
         assert_eq!(config.settle_delay, Duration::from_millis(300));
         assert_eq!(config.drain_duration, Duration::from_millis(500));
+        let config = config.baud_rate(9600).dtr(Some(true));
+        assert_eq!(config.baud_rate, 9600);
+        assert_eq!((config.dtr, config.rts), (Some(true), None));
+    }
+
+    #[test]
+    fn ports_are_listed_or_the_reason_given() {
+        // never a panic, also without /sys/class/tty (as in the Nix sandbox)
+        match list_ports() {
+            Ok(ports) => assert!(ports.iter().all(|port| !port.is_empty())),
+            Err(err) => assert!(matches!(err, crate::Error::Serial(_)), "{err}"),
+        }
     }
 
     #[test]

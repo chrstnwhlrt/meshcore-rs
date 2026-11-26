@@ -7,7 +7,7 @@ use super::{MeshCore, reply, wait_response};
 use crate::error::{Error, Result};
 use crate::event::{Event, Subscription};
 use crate::protocol::codes::{CommandType, ControlType};
-use crate::protocol::path::PathLen;
+use crate::protocol::path::{MAX_PATH_SIZE, PathLen};
 use crate::types::{
     ContactType, DefaultFloodScope, Destination, LoginSuccess, PathDiscovery, PublicKey,
     ReceivedMessage, SentInfo, TextType, TraceData,
@@ -127,7 +127,8 @@ pub struct TraceRequest {
     pub tag: Option<u32>,
     /// The flags: the low 2 bits give the hash size `1 << n`. `None` means 0.
     pub flags: Option<u8>,
-    /// The hop hashes, each `1 << (flags & 3)` bytes.
+    /// The hop hashes, each `1 << (flags & 3)` bytes: at least one hop and at
+    /// most 64, as the firmware takes them.
     pub path: Vec<u8>,
 }
 
@@ -309,8 +310,10 @@ impl MeshCore {
 
     /// Sends a message and waits for its ACK, retrying; after
     /// `flood_after` attempts the path is reset and the message flooded. A
-    /// key prefix needs its contact for the reset: when even the contacts
-    /// read then do not hold it, the attempts go on without the reset.
+    /// key prefix needs its contact for the reset, which is taken from the
+    /// cache, or from the contacts read in full when the cache lacks it (as
+    /// meshcore_py does). When not even those hold it, the attempts go on
+    /// without the reset.
     /// Returns the [`SentInfo`] of the attempt that was acknowledged, or
     /// `None` when none was, also when attempts could not be sent (their
     /// errors are logged). Fails only with [`Error::InvalidArgument`], for a
@@ -599,9 +602,19 @@ impl MeshCore {
     }
 
     async fn send_trace_raw(&self, request: &TraceRequest) -> Result<(SentInfo, Subscription)> {
-        // The firmware traces only along a path of at least one hop.
+        // The firmware traces only along a path of at least one hop, and
+        // answers others than whole hops, at most 64, with ERR_CODE_ILLEGAL_ARG.
         if request.path.is_empty() {
             return Err(Error::invalid("a trace needs a path of at least one hop"));
+        }
+        let hash_size = 1usize << (request.flags.unwrap_or(0) & 3);
+        let hops = request.path.len() / hash_size;
+        if !request.path.len().is_multiple_of(hash_size) || hops > MAX_PATH_SIZE {
+            return Err(Error::invalid(format!(
+                "a trace path of {} bytes is no whole number of at most {MAX_PATH_SIZE} hops \
+                 of {hash_size} bytes",
+                request.path.len()
+            )));
         }
         let tag = request.tag.unwrap_or_else(random_u32);
         let mut frame = vec![CommandType::SendTracePath.code()];
@@ -709,7 +722,9 @@ impl MeshCore {
     }
 
     /// Sets the default flood scope by name (a `#` is added when missing);
-    /// `None`, `""`, `"0"`, `"None"` or `"*"` clear it.
+    /// `None`, `""`, `"0"`, `"None"` or `"*"` clear it. The firmware takes a
+    /// name of 30 bytes at most, `#` included, and refuses a longer one with
+    /// `ERR_CODE_ILLEGAL_ARG`, so it is refused before sending.
     pub async fn set_default_flood_scope(&self, scope: Option<&str>) -> Result<()> {
         let mut frame = vec![CommandType::SetDefaultFloodScope.code()];
         if let Some(scope) = scope.filter(|s| !matches!(*s, "" | "0" | "None" | "*")) {

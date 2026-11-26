@@ -87,7 +87,8 @@ impl fmt::Display for ErrorCode {
 pub enum Error {
     /// An I/O error on the transport.
     Io(std::io::Error),
-    /// The serial port could not be opened or configured.
+    /// The serial port could not be opened or configured, or the serial ports
+    /// could not be listed.
     Serial(tokio_serial::Error),
     /// A Bluetooth error from BlueZ (feature `ble`, Linux).
     #[cfg(all(feature = "ble", target_os = "linux"))]
@@ -118,7 +119,10 @@ pub enum Error {
     /// The device reported a refused login (a node that does not answer a wrong
     /// password ends in [`Error::Timeout`]).
     LoginFailed,
-    /// A reply could not be read or was not the one expected.
+    /// A reply, or a sensor's answer to a subscription, could not be read: it
+    /// was cut short (`invalid_frame_length`; an error reply without its code
+    /// says so in words), or reports statistics of a type this library does
+    /// not know (`unknown_stats_type`).
     Protocol(String),
     /// An argument was rejected before anything was sent (data too long to
     /// sign only after [`MeshCore::sign_start`](crate::MeshCore::sign_start),
@@ -240,5 +244,8 @@ mod tests {
             pairing.to_string(),
             "pairing failed: it did not take the PIN"
         );
+        assert!(Error::Timeout.is_timeout());
+        assert!(!Error::ConnectionLost.is_timeout());
+        assert_eq!(Error::ConnectionLost.device_code(), None);
     }
 }

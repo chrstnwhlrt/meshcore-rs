@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use common::{
-    KEY, Random, ack_frame, binary_response, client, client_answering_app_start, contact_frame,
-    err, ok, poll_once, self_info_frame, sent_frame, status_fields,
+    KEY, Random, ack_frame, binary_response, client, client_answering_app_start, client_on_device,
+    contact_frame, err, ok, poll_once, self_info_frame, sent_frame, status_fields,
 };
 use meshcore::{
     BinaryReqType, Contact, ContactType, Error, ErrorCode, Event, EventKind, FloodScope,
@@ -603,6 +603,24 @@ async fn connect_fails_without_an_answer() {
     let mc = silent_client();
     assert!(matches!(mc.connect().await, Err(Error::Timeout)));
     assert!(!mc.is_connected());
+    // after 2 s, as in meshcore_py, and takes the link down again
+    // (meshcore_py's connect leaves it up)
+    let (mc, device) = client_answering_app_start(|| false);
+    let started = tokio::time::Instant::now();
+    assert!(matches!(mc.connect().await, Err(Error::Timeout)));
+    assert_eq!(started.elapsed().as_secs(), 2);
+    assert_eq!((device.opens(), device.closes()), (1, 1));
+    assert!(!device.in_use());
+}
+
+#[tokio::test(start_paused = true)]
+async fn commands_wait_15_seconds_for_their_reply() {
+    // as in meshcore_py
+    let (mc, _device) = client(Options::default(), |_| vec![]);
+    mc.connect().await.unwrap();
+    let started = tokio::time::Instant::now();
+    assert!(matches!(mc.get_time().await, Err(Error::Timeout)));
+    assert_eq!(started.elapsed().as_secs(), 15);
 }
 
 /// A device that takes every frame and never answers.
@@ -645,6 +663,89 @@ impl meshcore::FrameWriter for Sink {
 /// A client whose device never answers.
 fn silent_client() -> meshcore::MeshCore {
     meshcore::MeshCore::new(Silent, Options::default())
+}
+
+/// A device that is gone once its first link drops: it cannot be opened
+/// again.
+struct Vanishing {
+    opens: Arc<AtomicU32>,
+    link: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Sender<meshcore::LinkEvent>>>>,
+}
+
+/// Answers `APP_START`, swallows the rest.
+struct AppStartAnswer(tokio::sync::mpsc::Sender<meshcore::LinkEvent>);
+
+impl meshcore::Transport for Vanishing {
+    fn open(&self) -> meshcore::transport::BoxFuture<'_, meshcore::Result<meshcore::Link>> {
+        Box::pin(async {
+            if self.opens.fetch_add(1, Ordering::SeqCst) > 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
+            }
+            let (sender, events) = tokio::sync::mpsc::channel(4);
+            *self.link.lock().unwrap() = Some(sender.clone());
+            Ok(meshcore::Link {
+                info: "vanishing".into(),
+                events,
+                writer: Box::new(AppStartAnswer(sender)),
+            })
+        })
+    }
+
+    fn describe(&self) -> String {
+        "vanishing".into()
+    }
+}
+
+impl meshcore::FrameWriter for AppStartAnswer {
+    fn write_frame<'a>(
+        &'a mut self,
+        frame: &'a [u8],
+    ) -> meshcore::transport::BoxFuture<'a, meshcore::Result<()>> {
+        Box::pin(async move {
+            if frame.first() == Some(&1) {
+                let info = meshcore::LinkEvent::Frame(self_info_frame("Node"));
+                let _ = self.0.send(info).await;
+            }
+            Ok(())
+        })
+    }
+
+    fn close(&mut self) -> meshcore::transport::BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn reconnecting_gives_up_after_its_attempts() {
+    // three, a second apart, as in meshcore_py
+    let opens = Arc::new(AtomicU32::new(0));
+    let link = Arc::default();
+    let transport = Vanishing {
+        opens: Arc::clone(&opens),
+        link: Arc::clone(&link),
+    };
+    let options = Options {
+        auto_reconnect: true,
+        ..Options::default()
+    };
+    let mc = meshcore::MeshCore::new(transport, options);
+    mc.connect().await.unwrap();
+    let mut events = mc.subscribe();
+    let started = tokio::time::Instant::now();
+    let device = link.lock().unwrap().take().unwrap();
+    device
+        .send(meshcore::LinkEvent::Closed("gone".into()))
+        .await
+        .unwrap();
+    let reason = loop {
+        if let Event::Disconnected { reason } = events.recv().await.unwrap() {
+            break reason;
+        }
+    };
+    assert_eq!(reason, "reconnect_failed");
+    assert_eq!(started.elapsed().as_secs(), 3);
+    assert_eq!(opens.load(Ordering::SeqCst), 4);
+    assert!(!mc.is_connected());
 }
 
 #[tokio::test(start_paused = true)]
@@ -924,6 +1025,16 @@ async fn paths_the_length_byte_cannot_describe_are_refused() {
     mismatched.out_path_len = PathLen::new(2, 0).unwrap();
     mismatched.out_path = vec![1];
     assert!(refused(mc.update_contact(&mismatched, None).await));
+    // a path for a contact that floods, which the device would not hand back
+    let mut flooded = contact.clone();
+    flooded.out_path = vec![1];
+    assert!(refused(mc.update_contact(&flooded, None).await));
+    // a path that matches its length byte (33 hops of 2 bytes) but is longer
+    // than the 64 bytes the device stores
+    let mut long = contact.clone();
+    long.out_path_len = PathLen::from_byte(0x40 | 0x21);
+    long.out_path = vec![1; 66];
+    assert!(refused(mc.update_contact(&long, None).await));
     assert_eq!(device.commands_with(9).len(), 0);
 
     assert!(refused(
@@ -1077,6 +1188,90 @@ async fn retries_to_an_unknown_prefix_go_on_without_the_reset() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn retries_to_a_cached_prefix_take_its_key_from_the_cache() {
+    // as in meshcore_py, no contact list is read for it
+    let (mc, device) = client(Options::default(), |cmd| match cmd[0] {
+        2 => vec![sent_frame(false, 0x300, 500)],
+        13 => vec![ok()],
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    mc.cache_contact(Contact::new(key(), ContactType::Chat, "Alice"));
+    let prefix: [u8; 6] = KEY[..6].try_into().unwrap();
+    let started = tokio::time::Instant::now();
+    let result = mc
+        .send_msg_with_retry(prefix, "hi", RetryOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(result, None);
+    assert_eq!(device.commands_with(4).len(), 0);
+    assert_eq!(device.commands_with(13), [[&[13u8][..], &KEY].concat()]);
+    assert_eq!(device.commands_with(2).len(), 3);
+    // each attempt waits the device's suggestion (500 ms) and a fifth, as in
+    // meshcore_py
+    assert_eq!(started.elapsed(), Duration::from_millis(1800));
+}
+
+#[tokio::test(start_paused = true)]
+async fn cli_commands_take_the_text_type_of_their_destination() {
+    let (mc, device) = client(Options::default(), |cmd| match cmd[0] {
+        2 => vec![sent_frame(false, 0x100, 500)],
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    let companion = PublicKey::new([0x44; 32]);
+    mc.cache_contact(Contact::new(companion, ContactType::Chat, "Bob"));
+    let room = Contact::new(PublicKey::new([0x55; 32]), ContactType::Room, "Room");
+    // the type given, the destination contact's, the cached contact's (by its
+    // key or a prefix) and a repeater's for a key the cache lacks; meshcore_py
+    // takes a repeater for any bare key
+    mc.send_cmd(&room, "ver", Some(7), Some(ContactType::Chat))
+        .await
+        .unwrap();
+    mc.send_cmd(&room, "ver", Some(7), None).await.unwrap();
+    mc.send_cmd(companion, "ver", Some(7), None).await.unwrap();
+    mc.send_cmd([0x44u8; 6], "ver", Some(7), None)
+        .await
+        .unwrap();
+    mc.send_cmd(key(), "ver", Some(7), None).await.unwrap();
+    let frames = device.commands_with(2);
+    let types: Vec<u8> = frames.iter().map(|frame| frame[1]).collect();
+    // TXT_TYPE_CLI_COMMAND for companions, TXT_TYPE_CLI_DATA for the others
+    assert_eq!(types, [3, 1, 3, 3, 1]);
+    // type, attempt, timestamp, key prefix, command
+    assert_eq!(
+        frames[4],
+        [&[2u8, 1, 0][..], &7u32.to_le_bytes(), &KEY[..6], b"ver"].concat()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_path_without_hash_mode_fails_when_the_device_query_fails() {
+    // meshcore_py takes mode 0 then
+    let (mc, device) = client_on_device(Options::default(), |cmd| match cmd[0] {
+        1 => vec![self_info_frame("Node")],
+        22 => vec![err(1)],
+        _ => vec![ok()],
+    });
+    mc.connect().await.unwrap();
+    assert!(matches!(
+        mc.get_path_hash_mode().await,
+        Err(Error::Device(ErrorCode::UnsupportedCmd))
+    ));
+    let contact = Contact::new(key(), ContactType::Repeater, "Rep");
+    assert!(matches!(
+        mc.change_contact_path(&contact, &[1, 2], None).await,
+        Err(Error::Device(ErrorCode::UnsupportedCmd))
+    ));
+    assert_eq!(device.commands_with(9).len(), 0);
+    // with the mode given, no query is needed
+    mc.change_contact_path(&contact, &[1, 2], Some(1))
+        .await
+        .unwrap();
+    assert_eq!(device.commands_with(22).len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
 async fn binary_answers_right_behind_msg_sent_are_matched() {
     let (mc, device) = client(Options::default(), |cmd| match cmd[0] {
         // MSG_SENT and the answer in one burst: the tag must already be bound
@@ -1183,6 +1378,56 @@ async fn neighbours_are_paged() {
     };
     assert_eq!(typed.neighbours[1].pubkey, vec![0xa1; 4]);
     assert_eq!(typed.neighbours[1].secs_ago, 60);
+}
+
+#[tokio::test(start_paused = true)]
+async fn neighbour_pages_end_at_an_empty_page_or_a_second_failure() {
+    // The repeater counts 6 neighbours: two at offset 0, one at offset 2 on
+    // the second try, none at offset 3 (meshcore_py asks again forever) or
+    // no answer there.
+    for empty in [true, false] {
+        let offsets = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let asked = Arc::clone(&offsets);
+        let (mc, _device) = client(Options::default(), move |cmd| match cmd[0] {
+            50 => {
+                let offset = u16::from_le_bytes([cmd[36], cmd[37]]);
+                let mut asked = asked.lock().unwrap();
+                asked.push(offset);
+                let tag = 0x500 + u32::try_from(asked.len()).unwrap();
+                let tries = asked.iter().filter(|&&at| at == offset).count();
+                let count: i16 = match (offset, tries) {
+                    (0, _) => 2,
+                    (2, 1) => return vec![sent_frame(false, tag, 1000)],
+                    (2, _) => 1,
+                    _ if empty => 0,
+                    _ => return vec![sent_frame(false, tag, 1000)],
+                };
+                let mut answer = 6i16.to_le_bytes().to_vec();
+                answer.extend(count.to_le_bytes());
+                for i in 0..count {
+                    answer.extend([0xa0 + u8::try_from(i).unwrap(); 4]);
+                    answer.extend(60i32.to_le_bytes());
+                    answer.push(20);
+                }
+                vec![sent_frame(false, tag, 1000), binary_response(tag, &answer)]
+            }
+            _ => vec![],
+        });
+        mc.connect().await.unwrap();
+        let all = mc
+            .fetch_all_neighbours(&key(), 0, 4, RequestOptions::default())
+            .await
+            .unwrap();
+        assert_eq!((all.neighbours_count, all.results_count), (6, 3));
+        assert_eq!(all.neighbours.len(), 3);
+        // a failed page is asked for once more, an empty one is not
+        let expected: &[u16] = if empty {
+            &[0, 2, 2, 3]
+        } else {
+            &[0, 2, 2, 3, 3]
+        };
+        assert_eq!(*offsets.lock().unwrap(), expected);
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -1613,6 +1858,19 @@ async fn command_frames_match_the_protocol() {
 
     let no_path = mc.send_trace(&TraceRequest::default()).await;
     assert!(matches!(no_path, Err(Error::InvalidArgument(_))));
+    // the firmware answers ERR_CODE_ILLEGAL_ARG to a path that is no whole
+    // number of hops (here of 2 bytes) or has more than 64
+    for (flags, path) in [(1, vec![0xaa; 3]), (0, vec![0xaa; 65])] {
+        let request = TraceRequest {
+            flags: Some(flags),
+            path,
+            ..TraceRequest::default()
+        };
+        assert!(matches!(
+            mc.send_trace(&request).await,
+            Err(Error::InvalidArgument(_))
+        ));
+    }
     mc.send_trace(&TraceRequest {
         tag: Some(1),
         path: vec![0xaa],
@@ -1624,6 +1882,16 @@ async fn command_frames_match_the_protocol() {
         device.commands_with(36)[0],
         [36, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0xaa]
     );
+    // 64 hops, and two of 8 bytes
+    for (flags, path) in [(0, vec![0xaa; 64]), (3, vec![0xaa; 16])] {
+        let request = TraceRequest {
+            flags: Some(flags),
+            path,
+            ..TraceRequest::default()
+        };
+        mc.send_trace(&request).await.unwrap();
+    }
+    assert_eq!(device.commands_with(36).len(), 3);
 
     mc.set_flood_scope(&FloodScope::Unscoped).await.unwrap();
     mc.set_flood_scope_str("hamburg").await.unwrap();
@@ -1670,6 +1938,54 @@ async fn command_frames_match_the_protocol() {
 
     mc.set_path_hash_mode(1).await.unwrap();
     assert_eq!(device.commands_with(61)[0], vec![61, 0, 1]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn settings_the_firmware_refuses_are_not_sent() {
+    // it answers them with ERR_CODE_ILLEGAL_ARG
+    let (mc, device) = client(Options::default(), |_| vec![ok()]);
+    mc.connect().await.unwrap();
+    let radio = [
+        (149.999, 62.5, 9, 8),
+        (2500.001, 62.5, 9, 8),
+        (869.525, 6.999, 9, 8),
+        (869.525, 500.001, 9, 8),
+        (869.525, 62.5, 4, 8),
+        (869.525, 62.5, 13, 8),
+        (869.525, 62.5, 9, 4),
+        (869.525, 62.5, 9, 9),
+    ];
+    for (freq, bw, sf, cr) in radio {
+        let refused = mc.set_radio(freq, bw, sf, cr, None).await;
+        let what = format!("{freq} {bw} {sf} {cr}");
+        assert!(matches!(refused, Err(Error::InvalidArgument(_))), "{what}");
+    }
+    mc.set_radio(150.0, 7.0, 5, 5, None).await.unwrap();
+    mc.set_radio(2500.0, 500.0, 12, 8, None).await.unwrap();
+    assert_eq!(device.commands_with(11).len(), 2);
+
+    // from -9 dBm up to the device's maximum (22 dBm)
+    for dbm in [-9, 22] {
+        mc.set_tx_power(dbm).await.unwrap();
+    }
+    for dbm in [-10, 23] {
+        let refused = mc.set_tx_power(dbm).await;
+        assert!(matches!(refused, Err(Error::InvalidArgument(_))));
+    }
+    assert_eq!(device.commands_with(12).len(), 2);
+
+    mc.set_path_hash_mode(2).await.unwrap();
+    let refused = mc.set_path_hash_mode(3).await;
+    assert!(matches!(refused, Err(Error::InvalidArgument(_))));
+    assert_eq!(device.commands_with(61).len(), 1);
+
+    // a default flood scope name of 1 to 30 bytes, its '#' included
+    mc.set_default_flood_scope(Some(&"s".repeat(29)))
+        .await
+        .unwrap();
+    let refused = mc.set_default_flood_scope(Some(&"s".repeat(30))).await;
+    assert!(matches!(refused, Err(Error::InvalidArgument(_))));
+    assert_eq!(device.commands_with(63).len(), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2144,6 +2460,27 @@ async fn the_end_of_a_list_given_up_on_is_not_the_next_answer() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_contact_list_fails_once_it_stalls_for_5_seconds() {
+    // the first request gets no answer, the second a start and one contact;
+    // meshcore_py looks every 5 s whether a contact came
+    let requests = AtomicU32::new(0);
+    let (mc, _device) = client(Options::default(), move |cmd| match cmd[0] {
+        4 if requests.fetch_add(1, Ordering::SeqCst) == 0 => vec![],
+        4 => vec![
+            vec![2, 2, 0, 0, 0],
+            contact_frame(3, KEY, "Alice", 0xff, &[]),
+        ],
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    for _ in 0..2 {
+        let started = tokio::time::Instant::now();
+        assert!(matches!(mc.get_contacts(0).await, Err(Error::Timeout)));
+        assert_eq!(started.elapsed().as_secs(), 5);
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_busy_device_refuses_a_second_contact_list() {
     // the old list is still coming when the next request arrives
     let requests = AtomicU32::new(0);
@@ -2600,6 +2937,17 @@ async fn remaining_command_frames_match_the_firmware() {
         device.commands_with(37)[0],
         [&[37u8][..], &123_456u32.to_le_bytes()[..]].concat()
     );
+    // the firmware takes 0 and 100000 to 999999, and refuses the others
+    for pin in [0, 100_000, 999_999] {
+        mc.set_devicepin(pin).await.unwrap();
+    }
+    for pin in [12_345, 1_000_000] {
+        assert!(matches!(
+            mc.set_devicepin(pin).await,
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+    assert_eq!(device.commands_with(37).len(), 4);
     mc.send_advert(false).await.unwrap();
     mc.send_advert(true).await.unwrap();
     assert_eq!(device.commands_with(7), [vec![7], vec![7, 1]]);
@@ -2778,6 +3126,43 @@ async fn a_subscription_answer_cut_short_is_an_error() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_subscription_takes_3_to_14_bytes_of_deltas() {
+    // as many as the sensor keeps
+    let (mc, device) = client(Options::default(), |_| vec![]);
+    mc.connect().await.unwrap();
+    for deltas in [&[1, 103][..], &[1; 15]] {
+        let options = RequestOptions::default();
+        let refused = mc
+            .req_subscribe_sync(&key(), [1, 2, 3, 4], 60, deltas, options)
+            .await;
+        assert!(matches!(refused, Err(Error::InvalidArgument(_))));
+    }
+    assert_eq!(device.commands_with(50).len(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_owner_answer_without_a_line_break_is_the_name_alone() {
+    // meshcore_py fails on it with an IndexError
+    let (mc, _device) = client(Options::default(), |cmd| match cmd[0] {
+        30 => vec![err(2)],
+        57 => {
+            let answer = [&7u32.to_le_bytes()[..], b"Rep 1\0\0"].concat();
+            vec![
+                sent_frame(false, 0x700, 1000),
+                binary_response(0x700, &answer),
+            ]
+        }
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    let anon = mc
+        .req_owner_sync(&key(), RequestOptions::default())
+        .await
+        .unwrap();
+    assert_eq!((anon.name.as_str(), anon.owner.as_str()), ("Rep 1", ""));
+}
+
+#[tokio::test(start_paused = true)]
 async fn endless_timeouts_do_not_panic() {
     let (mc, _device) = client(Options::default(), |cmd| match cmd[0] {
         2 => vec![sent_frame(false, 0x31, 1000), ack_frame(0x31)],
@@ -2868,7 +3253,7 @@ async fn reconnecting_to_another_device_reads_its_contacts() {
     device.drop_link().await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(!mc.ensure_contacts(false).await.unwrap());
-    // another one, as when several fit the name a BLE device is looked for by
+    // another one, as a board plugged into the port meanwhile
     device.drop_link().await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     let mut other = self_info_frame("Other");
@@ -2901,6 +3286,58 @@ async fn self_telemetry_is_told_apart_from_another_nodes() {
     let telemetry = mc.get_self_telemetry().await.unwrap();
     assert_eq!(telemetry.pubkey_prefix, [0x22; 6]);
     assert_eq!(telemetry.telemetry.voltage(), Some(3.3));
+}
+
+#[tokio::test(start_paused = true)]
+async fn answers_about_another_channel_key_or_node_are_passed_over() {
+    // each answer asked for comes second; meshcore_py takes the first of the
+    // kind
+    let other = [0x33u8; 32];
+    let (mc, _device) = client(Options::default(), move |cmd| match cmd[0] {
+        31 => {
+            let info = |index: u8, name: &str| {
+                let mut field = [0u8; 32];
+                field[..name.len()].copy_from_slice(name.as_bytes());
+                [&[18, index][..], &field, &[index; 16]].concat()
+            };
+            vec![info(1, "#other"), info(cmd[1], "#asked")]
+        }
+        // the contact asked for within a list that is coming in
+        30 => vec![
+            vec![2, 2, 0, 0, 0],
+            contact_frame(3, other, "Bob", 0xff, &[]),
+            contact_frame(3, KEY, "Alice", 0xff, &[]),
+            vec![4, 0, 0, 0, 0],
+        ],
+        52 => {
+            let found = |key: &[u8], hash: u8| {
+                [&[0x8du8, 0][..], &key[..6], &[0x41, hash, hash, 0xff]].concat()
+            };
+            vec![
+                sent_frame(false, 0x800, 1000),
+                found(&other, 0xcc),
+                found(&KEY, 0xaa),
+            ]
+        }
+        // another node refuses its login
+        26 => vec![
+            sent_frame(false, 0x900, 1000),
+            [&[0x86u8, 0][..], &other[..6]].concat(),
+            [&[0x85u8, 1][..], &KEY[..6]].concat(),
+        ],
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    let options = RequestOptions::default();
+    assert_eq!(mc.get_channel(2).await.unwrap().channel_name, "#asked");
+    assert_eq!(mc.get_contact_by_key(&key()).await.unwrap().name, "Alice");
+    let paths = mc.send_path_discovery_sync(&key(), options).await.unwrap();
+    assert_eq!(paths.out_path, vec![0xaa, 0xaa]);
+    let login = mc
+        .send_login_sync(&key(), "password", options)
+        .await
+        .unwrap();
+    assert_eq!(login.pubkey_prefix, Some([0x11; 6]));
 }
 
 #[tokio::test(start_paused = true)]
@@ -3047,6 +3484,7 @@ async fn texts_longer_than_the_firmware_takes_are_refused() {
     let mut contact = Contact::new(key(), ContactType::Chat, "x");
     contact.name = "a\0b".into();
     assert!(refused(mc.update_contact(&contact, None).await));
+    assert!(refused(mc.send_login(&key(), "pa\0ss").await.map(drop)));
     // the firmware sends at most 15 bytes of a password
     assert!(refused(
         mc.send_login(&key(), &"p".repeat(16)).await.map(drop)
@@ -3191,18 +3629,30 @@ async fn reconnects_and_restarts_the_session() {
 
 #[tokio::test(start_paused = true)]
 async fn lost_link_without_reconnect_reports_it() {
-    let (mc, device) = client(Options::default(), |_| vec![]);
-    mc.connect().await.unwrap();
-    let mut events = mc.subscribe();
-    device.drop_link().await;
-    let reason = loop {
-        if let Event::Disconnected { reason } = events.recv().await.unwrap() {
-            break reason;
-        }
-    };
-    assert_eq!(reason, "test_disconnect");
-    assert!(!mc.is_connected());
-    assert!(matches!(mc.get_time().await, Err(Error::NotConnected)));
+    // also with automatic reconnecting of zero attempts
+    for options in [
+        Options::default(),
+        Options {
+            auto_reconnect: true,
+            max_reconnect_attempts: 0,
+            ..Options::default()
+        },
+    ] {
+        let (mc, device) = client(options, |_| vec![]);
+        mc.connect().await.unwrap();
+        let mut events = mc.subscribe();
+        device.drop_link().await;
+        let reason = loop {
+            if let Event::Disconnected { reason } = events.recv().await.unwrap() {
+                break reason;
+            }
+        };
+        assert_eq!(reason, "test_disconnect");
+        assert!(!mc.is_connected());
+        assert!(matches!(mc.get_time().await, Err(Error::NotConnected)));
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(device.opens(), 1);
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -3377,6 +3827,48 @@ async fn an_answer_from_before_a_login_is_not_taken_for_its_own() {
         .send_login_sync(&key(), "password", RequestOptions::default())
         .await;
     assert!(matches!(result, Err(Error::Timeout)), "{result:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn sync_requests_run_one_after_the_other() {
+    // the firmware keeps one pending request, which the next would replace;
+    // no request here gets an answer
+    let sent = AtomicU32::new(0);
+    let (mc, device) = client(Options::default(), move |cmd| match cmd[0] {
+        50 | 52 => vec![sent_frame(
+            false,
+            0x500 + sent.fetch_add(1, Ordering::SeqCst),
+            1000,
+        )],
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    let options = RequestOptions::default();
+    let status = tokio::spawn({
+        let mc = mc.clone();
+        async move { mc.req_status_sync(&key(), options).await }
+    });
+    device.settle().await;
+    let paths = tokio::spawn({
+        let mc = mc.clone();
+        async move { mc.send_path_discovery_sync(&key(), options).await }
+    });
+    device.settle().await;
+    // the path discovery waits for the status request to end; a request that
+    // does not wait for its answer is not held back
+    mc.send_binary_req(&key(), BinaryReqType::KeepAlive, &[7], options)
+        .await
+        .unwrap();
+    assert_eq!(device.commands_with(52).len(), 0);
+    assert!(matches!(status.await.unwrap(), Err(Error::Timeout)));
+    assert!(matches!(paths.await.unwrap(), Err(Error::Timeout)));
+    let codes: Vec<u8> = device
+        .commands()
+        .iter()
+        .map(|command| command[0])
+        .filter(|&code| code == 50 || code == 52)
+        .collect();
+    assert_eq!(codes, [50, 50, 52]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -3790,6 +4282,22 @@ async fn rx_log_channel_messages_get_path_and_signal() {
     assert_eq!(rx_info.path, vec![0xaa, 0xbb]);
     assert_eq!(rx_info.rssi, -80);
     assert_eq!(rx_info.snr, 6.5);
+
+    // also with NUL bytes at either end of the text, which the firmware does
+    // not send: they go, as in the older frame, and the hash is taken without
+    // them (meshcore_py keeps them in a v3 frame and misses the log entry)
+    let mut padded = vec![17, 24, 0, 0, 0, 2, 0];
+    padded.extend(1_700_000_000u32.to_le_bytes());
+    padded.extend(b"\0alice: hi\0\0");
+    device.push(padded).await;
+    let padded = loop {
+        if let Event::ChannelMessage(m) = events.recv().await.unwrap() {
+            break m;
+        }
+    };
+    assert_eq!(padded.text, "alice: hi");
+    assert_eq!(padded.txt_hash, message.txt_hash);
+    assert_eq!(padded.rx_info, message.rx_info);
 }
 
 #[tokio::test(start_paused = true)]

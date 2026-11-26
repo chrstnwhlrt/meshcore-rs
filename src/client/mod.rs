@@ -535,7 +535,9 @@ impl MeshCore {
     /// connected or connecting to it, [`Error::PairingFailed`] when the device
     /// does not take the PIN or needs one that was not given, [`Error::Ble`]
     /// when connecting fails otherwise, [`Error::Timeout`] when it takes too
-    /// long or the device does not answer.
+    /// long or the device does not answer, and [`Error::InvalidArgument`] for
+    /// text with a `:` that is no Bluetooth address or a PIN of more than six
+    /// digits.
     #[cfg(all(feature = "ble", target_os = "linux"))]
     pub async fn create_ble(
         config: crate::transport::ble::BleConfig,

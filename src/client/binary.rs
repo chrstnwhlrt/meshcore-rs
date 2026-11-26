@@ -416,7 +416,10 @@ impl MeshCore {
             .binary_answer(dst, BinaryReqType::Subscribe, &data, options)
             .await?;
         if answer.len() < 2 {
-            return Err(Error::protocol("invalid_frame_length"));
+            // meshcore_py reads zeros for the missing bytes, without a line
+            let err = Error::protocol("invalid_frame_length");
+            log::error!(target: "meshcore", "Error parsing binary SUBSCRIBE response: {err}");
+            return Err(err);
         }
         Ok(SensorSubscription {
             expiry_secs: u16::from_le_bytes([answer[0], answer[1]]),

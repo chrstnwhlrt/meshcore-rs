@@ -509,9 +509,20 @@ impl State {
         };
         let prefix = request.pubkey_prefix;
         let typed = match request.kind {
-            RequestKind::Binary(BinaryReqType::Status) if body.len() >= 52 => Some(
-                Event::StatusResponse(Box::new(parse::status(body, prefix, Some(tag))?)),
-            ),
+            // A line in the form of meshcore_py's for the other answers;
+            // meshcore_py drops a status answer cut short without one.
+            RequestKind::Binary(BinaryReqType::Status) => {
+                match parse::status(body, prefix, Some(tag)) {
+                    Ok(status) => Some(Event::StatusResponse(Box::new(status))),
+                    Err(err) => {
+                        log::error!(
+                            target: "meshcore",
+                            "Error parsing binary STATUS response: {err}"
+                        );
+                        None
+                    }
+                }
+            }
             RequestKind::Binary(BinaryReqType::Telemetry) => {
                 Some(Event::TelemetryResponse(Box::new(TelemetryResponse {
                     pubkey_prefix: prefix,
@@ -1347,6 +1358,23 @@ mod tests {
     }
 
     #[test]
+    fn a_list_end_whose_lastmod_is_cut_short_ends_with_0() {
+        // meshcore_py fills in zeros for the missing bytes
+        let mut state = State::new();
+        state.contacts_request_since = Some(0);
+        state.handle_frame(&[2, 1, 0, 0, 0]);
+        state.handle_frame(&contact_frame(3, 1, "a"));
+        let events = state.handle_frame(&[4, 0x88, 0x13]);
+        let Event::Contacts(list) = &events[0] else {
+            panic!()
+        };
+        assert_eq!(list.lastmod, 0);
+        assert_eq!(state.contacts.len(), 1);
+        // the next list since then is a full one
+        assert_eq!(state.contacts_lastmod, 0);
+    }
+
+    #[test]
     fn incremental_contact_list_merges() {
         let mut state = State::new();
         state.handle_frame(&[2, 1, 0, 0, 0]);
@@ -1435,6 +1463,41 @@ mod tests {
         assert_eq!(acl.entries.len(), 1);
         // matched once
         assert_eq!(state.handle_frame(&response).len(), 1);
+    }
+
+    #[test]
+    fn a_neighbours_answer_cut_short_comes_only_raw() {
+        // meshcore_py reports the neighbours it could read
+        let mut state = State::new();
+        state.prepared = Some(PreparedRequest {
+            kind: RequestKind::Binary(BinaryReqType::Neighbours),
+            pubkey_prefix: [1, 2, 3, 4, 5, 6],
+            timeout: None,
+            min_timeout: Duration::ZERO,
+            timeout_factor: 1,
+            neighbours_prefix_len: 4,
+        });
+        let mut sent = vec![6, 0];
+        sent.extend(0xabcd_u32.to_le_bytes());
+        sent.extend(4000u32.to_le_bytes());
+        state.handle_frame(&sent);
+
+        // two neighbours announced, the second without its SNR
+        let mut response = vec![0x8c, 0];
+        response.extend(0xabcd_u32.to_le_bytes());
+        response.extend(2i16.to_le_bytes());
+        response.extend(2i16.to_le_bytes());
+        response.extend([0xa1; 4]);
+        response.extend(30i32.to_le_bytes());
+        response.push(8);
+        response.extend([0xa2; 4]);
+        response.extend(30i32.to_le_bytes());
+        let events = state.handle_frame(&response);
+        assert_eq!(events.len(), 1);
+        let Event::BinaryResponse(raw) = &events[0] else {
+            panic!()
+        };
+        assert_eq!(raw.data, response[6..]);
     }
 
     #[test]

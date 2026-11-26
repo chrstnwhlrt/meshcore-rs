@@ -121,6 +121,8 @@ struct State {
     /// The pairing agents of the programs.
     agents: HashMap<String, (Program, String)>,
     removals: usize,
+    /// How often a program asked to disconnect the companion.
+    disconnect_calls: usize,
 }
 
 struct Inner {
@@ -133,9 +135,36 @@ struct Inner {
 #[derive(Clone)]
 pub struct Bluez(Arc<Inner>);
 
+/// The lines the library logged at info level and above, as `LEVEL:message`.
+static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+struct Capture;
+
+impl log::Log for Capture {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.target() == "meshcore" && metadata.level() <= log::Level::Info
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            let line = format!("{}:{}", record.level(), record.args());
+            LINES.lock().unwrap().push(line);
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static CAPTURE: Capture = Capture;
+
+/// The lines the library logged at info level and above since the last call.
+pub fn logged() -> Vec<String> {
+    std::mem::take(&mut *LINES.lock().unwrap())
+}
+
 /// Runs `test` in a process of its own: D-Bus takes the address of the system
 /// bus from the environment a process starts with. `_test` is the test function
-/// this is called in.
+/// this is called in. The process captures the library's log for [`logged`].
 pub fn run<F: Fn()>(_test: F, test: impl AsyncFnOnce(Bluez)) {
     const TEST: &str = "MESHCORE_BLUEZ_TEST";
     const ADDRESS: &str = "DBUS_SYSTEM_BUS_ADDRESS";
@@ -148,6 +177,8 @@ pub fn run<F: Fn()>(_test: F, test: impl AsyncFnOnce(Bluez)) {
             report(info);
             std::process::exit(101);
         }));
+        log::set_logger(&CAPTURE).unwrap();
+        log::set_max_level(log::LevelFilter::Info);
         let address = std::env::var(ADDRESS).unwrap();
         let bluez = Bluez::start(address.strip_prefix(ABSTRACT).unwrap());
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -260,6 +291,7 @@ impl Bluez {
             written: Vec::new(),
             agents: HashMap::new(),
             removals: 0,
+            disconnect_calls: 0,
         };
         let mut companion = device(ADDRESS, NAME);
         companion.insert("Paired".into(), Value::Bool(true));
@@ -372,6 +404,11 @@ impl Bluez {
     /// How often the companion was removed, with its pairing.
     pub fn removals(&self) -> usize {
         self.state().removals
+    }
+
+    /// How often a program asked to disconnect the companion.
+    pub fn disconnect_calls(&self) -> usize {
+        self.state().disconnect_calls
     }
 
     /// Adds another device, which is heard with `rssi`.
@@ -501,6 +538,7 @@ impl Bluez {
     /// As `device_request_disconnect`.
     fn disconnect(&self, call: Call) {
         let mut state = self.state();
+        state.disconnect_calls += 1;
         if let Some(connecting) = state.connecting.take() {
             connecting.fail(FAILED, "br-connection-canceled");
         }

@@ -193,7 +193,9 @@ pub(crate) fn channel_message(data: &[u8], v3: bool) -> Result<(ChannelMessage, 
 }
 
 /// A channel datagram (`RESP_CODE_CHANNEL_DATA_RECV`): SNR, 2 reserved,
-/// channel, path length, data type (LE 16), data length, data.
+/// channel, path length, data type (LE 16), data length, data. The firmware
+/// always sends all the data its length byte announces, so less is a frame
+/// cut short.
 pub(crate) fn channel_data(data: &[u8]) -> Result<ChannelData> {
     let mut r = ByteReader::new(data);
     if r.remaining() < 8 {
@@ -205,7 +207,7 @@ pub(crate) fn channel_data(data: &[u8]) -> Result<ChannelData> {
     let path_len = PathLen::from_byte(r.u8()?);
     let data_type = r.u16()?;
     let data_len = usize::from(r.u8()?);
-    let payload = r.bytes(data_len.min(r.remaining()))?.to_vec();
+    let payload = r.bytes(data_len)?.to_vec();
     Ok(ChannelData {
         snr,
         channel_idx,
@@ -359,7 +361,8 @@ pub(crate) fn login_failed(data: &[u8]) -> LoginFailed {
 }
 
 /// A trace: reserved, path length in bytes, flags, tag, auth code, the hop
-/// hashes, one SNR per hop, the final SNR.
+/// hashes, one SNR per whole hop, the final SNR. A trace another node built
+/// may end in a hash cut short; it has no SNR and is left out.
 pub(crate) fn trace(data: &[u8]) -> Result<TraceData> {
     let mut r = ByteReader::new(data);
     r.skip(1)?;
@@ -369,7 +372,7 @@ pub(crate) fn trace(data: &[u8]) -> Result<TraceData> {
     let auth_code = r.u32()?;
     let hash_len = 1usize << (flags & 3);
     let hop_count = path_bytes / hash_len;
-    let hashes = r.bytes(hop_count * hash_len)?;
+    let hashes = r.bytes(path_bytes)?;
     let snrs = r.bytes(hop_count)?;
     let hops = hashes
         .chunks_exact(hash_len)
@@ -429,13 +432,18 @@ pub(crate) fn control_data(data: &[u8]) -> Result<(ControlData, Option<DiscoverR
         return Err(Error::protocol("invalid_frame_length"));
     };
     // A discovery answer too short to read still leaves the control data:
-    // control packets come unchecked from any node.
+    // control packets come unchecked from any node. It needs 8 bytes of the
+    // key, as the firmware's display does; nodes send 8 or 32.
     let read_discover = || {
         let mut p = ByteReader::new(&payload[1..]);
         let snr_in = snr(p.i8().ok()?);
         let tag = p.u32().ok()?;
         let key = p.rest();
-        let key_len = if key.len() < 32 { key.len().min(8) } else { 32 };
+        let key_len = match key.len() {
+            0..8 => return None,
+            8..32 => 8,
+            _ => 32,
+        };
         Some(DiscoverResponse {
             snr: snr_value,
             rssi,
@@ -495,7 +503,8 @@ pub(crate) fn autoadd_config(data: &[u8]) -> Result<AutoAddConfig> {
     })
 }
 
-/// Pairs of lower and upper frequency until a zero or the end.
+/// Pairs of lower and upper frequency until a zero or the end. A last pair
+/// cut short is left out; meshcore_py fills in zeros for its missing bytes.
 pub(crate) fn repeat_freqs(data: &[u8]) -> Vec<FreqRange> {
     let mut r = ByteReader::new(data);
     let mut ranges = Vec::new();
@@ -655,6 +664,14 @@ mod tests {
     }
 
     #[test]
+    fn a_contact_name_ends_at_its_first_nul() {
+        // renamed by an advert: the old name's tail stays behind the NUL
+        let c = contact(&contact_bytes(b"Rep-HH\0ater-Hamburg", 0xff, &[])).unwrap();
+        assert_eq!(c.name, "Rep-HH");
+        assert_eq!(c.name_raw[..19], *b"Rep-HH\0ater-Hamburg");
+    }
+
+    #[test]
     fn short_self_info_is_an_error_not_a_panic() {
         assert!(self_info(&[0; 55]).is_err());
         let mut data = vec![1, 0xf7, 22];
@@ -730,6 +747,11 @@ mod tests {
         assert_eq!(d.data_type, 0x1234);
         assert_eq!(d.payload, vec![0xaa, 0xbb]);
         assert!(channel_data(&[0; 5]).is_err());
+        // data cut short of its length byte; bytes after it are left alone
+        assert!(channel_data(&data[..9]).is_err());
+        let mut longer = data.to_vec();
+        longer.push(0xcc);
+        assert_eq!(channel_data(&longer).unwrap().payload, vec![0xaa, 0xbb]);
     }
 
     #[test]
@@ -802,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn trace_with_two_byte_hashes() {
+    fn trace_hops_and_their_snrs() {
         let mut data = vec![0, 4, 1];
         data.extend(7u32.to_le_bytes());
         data.extend(9u32.to_le_bytes());
@@ -817,6 +839,32 @@ mod tests {
         assert_eq!(t.final_snr, Some(3.0));
         // a path cut short (here its final SNR) makes the trace unreadable
         assert!(trace(&data[..data.len() - 1]).is_err());
+        // a path of no whole hops (from a trace another node built): the
+        // firmware sends all its bytes and an SNR per whole hop
+        let mut data = vec![0, 5, 1];
+        data.extend(7u32.to_le_bytes());
+        data.extend(9u32.to_le_bytes());
+        data.extend([0xaa, 0xab, 0xbb, 0xbc, 0xcc]);
+        data.extend([8, 0xfc, 12]);
+        let t = trace(&data).unwrap();
+        assert_eq!(t.hops.len(), 2);
+        assert_eq!((t.hops[0].snr, t.hops[1].snr), (2.0, -1.0));
+        assert_eq!(t.final_snr, Some(3.0));
+        // no whole hop at all: the byte after the hash is the final SNR
+        let mut data = vec![0, 1, 1];
+        data.extend([0; 8]);
+        data.extend([0xaa, 12]);
+        let t = trace(&data).unwrap();
+        assert_eq!((t.hops.len(), t.final_snr), (0, Some(3.0)));
+        // 8-byte hashes: one whole hop and three bytes of the next
+        let mut data = vec![0, 11, 3];
+        data.extend([0; 8]);
+        data.extend([0xaa; 11]);
+        data.extend([8, 12]);
+        let t = trace(&data).unwrap();
+        assert_eq!(t.hops.len(), 1);
+        assert_eq!(t.hops[0].hash, vec![0xaa; 8]);
+        assert_eq!((t.hops[0].snr, t.final_snr), (2.0, Some(3.0)));
     }
 
     #[test]
@@ -873,6 +921,22 @@ mod tests {
         let (control, discover) = control_data(&data[..7]).unwrap();
         assert_eq!(control.payload, vec![0x92, 0x10, 0xef, 0xbe]);
         assert!(discover.is_none());
+        // so does one cut inside the first 8 bytes of the key, which the
+        // firmware's own display needs too (an empty key would match any)
+        for len in 9..17 {
+            let (control, discover) = control_data(&data[..len]).unwrap();
+            assert_eq!(control.payload.len(), len - 3);
+            assert!(discover.is_none(), "{} key bytes", len - 9);
+        }
+        // one cut after them gives those 8, as in meshcore_py
+        data.extend([9; 5]);
+        let (_, discover) = control_data(&data).unwrap();
+        assert_eq!(discover.unwrap().pubkey, vec![7; 8]);
+        // a whole key: 32 bytes, as meshcore_py takes them
+        data.truncate(9);
+        data.extend([8; 33]);
+        let (_, discover) = control_data(&data).unwrap();
+        assert_eq!(discover.unwrap().pubkey, vec![8; 32]);
     }
 
     #[test]
@@ -917,6 +981,10 @@ mod tests {
             data.extend(v.to_le_bytes());
         }
         assert_eq!(repeat_freqs(&data).len(), 2);
+        // a last pair cut short is left out
+        for len in 9..16 {
+            assert_eq!(repeat_freqs(&data[..len]).len(), 1);
+        }
         data.extend([0; 8]);
         data.extend([1; 8]);
         assert_eq!(repeat_freqs(&data).len(), 2);

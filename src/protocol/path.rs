@@ -255,6 +255,15 @@ mod tests {
             encode_reply_path(PathLen::new(3, 0).unwrap(), &[1]),
             vec![1, 1]
         );
+        // a reserved hash mode asks for a zero-hop reply
+        assert_eq!(
+            encode_reply_path(PathLen::from_byte(0xc1), &[1, 2, 3, 4]),
+            vec![0]
+        );
+        // nor what the server's 64 bytes take: 32 of 35 hops of 2 bytes
+        let long = encode_reply_path(PathLen::from_byte(0x40 | 0x23), &[7; 70]);
+        assert_eq!(long[0], 0x40 | 0x20);
+        assert_eq!(long.len(), 1 + 64);
     }
 
     #[test]

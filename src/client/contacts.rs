@@ -60,9 +60,9 @@ pub(crate) fn update_contact_frame(contact: &Contact, lastmod: Option<u32>) -> R
             contact.out_path.len()
         )));
     }
-    // The device would take the missing hops for zero hashes.
-    if !contact.out_path_len.is_none() && contact.out_path_len.byte_len() != contact.out_path.len()
-    {
+    // The device would take the missing hops for zero hashes, and it hands
+    // back no path for a contact that floods.
+    if contact.out_path_len.byte_len() != contact.out_path.len() {
         return Err(Error::invalid(format!(
             "the out path has {} bytes, its length byte announces {}",
             contact.out_path.len(),
@@ -369,6 +369,11 @@ mod tests {
         contact.out_path = vec![1, 2];
         assert!(update_contact_frame(&contact, None).is_err());
         contact.out_path.push(3);
+        assert!(update_contact_frame(&contact, None).is_ok());
+        // a contact that floods has no path
+        contact.out_path_len = PathLen::NONE;
+        assert!(update_contact_frame(&contact, None).is_err());
+        contact.out_path.clear();
         assert!(update_contact_frame(&contact, None).is_ok());
     }
 

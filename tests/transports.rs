@@ -369,6 +369,41 @@ async fn tcp_refused_connection_fails_at_once() {
     );
 }
 
+/// A connection nobody answers gives up after the connect timeout (10 s
+/// unless set); meshcore_py waits as long as the system does. The port's
+/// queue of connections is full, so Linux drops the handshake.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn tcp_connect_gives_up_after_its_timeout() {
+    assert_eq!(
+        TcpTransport::new("127.0.0.1", 1),
+        TcpTransport::new("127.0.0.1", 1).connect_timeout(Duration::from_secs(10))
+    );
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(0).unwrap();
+    let address = listener.local_addr().unwrap();
+    // connections the listener never accepts, until one is not taken
+    let mut queued = Vec::new();
+    while let Ok(stream) = timeout(
+        Duration::from_secs(1),
+        tokio::net::TcpStream::connect(address),
+    )
+    .await
+    {
+        queued.push(stream.unwrap());
+        assert!(queued.len() < 10, "the queue does not fill");
+    }
+    let transport =
+        TcpTransport::new("127.0.0.1", address.port()).connect_timeout(Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    let result = timeout(PATIENCE, transport.open())
+        .await
+        .expect("the connect timeout does not end the connect");
+    assert!(matches!(result, Err(Error::Timeout)));
+    assert!(started.elapsed() >= Duration::from_millis(300));
+}
+
 // ---------------------------------------------------------------- serial
 
 #[cfg(unix)]

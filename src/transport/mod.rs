@@ -302,10 +302,12 @@ mod tests {
     async fn a_write_that_does_not_finish_takes_the_link_down() {
         // as when the device has stopped reading
         let (mut writer, mut events) = writer_on(|_| Poll::Pending);
+        let started = tokio::time::Instant::now();
         assert!(matches!(
             writer.write_frame(&[22, 3]).await,
             Err(Error::ConnectionLost)
         ));
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
         assert_eq!(
             events.recv().await,
             Some(LinkEvent::Closed("serial_write_timeout".into()))

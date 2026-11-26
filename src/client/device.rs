@@ -226,8 +226,21 @@ impl MeshCore {
         self.request_ok(&frame).await.map(drop)
     }
 
-    /// Sets the TX power in dBm (the firmware takes -9 up to its maximum).
+    /// Sets the TX power in dBm: -9 up to the device's maximum
+    /// ([`SelfInfo::max_tx_power`]). Any other the firmware refuses with
+    /// `ERR_CODE_ILLEGAL_ARG`, so it is refused before sending.
     pub async fn set_tx_power(&self, dbm: i8) -> Result<()> {
+        let max = self
+            .state()
+            .self_info
+            .as_ref()
+            .map(|info| info.max_tx_power);
+        if dbm < -9 || max.is_some_and(|max| i16::from(dbm) > i16::from(max)) {
+            return Err(Error::invalid(format!(
+                "TX power {dbm} dBm, the device takes -9 up to {}",
+                max.map_or_else(|| "its maximum".to_string(), |max| format!("{max} dBm"))
+            )));
+        }
         let mut frame = vec![CommandType::SetRadioTxPower.code()];
         frame.extend_from_slice(&i32::from(dbm).to_le_bytes());
         self.change_self_info(&frame, move |info| info.tx_power = dbm)
@@ -242,7 +255,10 @@ impl MeshCore {
     /// The frequency goes out in whole kHz and the bandwidth in whole Hz,
     /// rounded (meshcore_py cuts off the rest). [`self_info`](Self::self_info)
     /// takes them as the device reports them back: a few values, none of a
-    /// LoRa band or bandwidth, come back 1 kHz or 1 Hz lower.
+    /// LoRa band or bandwidth, come back 1 kHz or 1 Hz lower. The firmware
+    /// takes 150 to 2500 MHz, 7 to 500 kHz, SF 5 to 12 and CR 5 to 8 and
+    /// refuses others with `ERR_CODE_ILLEGAL_ARG`, so they are refused before
+    /// sending.
     pub async fn set_radio(
         &self,
         freq_mhz: f64,
@@ -262,6 +278,16 @@ impl MeshCore {
         };
         let freq = to_u32(freq_mhz, "frequency")?;
         let bw = to_u32(bw_khz, "bandwidth")?;
+        if !(150_000..=2_500_000).contains(&freq)
+            || !(7_000..=500_000).contains(&bw)
+            || !(5..=12).contains(&sf)
+            || !(5..=8).contains(&cr)
+        {
+            return Err(Error::invalid(format!(
+                "radio {freq_mhz} MHz, {bw_khz} kHz, SF {sf}, CR {cr}: the firmware takes 150 to \
+                 2500 MHz, 7 to 500 kHz, SF 5 to 12 and CR 5 to 8"
+            )));
+        }
         let mut frame = vec![CommandType::SetRadioParams.code()];
         frame.extend_from_slice(&freq.to_le_bytes());
         frame.extend_from_slice(&bw.to_le_bytes());
@@ -375,10 +401,16 @@ impl MeshCore {
         self.set_other_param(|p| p.multi_acks = multi_acks).await
     }
 
-    /// Sets the BLE PIN, which the device uses from its next start on: six
-    /// digits, or 0 for the firmware's own (on boards with a display usually a
-    /// random one).
+    /// Sets the BLE PIN, which the device uses from its next start on: 100000
+    /// to 999999, or 0 for the firmware's own (on boards with a display usually
+    /// a random one). Any other the firmware refuses with
+    /// `ERR_CODE_ILLEGAL_ARG`, so it is refused before sending.
     pub async fn set_devicepin(&self, pin: u32) -> Result<()> {
+        if pin != 0 && !(100_000..=999_999).contains(&pin) {
+            return Err(Error::invalid(format!(
+                "PIN {pin}, the firmware takes 100000 to 999999, or 0"
+            )));
+        }
         let mut frame = vec![CommandType::SetDevicePin.code()];
         frame.extend_from_slice(&pin.to_le_bytes());
         self.request_ok(&frame).await.map(drop)
@@ -733,8 +765,13 @@ impl MeshCore {
         .await
     }
 
-    /// Sets the path hash mode: bytes per hop minus one (0-2).
+    /// Sets the path hash mode: bytes per hop minus one, 0 to 2. Mode 3 is
+    /// reserved, and the firmware refuses it and above with
+    /// `ERR_CODE_ILLEGAL_ARG`, so they are refused before sending.
     pub async fn set_path_hash_mode(&self, mode: u8) -> Result<()> {
+        if mode > 2 {
+            return Err(Error::invalid(format!("hash mode {mode}, at most 2")));
+        }
         let frame = [CommandType::SetPathHashMode.code(), 0, mode];
         self.request_ok(&frame).await.map(drop)
     }

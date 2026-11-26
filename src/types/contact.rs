@@ -137,8 +137,9 @@ impl ContactType {
         }
     }
 
-    /// The short name meshcore_py's packet parser uses
-    /// (`NONE`, `CLI`, `REP`, `ROOM`, `SENS`).
+    /// The short name meshcore_py's packet parser lists for the type in
+    /// `CONTACT_TYPENAMES` (`NONE`, `CLI`, `REP`, `ROOM`, `SENS`), and `UNK`
+    /// for any other, which the list lacks.
     #[must_use]
     pub const fn short_name(self) -> &'static str {
         match self {
@@ -452,5 +453,7 @@ mod tests {
         assert_eq!(prefix.public_key(), None);
         assert_eq!(prefix.prefix(), [7; 6]);
         assert!(Destination::from_hex("0707").is_err());
+        assert!(Destination::from_bytes(&[7; 33]).is_err());
+        assert!(Destination::from_hex("zz0707070707").is_err());
     }
 }
