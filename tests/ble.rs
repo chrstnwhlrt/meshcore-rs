@@ -311,8 +311,16 @@ fn a_companion_that_forgot_the_pairing_is_paired_again() {
                 let reason = failed_pairing(paired().connect().await);
                 assert!(reason.contains("may have forgotten the pairing"));
                 assert_eq!(bluez.removals(), removals);
+                logged();
                 let mc = with_pin(123_456);
                 mc.connect().await.unwrap();
+                // a line of the library's own: meshcore_py does not pair again
+                let again = format!(
+                    "INFO:BlueZ cannot connect to {ADDRESS}, which may have forgotten the \
+                     pairing, pairing again"
+                );
+                let started = ["INFO:BLE pairing successful", "INFO:BLE Connection started"];
+                assert_eq!(logged(), [&[again.as_str()][..], &started].concat());
                 works(&mc).await;
                 mc.disconnect().await.unwrap();
                 assert_eq!(bluez.removals(), removals + 1);

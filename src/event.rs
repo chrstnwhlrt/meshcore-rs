@@ -423,7 +423,8 @@ impl Event {
     }
 }
 
-/// A subscription to all events.
+/// A subscription to all events. A subscriber that falls more than the event
+/// capacity behind loses the oldest events (logged as a warning).
 #[derive(Debug)]
 pub struct Subscription {
     receiver: broadcast::Receiver<Event>,
@@ -433,9 +434,6 @@ pub struct Subscription {
 
 impl Subscription {
     /// The next event; `None` once the client is gone.
-    ///
-    /// A subscriber that falls more than the event capacity behind loses the
-    /// oldest events (logged as a warning).
     pub async fn recv(&mut self) -> Option<Event> {
         next_event(&mut self.receiver).await
     }

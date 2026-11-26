@@ -143,7 +143,9 @@ impl MeshCore {
     /// When the list stalls for 5 s (no start, contact or end), this fails
     /// with [`Error::Timeout`]. A list that only starts after that, or another
     /// app's on another link, is merged into the cache but does not count as
-    /// read, as it may be partial. A call takes only the end of a list whose
+    /// read, as it may be partial. A contact that cannot be read ends this
+    /// with [`Error::Protocol`]; the rest of its list does not count as read
+    /// either, and the next one is read in full. A call takes only the end of a list whose
     /// start came after its request: the end of an earlier list that goes on
     /// late is not its answer, and the device refuses the request with
     /// [`ErrorCode::BadState`](crate::ErrorCode::BadState) while such a list

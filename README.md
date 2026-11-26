@@ -359,7 +359,9 @@ meshcore_py leaves a gap:
 - A contact list the client did not ask for (another app's on another link),
   or one during which it removes a contact (the firmware then leaves out
   another), is merged but does not count as read; meshcore_py goes on from its
-  `lastmod` and can miss what changed before or was left out.
+  `lastmod` and can miss what changed before or was left out. A list with a
+  contact that cannot be read does not count as read either, and the next one
+  is read in full; meshcore_py takes over the list's `lastmod` all the same.
 - `get_contacts_async` waits for the start of the list, so a refusal (while
   another list is coming in) is its own error; in meshcore_py the refusal
   can pass for the reply to the next command.
@@ -418,7 +420,8 @@ meshcore_py leaves a gap:
 - `send_login_sync` returns `Error::LoginFailed` as soon as the device reports
   a refused login; meshcore_py waits for a successful login only and runs into
   its timeout. (Repeaters, room servers and sensors with firmware 1.18 do not
-  answer a wrong password, which ends in `Error::Timeout`.)
+  answer a wrong password, which ends in `Error::Timeout`; a room server set to
+  allow read-only access logs the client in read-only instead.)
 - `import_private_key` returns `Error::Disabled` as soon as the firmware
   answers that importing keys is disabled; meshcore_py waits for `OK` or an
   error only and runs into its timeout.
@@ -569,7 +572,9 @@ meshcore_py leaves a gap:
   data along 1-byte hashes only.
 - `connect` takes the link down again when the device does not answer
   `APP_START`, and returns the error; meshcore_py's `connect` returns `None`
-  and leaves the link up (its `create_*` functions take it down).
+  and leaves the link up (its `create_*` functions take it down). Automatic
+  message fetching stays on through a `connect` that fails, also one that
+  cannot open the link, for which meshcore_py stops it.
 - A `disconnect` or another `connect` that comes in while a `connect` opens its
   link counts, and the first one fails with `Error::NotConnected`; meshcore_py
   opens that link all the same. One that comes in while the client reconnects
@@ -636,7 +641,8 @@ cargo clippy --all-targets --all-features
   meshcore_py writes for the same calls. After updating meshcore_py,
   regenerate its fixture as described in
   `tests/fixtures/meshcore_py_commands.py`.
-- `tests/logging.rs` checks the log lines at info level and above:
+- `tests/logging.rs` checks the log lines at info level and above (a unit
+  test those of the retries of `create_serial`, `tests/ble.rs` those of BLE):
   meshcore_py's wording where it logs the same case, lines of the library's
   own where meshcore_py logs nothing at that level (such as for a lost link),
   and none for a command without a link and input refused before sending.

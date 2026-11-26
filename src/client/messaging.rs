@@ -502,9 +502,10 @@ impl MeshCore {
 
     /// Logs in and waits for the answer. [`Error::LoginFailed`] when the device
     /// reports a refused login; repeaters, room servers and sensors (firmware
-    /// 1.18) do not answer a wrong password, which ends in [`Error::Timeout`].
-    /// The device takes the node's next answer for the login's, so a late one
-    /// to an earlier request can pass for it.
+    /// 1.18) do not answer a wrong password, which ends in [`Error::Timeout`]
+    /// (a room server set to allow read-only access logs the client in
+    /// read-only instead). The device takes the node's next answer for the
+    /// login's, so a late one to an earlier request can pass for it.
     pub async fn send_login_sync(
         &self,
         dst: &PublicKey,

@@ -8,10 +8,13 @@ mod common;
 
 use std::future::Future;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
-use common::{Device, KEY, binary_response, client, contact_frame, err, ok, sent_frame};
+use common::{
+    Device, KEY, binary_response, client, client_on_device, contact_frame, err, ok, poll_once,
+    self_info_frame, sent_frame,
+};
 use meshcore::protocol::encode_reply_path;
 use meshcore::{
     AnonReqType, Error, ErrorCode, Event, MeshCore, NeighboursQuery, Options, PathLen, PublicKey,
@@ -206,6 +209,160 @@ async fn unusable_reply_paths() {
     );
 }
 
+/// A link that drops for good, as the device cannot be opened again while the
+/// link that dropped still holds its port, and one whose session does not
+/// start again: lines of the library's own. meshcore_py logs no line for
+/// giving up, and one for a session start that fails only when it raises.
+async fn failed_reconnects() {
+    let options = || Options {
+        auto_reconnect: true,
+        ..Options::default()
+    };
+    let (mc, device) = client(options(), |_| vec![]);
+    device.one_link_at_a_time();
+    mc.connect().await.unwrap();
+    let mut events = mc.subscribe();
+    let lines = lines_of(async {
+        device.hang_on_close();
+        device.drop_link().await;
+        while !matches!(events.recv().await, Some(Event::Disconnected { .. })) {}
+    })
+    .await;
+    assert_eq!(
+        lines,
+        [
+            "INFO:connection lost: test_disconnect",
+            "INFO:giving up reconnecting after: test_disconnect"
+        ]
+    );
+
+    let answered = AtomicBool::new(false);
+    let (mc, device) = client_on_device(options(), move |cmd| {
+        if cmd[0] == 1 && !answered.swap(true, Ordering::SeqCst) {
+            vec![self_info_frame("Node")]
+        } else {
+            vec![]
+        }
+    });
+    mc.connect().await.unwrap();
+    let mut events = mc.subscribe();
+    let lines = lines_of(async {
+        device.drop_link().await;
+        while !matches!(events.recv().await, Some(Event::Connected { .. })) {}
+    })
+    .await;
+    assert_eq!(
+        lines,
+        [
+            "INFO:connection lost: test_disconnect",
+            "WARN:could not start the session after reconnecting: timed out"
+        ]
+    );
+}
+
+/// The automatic contact update cannot read the contacts, and the end of a
+/// list comes without its start: lines of the library's own.
+async fn contact_updates_that_fail() {
+    let (mc, device) = client(Options::default(), |cmd| match cmd[0] {
+        4 => vec![err(4)],
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    mc.set_auto_update_contacts(true);
+    let lines = lines_of(async {
+        device.push([&[0x80][..], &KEY].concat()).await;
+        device.settle().await;
+        device.push(vec![4, 0, 0, 0, 0]).await;
+        device.settle().await;
+    })
+    .await;
+    assert_eq!(
+        lines,
+        [
+            "WARN:could not update contacts: device error 4 (ERR_CODE_BAD_STATE)",
+            "WARN:end of a contact list that did not start"
+        ]
+    );
+}
+
+/// A contact set to zero-hop for an anonymous request that cannot be set
+/// back to flood: after the request, after a change without an answer, in
+/// the background after a request given up halfway, and without a runtime to
+/// do it in. Lines of the library's own: meshcore_py does not set it back in
+/// the second and third case, and does not look at the answer in the first.
+async fn paths_not_set_back() {
+    let changes = AtomicU32::new(0);
+    let requests = AtomicU32::new(0);
+    let options = Options {
+        default_timeout: Duration::from_secs(1),
+        ..Options::default()
+    };
+    let (mc, device) = client(options, move |cmd| match cmd[0] {
+        30 => vec![contact_frame(3, KEY, "Rep", 0xff, &[])],
+        // the second change to zero-hop gets no answer
+        9 if changes.fetch_add(1, Ordering::SeqCst) == 1 => vec![],
+        9 => vec![ok()],
+        // only the first request is confirmed
+        57 if requests.fetch_add(1, Ordering::SeqCst) == 0 => vec![sent_frame(false, 0x57, 1000)],
+        13 => vec![err(2)],
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    let key = PublicKey::new(KEY);
+    let request = || mc.send_anon_req(&key, AnonReqType::Owner, RequestOptions::default());
+    let zero_hop = "INFO:No path set trying zero hop";
+    let not_back = "WARN:could not reset the path to flood: device error 2 (ERR_CODE_NOT_FOUND)";
+    let lines = lines_of(async {
+        request().await.unwrap();
+        assert!(matches!(request().await, Err(Error::Timeout)));
+        let given_up = tokio::time::timeout(Duration::from_millis(500), request()).await;
+        assert!(given_up.is_err());
+        device.settle().await;
+    })
+    .await;
+    let aborted = "ERROR:Could not set zero-hop path, aborting anon request";
+    assert_eq!(
+        lines,
+        [
+            zero_hop, not_back, zero_hop, not_back, aborted, zero_hop, not_back
+        ]
+    );
+
+    let lines = lines_of(async {
+        let mut pending = Box::pin(request());
+        // until the request waits for the device to take it
+        let sent = device.commands_with(57).len();
+        while device.commands_with(57).len() == sent {
+            assert!(!poll_once(&mut pending).await);
+            device.settle().await;
+        }
+        std::thread::scope(|scope| {
+            scope.spawn(move || drop(pending));
+        });
+    })
+    .await;
+    let no_runtime = format!("WARN:no runtime to reset the path of {key} to flood");
+    assert_eq!(lines, [zero_hop.to_string(), no_runtime]);
+}
+
+/// A frame longer than the firmware takes, written on a link of its own (the
+/// client refuses it before). On real time.
+async fn long_frame() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let peer = tokio::spawn(async move { listener.accept().await.unwrap() });
+    let mut link = TcpTransport::new("127.0.0.1", port).open().await.unwrap();
+    let _peer = peer.await.unwrap();
+    let lines = lines_of(async {
+        link.writer.write_frame(&[0; 177]).await.unwrap();
+    })
+    .await;
+    assert_eq!(
+        lines,
+        ["WARN:sending a 177 byte frame, the firmware takes at most 176"]
+    );
+}
+
 /// A lost link gets a line of the library's own; meshcore_py logs it below
 /// info level.
 async fn lost_link() {
@@ -221,18 +378,26 @@ async fn lost_link() {
 }
 
 /// A subscriber that falls more than the event buffer (1024 by default)
-/// behind loses the oldest events, with a warning of the library's own.
+/// behind loses the oldest events, with a warning of the library's own, also
+/// one that does not wait (as `send_msg_with_retry` looks for ACKs).
 async fn lagging_subscriber(mc: &MeshCore, device: &Device) {
-    let mut events = mc.subscribe();
-    let lines = lines_of(async {
-        for _ in 0..1100 {
-            device.push(vec![0x83]).await;
-        }
-        device.settle().await;
-        assert!(matches!(events.recv().await, Some(Event::MessagesWaiting)));
-    })
-    .await;
-    assert_eq!(lines, ["WARN:event subscriber fell behind, 76 events lost"]);
+    for waits in [true, false] {
+        let mut events = mc.subscribe();
+        let lines = lines_of(async {
+            for _ in 0..1100 {
+                device.push(vec![0x83]).await;
+            }
+            device.settle().await;
+            let next = if waits {
+                events.recv().await
+            } else {
+                events.try_recv()
+            };
+            assert!(matches!(next, Some(Event::MessagesWaiting)));
+        })
+        .await;
+        assert_eq!(lines, ["WARN:event subscriber fell behind, 76 events lost"]);
+    }
 }
 
 /// Anonymous requests: the contact cannot be read, its path cannot be set to
@@ -510,7 +675,8 @@ async fn serial_links() {
 
 /// Messages retried, sent without an ACK or refused, and a command to a node
 /// of unknown type, on a device that sends "hi" but never acknowledges it,
-/// refuses "full" and does not answer "silent".
+/// refuses "full", does not answer "silent", answers "cut" with a `MSG_SENT`
+/// cut short and refuses "bare" without an error code.
 async fn messages_and_commands(mc: &MeshCore, key: &PublicKey) {
     let once = RetryOptions {
         max_attempts: 1,
@@ -543,13 +709,23 @@ async fn messages_and_commands(mc: &MeshCore, key: &PublicKey) {
             mc.send_msg_with_retry(key, "silent", once).await.unwrap(),
             None
         );
+        for text in ["cut", "bare"] {
+            assert_eq!(mc.send_msg_with_retry(key, text, once).await.unwrap(), None);
+        }
     })
     .await;
+    // the payloads of meshcore_py's error events: an error code, none (a
+    // timeout), a reply that could not be read (whose own line meshcore_py
+    // logs below info level), an error reply without a code
     assert_eq!(
         lines,
         [
             "ERROR:Failed to send message: {'error_code': 3, 'code_string': 'ERR_CODE_TABLE_FULL'}",
-            "ERROR:Failed to send message: {'reason': 'no_event_received'}"
+            "ERROR:Failed to send message: {'reason': 'no_event_received'}",
+            "ERROR:handle_rx parse error: packet type 0x06, 4 bytes: protocol error: \
+             invalid_frame_length",
+            "ERROR:Failed to send message: {'reason': 'invalid_frame_length'}",
+            "ERROR:Failed to send message: {}"
         ]
     );
 
@@ -573,11 +749,15 @@ async fn lines_read_as_meshcore_py() {
     log::set_max_level(log::LevelFilter::Info);
     silent_tcp_node().await;
     failed_tcp_write().await;
+    long_frame().await;
     tokio::time::pause();
     #[cfg(unix)]
     serial_links().await;
     command_without_a_link().await;
     lost_link().await;
+    failed_reconnects().await;
+    contact_updates_that_fail().await;
+    paths_not_set_back().await;
     anonymous_requests().await;
     refused_sign_chunk().await;
     retries_without_the_reset().await;
@@ -589,6 +769,8 @@ async fn lines_read_as_meshcore_py() {
         // no answer at all
         2 if cmd.ends_with(b"hi") => vec![sent_frame(false, 0x200, 500)],
         2 if cmd.ends_with(b"silent") => vec![],
+        2 if cmd.ends_with(b"cut") => vec![vec![6, 0, 1, 2]],
+        2 if cmd.ends_with(b"bare") => vec![vec![1]],
         2 => vec![err(3)],
         13 => vec![ok()],
         50 => vec![

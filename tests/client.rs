@@ -3555,6 +3555,7 @@ async fn texts_longer_than_the_firmware_takes_are_refused() {
     ));
     assert!(refused(mc.send_control_data(0x10, &[1]).await));
     assert!(refused(mc.send_raw_packet(&[0x11]).await));
+    assert!(refused(mc.send_raw_data(&[1, 2, 3], &[], 0).await));
     assert!(refused(mc.import_contact(&[0; 97]).await));
     // an empty channel message the firmware sends as "Node: "
     mc.send_chan_msg(0, "", None).await.unwrap();
@@ -3578,7 +3579,7 @@ async fn texts_longer_than_the_firmware_takes_are_refused() {
     assert_eq!(device.commands_with(8).len(), 0);
     assert_eq!(device.commands_with(66).len(), 0);
     assert_eq!(device.commands_with(41).len(), 0);
-    for code in [55, 65, 18, 26, 32, 63, 9] {
+    for code in [55, 65, 25, 18, 26, 32, 63, 9] {
         assert_eq!(device.commands_with(code).len(), 0);
     }
 }
@@ -4168,6 +4169,47 @@ async fn auto_fetch_goes_on_after_connecting_again() {
     queue.lock().unwrap().push(private_message(b"after"));
     device.push(vec![0x83]).await;
     assert_eq!(next_message(&mut events).await, "after");
+}
+
+#[tokio::test(start_paused = true)]
+async fn auto_fetch_stays_on_through_connects_that_fail() {
+    // the device does not answer APP_START (as while it boots), or its port is
+    // still held by the link before; the next connect that works fetches again
+    // (meshcore_py stops the fetching when it cannot open the link)
+    let answers = Arc::new(AtomicBool::new(true));
+    let queue = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let (mc, device) = client_on_device(Options::default(), {
+        let (answers, queue) = (Arc::clone(&answers), Arc::clone(&queue));
+        move |cmd| match cmd[0] {
+            1 if answers.load(Ordering::SeqCst) => vec![self_info_frame("Node")],
+            10 => vec![queue.lock().unwrap().pop().unwrap_or_else(|| vec![10])],
+            _ => vec![],
+        }
+    });
+    device.one_link_at_a_time();
+    mc.connect().await.unwrap();
+    mc.start_auto_message_fetching();
+    device.settle().await;
+    let mut events = mc.subscribe();
+    for failure in ["no answer", "port in use"] {
+        if failure == "no answer" {
+            answers.store(false, Ordering::SeqCst);
+            assert!(matches!(mc.connect().await, Err(Error::Timeout)));
+            answers.store(true, Ordering::SeqCst);
+        } else {
+            mc.connect().await.unwrap();
+            // the link takes longer to close than a connect waits for it
+            device.slow_close(Duration::from_secs(7));
+            assert!(matches!(mc.connect().await, Err(Error::Io(_))));
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+        queue
+            .lock()
+            .unwrap()
+            .push(private_message(failure.as_bytes()));
+        mc.connect().await.unwrap();
+        assert_eq!(next_message(&mut events).await, failure);
+    }
 }
 
 #[tokio::test(start_paused = true)]

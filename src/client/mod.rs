@@ -469,17 +469,27 @@ impl MeshCore {
         config: crate::transport::serial::SerialConfig,
         options: Options,
     ) -> Result<Self> {
-        use crate::transport::serial::SerialTransport;
+        let port = crate::transport::serial::SerialTransport::new;
+        Self::create_serial_on(config, options, port).await
+    }
+
+    /// [`create_serial`](Self::create_serial) on the transport `port` gives
+    /// for each try's settings.
+    async fn create_serial_on<T: Transport>(
+        config: crate::transport::serial::SerialConfig,
+        options: Options,
+        port: impl Fn(crate::transport::serial::SerialConfig) -> T,
+    ) -> Result<Self> {
         // Only a node that does not answer is retried; a port that cannot be
         // opened fails at once. The log texts are meshcore_py's.
         let mut config = config;
-        let mut client = Self::new(SerialTransport::new(config.clone()), options.clone());
+        let mut client = Self::new(port(config.clone()), options.clone());
         let mut result = client.connect().await;
         if client.no_answer(&result) && config.dtr.is_none() {
             log::info!(target: "meshcore", "No response from meshcore node, trying to force DTR = True");
             config.dtr = Some(true);
             tokio::time::sleep(Duration::from_secs(1)).await;
-            client = Self::new(SerialTransport::new(config.clone()), options.clone());
+            client = Self::new(port(config.clone()), options.clone());
             result = client.connect().await;
         }
         if client.no_answer(&result) {
@@ -491,7 +501,7 @@ impl MeshCore {
             );
             config.dtr = Some(dtr);
             tokio::time::sleep(Duration::from_secs(1)).await;
-            client = Self::new(SerialTransport::new(config), options);
+            client = Self::new(port(config), options);
             result = client.connect().await;
         }
         if client.no_answer(&result) {
@@ -574,7 +584,8 @@ impl MeshCore {
     /// # Errors
     ///
     /// The link cannot be opened, or the device does not answer `APP_START`
-    /// (the client is disconnected then, as by [`disconnect`](Self::disconnect)).
+    /// (the link is taken down again then). Automatic message fetching stays
+    /// on either way and goes on with the next `connect` that works.
     /// [`Error::NotConnected`] or [`Error::ConnectionLost`] when a
     /// `disconnect` or another `connect` came in meanwhile, which counts then.
     pub async fn connect(&self) -> Result<SelfInfo> {
@@ -587,7 +598,7 @@ impl MeshCore {
                 Ok(info)
             }
             Err(err) => {
-                let (_, closed) = self.take_down(Some(generation), true);
+                let (_, closed) = self.take_down(Some(generation), false);
                 closed.await;
                 Err(err)
             }
@@ -1407,15 +1418,23 @@ async fn wait_event(
     }
 }
 
+/// The reason of an error reply without its code byte.
+const NO_ERROR_CODE: &str = "error reply without a code";
+
 /// The payload meshcore_py logs for a command that failed with `err`: the
-/// device's error code, or `no_event_received` for anything else (a timeout
-/// or a link that dropped, which meshcore_py only sees as missing replies).
+/// device's error code, none for an error reply without one, the reason a
+/// reply could not be read (as for a `MSG_SENT` cut short; for other replies
+/// meshcore_py adds their packet type, which the error does not carry), or
+/// `no_event_received` for anything else (a timeout or a link that dropped,
+/// which meshcore_py only sees as missing replies).
 fn python_payload(err: &Error) -> String {
     match err {
         Error::Device(code) => match code.name() {
             Some(name) => format!("{{'error_code': {}, 'code_string': '{name}'}}", code.code()),
             None => format!("{{'error_code': {}}}", code.code()),
         },
+        Error::Protocol(reason) if reason == NO_ERROR_CODE => "{}".to_string(),
+        Error::Protocol(reason) => format!("{{'reason': '{reason}'}}"),
         _ => "{'reason': 'no_event_received'}".to_string(),
     }
 }
@@ -1424,7 +1443,7 @@ fn error_from_info(info: ErrorInfo) -> Error {
     match (info.code, info.reason) {
         (Some(code), _) => Error::Device(code),
         (None, Some(reason)) => Error::Protocol(reason),
-        (None, None) => Error::protocol("error reply without a code"),
+        (None, None) => Error::protocol(NO_ERROR_CODE),
     }
 }
 
@@ -1438,3 +1457,125 @@ macro_rules! reply {
     };
 }
 pub(crate) use reply;
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use super::*;
+    use crate::transport::BoxFuture;
+    use crate::transport::serial::SerialConfig;
+
+    thread_local! {
+        /// The lines logged on this thread at info level and above, as
+        /// `LEVEL:message` (the other tests log on threads of their own).
+        static LINES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    struct Capture;
+
+    impl log::Log for Capture {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.target() == "meshcore" && metadata.level() <= log::Level::Info
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                let line = format!("{}:{}", record.level(), record.args());
+                LINES.with_borrow_mut(|lines| lines.push(line));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    static CAPTURE: Capture = Capture;
+
+    /// A port whose node never answers: the link takes every frame and stays
+    /// up until it is closed.
+    struct Unanswered;
+
+    struct Swallow(Option<mpsc::Sender<LinkEvent>>);
+
+    impl Transport for Unanswered {
+        fn open(&self) -> BoxFuture<'_, Result<Link>> {
+            Box::pin(async {
+                let (sender, events) = mpsc::channel(4);
+                Ok(Link {
+                    info: "port".into(),
+                    events,
+                    writer: Box::new(Swallow(Some(sender))),
+                })
+            })
+        }
+
+        fn describe(&self) -> String {
+            "port".into()
+        }
+    }
+
+    impl FrameWriter for Swallow {
+        fn write_frame<'a>(&'a mut self, _frame: &'a [u8]) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn close(&mut self) -> BoxFuture<'_, ()> {
+            self.0 = None;
+            Box::pin(async {})
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serial_tries_again_with_dtr_set_then_inverted() {
+        // as meshcore_py's create_serial: a second apart, with its lines
+        let _ = log::set_logger(&CAPTURE);
+        log::set_max_level(log::LevelFilter::Info);
+        let gave_up = [
+            "ERROR:No response from meshcore node, disconnecting",
+            "ERROR:Are you sure your node is a serial companion ?",
+        ];
+        let force = "INFO:No response from meshcore node, trying to force DTR = True";
+        let invert =
+            |now| format!("INFO:No response from meshcore node, trying to invert dtr (now {now})");
+        // DTR as configured, the DTR of each try, the lines before giving up
+        let cases = [
+            (
+                None,
+                vec![None, Some(true), Some(false)],
+                vec![force.to_string(), invert("False")],
+            ),
+            (
+                Some(true),
+                vec![Some(true), Some(false)],
+                vec![invert("False")],
+            ),
+            (
+                Some(false),
+                vec![Some(false), Some(true)],
+                vec![invert("True")],
+            ),
+        ];
+        for (dtr, tries, retried) in cases {
+            LINES.with_borrow_mut(Vec::clear);
+            let tried = StdMutex::new(Vec::new());
+            let port = |config: SerialConfig| {
+                lock(&tried).push(config.dtr);
+                Unanswered
+            };
+            let started = Instant::now();
+            let config = SerialConfig::new("/dev/ttyUSB0").dtr(dtr);
+            let result = MeshCore::create_serial_on(config, Options::default(), port).await;
+            assert!(matches!(result, Err(Error::Timeout)), "{result:?}");
+            assert_eq!(*lock(&tried), tries);
+            // each try waits 2 s for the answer to APP_START, the next comes a
+            // second later
+            let waits = 2 * tries.len() + tries.len() - 1;
+            assert_eq!(started.elapsed(), Duration::from_secs(waits as u64));
+            let lines = LINES.with_borrow_mut(std::mem::take);
+            assert_eq!(
+                lines,
+                [retried, gave_up.map(String::from).to_vec()].concat()
+            );
+        }
+    }
+}

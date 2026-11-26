@@ -159,6 +159,14 @@ impl State {
                         frame.len()
                     );
                 }
+                // A list coming in lacks the contact that could not be read,
+                // whichever it was: the list does not count as read, and the
+                // next one is a full one.
+                if packet_type == PacketType::Contact && self.building.is_some() {
+                    self.discount_list();
+                    self.contacts_lastmod = 0;
+                    self.contacts_changed();
+                }
                 // A reply answers the command in flight, so its caller learns
                 // at once. A push came unasked: an error for it would end an
                 // unrelated command, so it is only logged.
@@ -1151,6 +1159,28 @@ mod tests {
             state.reset_contact_path(&PublicKey::new([1; 32]));
             state.handle_frame(&end_frame(30));
             assert!(state.contacts_listed && !state.contacts_dirty);
+        }
+    }
+
+    #[test]
+    fn a_contact_of_a_list_that_cannot_be_read_has_the_contacts_read_in_full() {
+        // the list lacks it, whichever contact it was; its request fails, but
+        // the list goes on to its end
+        let mut state = State::new();
+        feed_list(&mut state, 0, 1, &[(1, "a")], 30);
+        assert!(!state.contacts_dirty);
+        for since in [0, 30] {
+            state.contacts_request_since = Some(since);
+            state.handle_frame(&[2, 1, 0, 0, 0]);
+            let cut = contact_frame(3, 1, "a2");
+            assert_eq!(state.handle_frame(&cut[..50])[0].kind(), EventKind::Error);
+            state.handle_frame(&end_frame(40));
+            assert!(state.contacts_dirty, "since {since}");
+            assert_eq!(state.contacts_lastmod, 0, "since {since}");
+            // a full list puts it right
+            feed_list(&mut state, 0, 1, &[(1, "a2")], 40);
+            assert!(!state.contacts_dirty);
+            assert_eq!(state.contacts[0].name, "a2");
         }
     }
 

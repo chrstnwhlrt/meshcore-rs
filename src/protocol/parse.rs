@@ -568,8 +568,8 @@ pub(crate) fn acl(data: &[u8]) -> Vec<AclEntry> {
         .collect()
 }
 
-/// A min/max/average answer: the sensor's clock, then the series (from
-/// offset 4 also when the clock is cut short, as meshcore_py reads them).
+/// A min/max/average answer: the sensor's clock (4 bytes), then the series,
+/// which meshcore_py reads from offset 4 too.
 pub(crate) fn mma(data: &[u8], pubkey_prefix: [u8; 6], tag: u32) -> MmaResponse {
     let timestamp = ByteReader::new(data).opt_u32();
     let (entries, undecoded) = parse_mma(data.get(4..).unwrap_or_default());
