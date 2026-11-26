@@ -1,5 +1,6 @@
 {"type":"command_ok","payload":{}}
 {"type":"command_ok","payload":{"value":1234}}
+{"type":"command_ok","payload":{}}
 {"type":"command_error","payload":{"error_code":6,"code_string":"ERR_CODE_ILLEGAL_ARG"}}
 {"type":"command_error","payload":{"error_code":42}}
 {"type":"self_info","payload":{"adv_type":1,"tx_power":247,"max_tx_power":22,"public_key":"2222222222222222222222222222222222222222222222222222222222222222","adv_lat":53.5511,"adv_lon":9.9937,"multi_acks":0,"adv_loc_policy":1,"telemetry_mode_env":2,"telemetry_mode_loc":1,"telemetry_mode_base":2,"manual_add_contacts":true,"radio_freq":869.525,"radio_bw":250.0,"radio_sf":11,"radio_cr":5,"name":"MyNode"}}

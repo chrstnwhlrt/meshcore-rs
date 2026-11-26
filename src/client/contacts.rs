@@ -255,6 +255,8 @@ impl MeshCore {
             Some(mode) => mode,
             None => self.get_path_hash_mode().await?,
         };
+        // Before the hops: a reserved mode says nothing about their size.
+        PathLen::new(0, hash_mode)?;
         let hash_size = usize::from(hash_mode) + 1;
         if !path.len().is_multiple_of(hash_size) {
             return Err(Error::invalid(format!(

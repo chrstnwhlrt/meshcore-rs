@@ -208,9 +208,8 @@ fn a_companion_is_found_by_address_and_name() {
 
 #[test]
 fn later_links_go_to_the_companion_found_first() {
-    // as in meshcore_py, which keeps the address of the device it found:
     // a reconnect and another connect do not look for the name again, which
-    // may find another device
+    // may find another device; meshcore_py does so once a link went down
     run(later_links_go_to_the_companion_found_first, async |bluez| {
         let options = Options {
             auto_reconnect: true,
@@ -230,6 +229,28 @@ fn later_links_go_to_the_companion_found_first() {
         let lost = "INFO:connection lost: ble_disconnect";
         assert_eq!(logged(), [lost, started, started]);
         assert_eq!(mc.connection_info().as_deref(), Some(ADDRESS));
+    });
+}
+
+#[test]
+fn a_clone_of_the_transport_finds_its_device_anew() {
+    // the device found belongs to the client that found it
+    run(a_clone_of_the_transport_finds_its_device_anew, async |_| {
+        let transport = BleTransport::new(BleConfig::new("Node"));
+        let clone = transport.clone();
+        let mc = MeshCore::new(transport, Options::default());
+        mc.connect().await.unwrap();
+        mc.disconnect().await.unwrap();
+        let other = MeshCore::new(clone, Options::default());
+        other.connect().await.unwrap();
+        works(&other).await;
+        let found = format!("INFO:Found device: {ADDRESS}: {NAME}");
+        let search = [
+            "INFO:Scanning for devices...",
+            &found,
+            "INFO:BLE Connection started",
+        ];
+        assert_eq!(logged(), [search, search].concat());
     });
 }
 

@@ -22,6 +22,8 @@ frames = []
 add = frames.append
 add(b'\x00')
 add(b'\x00' + u32(1234))
+# a value only in a frame of 5 bytes
+add(b'\x00' + u32(1234) + b'\x00')
 add(b'\x01\x06')
 add(b'\x01\x2a')
 si = bytes([5, 1, 0xf7, 22]) + bytes([0x22]) * 32 + i32(53551100) + i32(9993700) + bytes([0, 1, 0b100110, 1]) + u32(869525) + u32(250000) + bytes([11, 5]) + b'MyNode'

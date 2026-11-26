@@ -4,9 +4,10 @@
 //! Each write to the RX characteristic is one frame and each notification of
 //! the TX characteristic is one frame, so no framing bytes are added. As in
 //! meshcore_py's `BLEConnection`, the device is found by its address, by a
-//! part of its name or as the first MeshCore device in range, and the later
-//! links go to the device found; frames are written with response, and a
-//! write that does not finish within 10 s takes the link down.
+//! part of its name or as the first MeshCore device in range; frames are
+//! written with response, and a write that does not finish within 10 s takes
+//! the link down. The later links go to the device found, where meshcore_py
+//! searches again once a link went down.
 //!
 //! MeshCore takes frames only over a paired link. A PIN pairs a device that is
 //! not paired yet, and pairs it anew when it has forgotten the pairing (after
@@ -91,8 +92,11 @@ const LINK_END_WAIT: Duration = Duration::from_secs(1);
 pub struct BleConfig {
     /// The device: its address (`AA:BB:CC:DD:EE:FF`), a part of its name, or
     /// `None` for the first MeshCore device in range. As in meshcore_py, text
-    /// with a `:` is taken for an address, and once a device was found, the
-    /// later links (a reconnect, another `connect`) go to its address.
+    /// with a `:` is taken for an address. Once the transport found a device,
+    /// its later links (a reconnect, another `connect`) go to that device's
+    /// address. meshcore_py searches again once a link went down, so with a
+    /// part of a name or none it can reach another device than the one it
+    /// lost.
     pub address: Option<String>,
     /// The PIN to pair with (six digits at most) when the device is not paired
     /// yet, or has forgotten the pairing (shown on the device's display, or
@@ -554,16 +558,26 @@ async fn uart_characteristics(device: &Device) -> Result<(Characteristic, Charac
     )))
 }
 
-/// Connects over BLE.
-#[derive(Clone)]
+/// Connects over BLE. A clone has the same settings and finds its device
+/// anew.
 pub struct BleTransport {
     config: BleConfig,
     /// The D-Bus session to BlueZ, made on the first open and kept for
-    /// reconnecting.
+    /// reconnecting (and shared with clones).
     session: Arc<OnceCell<Session>>,
-    /// The address of the device found first, which the later links go to,
-    /// as in meshcore_py: looking for the name again may find another one.
-    found: Arc<Mutex<Option<Address>>>,
+    /// The address of the device found first, which the later links go to:
+    /// looking for the name again may find another one.
+    found: Mutex<Option<Address>>,
+}
+
+impl Clone for BleTransport {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            session: Arc::clone(&self.session),
+            found: Mutex::default(),
+        }
+    }
 }
 
 impl fmt::Debug for BleTransport {
@@ -581,7 +595,7 @@ impl BleTransport {
         Self {
             config,
             session: Arc::default(),
-            found: Arc::default(),
+            found: Mutex::default(),
         }
     }
 

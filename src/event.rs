@@ -62,8 +62,8 @@ pub enum Event {
     },
     /// A command succeeded (`command_ok`).
     Ok {
-        /// The 32-bit value of a longer frame (meshcore_py reads it too; the
-        /// firmware sends none).
+        /// The 32-bit value of a frame of 5 bytes (meshcore_py reads it too;
+        /// the firmware sends none).
         value: Option<u32>,
     },
     /// A command failed (`command_error`).

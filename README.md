@@ -19,7 +19,7 @@ and keeps its command names, event types and payload fields.
 
 The library follows meshcore_py 2.3.19 and the companion protocol of firmware
 1.18.0, including paths with 2 and 3 byte hashes per hop. The parser covers every
-response and push code that firmware sends. A parity test runs the same 70 device
+response and push code that firmware sends. A parity test runs the same 71 device
 frames through meshcore_py and through this library, with channel log decryption
 on and a binary request of each kind waiting for its answer, and compares the
 JSON of the resulting events; they match except for the deliberate fixes listed
@@ -128,9 +128,9 @@ take one for its own.
 
 `MeshCore::create_ble` (feature `ble`) finds a companion by its address, by a
 part of its name (it advertises as `MeshCore-<node name>`) or as the first one
-in range, as meshcore_py does, and as there a reconnect or a later `connect`
-goes to the device found first, by its address. A companion advertises only
-while no other app (such as the phone app) is connected to it over BLE.
+in range, as meshcore_py does. A reconnect or a later `connect` goes to the
+device found first, by its address. A companion advertises only while no other
+app (such as the phone app) is connected to it over BLE.
 
 ```rust ignore
 use meshcore::{BleConfig, MeshCore, Options};
@@ -458,8 +458,9 @@ meshcore_py leaves a gap:
   which the device may have taken anyway. meshcore_py leaves it at zero-hop in
   both cases.
 - `req_owner_sync` takes an answer without a line break for the name alone,
-  with no owner info; meshcore_py fails on it with an `IndexError`.
-  Repeaters always send the line break.
+  with no owner info, and `req_owner_info_sync` leaves the fields empty that
+  an answer with fewer than two line breaks lacks; meshcore_py fails on both
+  with an `IndexError`. Repeaters always send the line breaks.
 - `set_channel` keeps the channel's secret for the RX log as `get_channel`
   does; meshcore_py learns secrets from `get_channel` only.
 - An RX log packet that was logged before its channel was known, or while
@@ -576,6 +577,12 @@ meshcore_py leaves a gap:
   `host:port`, where meshcore_py gives the host only, and connecting gives up
   after 10 s (`TcpTransport::connect_timeout`), where meshcore_py waits as
   long as the system does.
+- Over BLE, a reconnect or a later `connect` goes to the device found first,
+  by its address. meshcore_py keeps that device only for the attempts before a
+  link is made. Once a link went down, it searches again by the part of the
+  name it was given, or for the first device in range, and can reach another
+  device than the one it lost, although its comment says it reconnects to the
+  same one.
 - A BLE scan or name search also finds a device this computer is still
   connected to, for example right after another program let go of it;
   meshcore_py finds only advertising devices and misses it for a few seconds.
@@ -583,9 +590,10 @@ meshcore_py leaves a gap:
   connected to fails with `Error::DeviceInUse`; meshcore_py joins that link,
   and both programs then get each other's frames.
 - Over BLE, a device that is not paired needs the PIN, and one that forgot
-  its pairing (flashed anew) is paired again with it; meshcore_py leaves the
-  pairing to the desktop's agent and keeps reconnecting to a device that
-  forgot it for 60 s.
+  its pairing (flashed anew) is paired again with it. meshcore_py leaves the
+  pairing to the desktop's agent (bleak gets no PIN from it) and does not pair
+  a device again that BlueZ holds as paired, so one that forgot its pairing
+  stays unusable until it is removed from BlueZ.
 - BLE works on Linux only (through BlueZ); meshcore_py's BLE (through bleak)
   also runs on macOS and Windows.
 

@@ -21,7 +21,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use meshcore::{Error, ErrorCode, Event, MeshCore, Options};
 
-const USAGE: &str = "usage: check serial PORT | tcp HOST:PORT | ble [ADDRESS|NAME] [--pin PIN] | scan [SECONDS]  [--watch]";
+const USAGE: &str = "\
+usage: check serial PORT [--watch]
+       check tcp HOST:PORT [--watch]
+       check ble [ADDRESS|NAME] [--pin PIN] [--watch]
+       check scan [SECONDS]";
+
+#[cfg(not(all(feature = "ble", target_os = "linux")))]
+const NO_BLE: &str = "ble and scan work only on Linux, built with the ble feature \
+                      (cargo run --example check --features ble -- ble ...)";
 
 struct StderrLogger;
 
@@ -55,50 +63,93 @@ fn init_log() {
     }
 }
 
-/// The value after `flag`, if given.
-#[cfg(all(feature = "ble", target_os = "linux"))]
-fn value_of<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-    let at = args.iter().position(|arg| arg == flag)?;
-    args.get(at + 1).map(String::as_str)
+/// What the command line asks for.
+enum Command {
+    /// Check the device, then stay connected if the flag says so.
+    Check(Target, bool),
+    /// Look for devices for this many seconds.
+    #[cfg(all(feature = "ble", target_os = "linux"))]
+    Scan(u64),
 }
 
-async fn connect(args: &[String], options: Options) -> Result<MeshCore, String> {
-    let fail = |err: Error| err.to_string();
-    match args.first().map(String::as_str) {
-        Some("serial") => {
-            let port = args.get(1).ok_or(USAGE)?;
-            MeshCore::create_serial(meshcore::SerialConfig::new(port.as_str()), options)
-                .await
-                .map_err(fail)
-        }
-        Some("tcp") => {
-            let target = args.get(1).ok_or(USAGE)?;
+/// The device to check.
+enum Target {
+    Serial(String),
+    Tcp(String, u16),
+    #[cfg(all(feature = "ble", target_os = "linux"))]
+    Ble(meshcore::BleConfig),
+}
+
+/// Reads the command line. What it does not know is refused, so that a typo
+/// in a flag is not passed over.
+fn parse(args: &[String]) -> Result<Command, String> {
+    let watch = args.iter().any(|arg| arg == "--watch");
+    let args: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|arg| *arg != "--watch")
+        .collect();
+    let target = match args.as_slice() {
+        ["serial", port] => Target::Serial((*port).into()),
+        ["tcp", target] => {
             let (host, port) = target.rsplit_once(':').ok_or(USAGE)?;
             let port = port.parse().map_err(|_| format!("{port} is not a port"))?;
-            MeshCore::create_tcp(host, port, options)
-                .await
-                .map_err(fail)
+            Target::Tcp(host.into(), port)
         }
         #[cfg(all(feature = "ble", target_os = "linux"))]
-        Some("ble") => {
-            let pin = value_of(args, "--pin")
-                .map(str::parse)
-                .transpose()
-                .map_err(|_| "the PIN is a number".to_string())?;
-            let config = meshcore::BleConfig {
-                address: args.get(1).filter(|arg| !arg.starts_with("--")).cloned(),
-                pin,
-                ..meshcore::BleConfig::default()
-            };
-            MeshCore::create_ble(config, options).await.map_err(fail)
+        ["ble", rest @ ..] => Target::Ble(ble_config(rest)?),
+        #[cfg(all(feature = "ble", target_os = "linux"))]
+        ["scan"] if !watch => return Ok(Command::Scan(10)),
+        #[cfg(all(feature = "ble", target_os = "linux"))]
+        ["scan", seconds] if !watch => {
+            let seconds = seconds
+                .parse()
+                .map_err(|_| format!("{seconds} is not a number of seconds"))?;
+            return Ok(Command::Scan(seconds));
         }
-        _ => Err(USAGE.into()),
+        #[cfg(not(all(feature = "ble", target_os = "linux")))]
+        ["ble" | "scan", ..] => return Err(NO_BLE.into()),
+        _ => return Err(USAGE.into()),
+    };
+    Ok(Command::Check(target, watch))
+}
+
+/// The arguments after `ble`: an address or a part of the name, then the PIN.
+#[cfg(all(feature = "ble", target_os = "linux"))]
+fn ble_config(args: &[&str]) -> Result<meshcore::BleConfig, String> {
+    let (address, pin) = match args {
+        [] => (None, None),
+        ["--pin", pin] => (None, Some(*pin)),
+        [address] => (Some(*address), None),
+        [address, "--pin", pin] => (Some(*address), Some(*pin)),
+        _ => return Err(USAGE.into()),
+    };
+    if address.is_some_and(|address| address.starts_with("--")) {
+        return Err(USAGE.into());
+    }
+    let pin = pin
+        .map(|pin| pin.parse().map_err(|_| format!("{pin} is not a PIN")))
+        .transpose()?;
+    Ok(meshcore::BleConfig {
+        address: address.map(str::to_string),
+        pin,
+        ..meshcore::BleConfig::default()
+    })
+}
+
+async fn connect(target: Target, options: Options) -> meshcore::Result<MeshCore> {
+    match target {
+        Target::Serial(port) => {
+            MeshCore::create_serial(meshcore::SerialConfig::new(port), options).await
+        }
+        Target::Tcp(host, port) => MeshCore::create_tcp(host, port, options).await,
+        #[cfg(all(feature = "ble", target_os = "linux"))]
+        Target::Ble(config) => MeshCore::create_ble(config, options).await,
     }
 }
 
 #[cfg(all(feature = "ble", target_os = "linux"))]
-async fn scan(args: &[String]) -> ExitCode {
-    let seconds = args.get(1).and_then(|arg| arg.parse().ok()).unwrap_or(10);
+async fn scan(seconds: u64) -> ExitCode {
     println!("scanning for {seconds} s ...");
     match meshcore::transport::ble::scan(Duration::from_secs(seconds)).await {
         Ok(devices) if devices.is_empty() => {
@@ -274,17 +325,21 @@ async fn watch(mc: &MeshCore) {
 static PASSED: OnceLock<bool> = OnceLock::new();
 
 async fn run(args: &[String]) -> ExitCode {
-    #[cfg(all(feature = "ble", target_os = "linux"))]
-    if args.first().is_some_and(|arg| arg == "scan") {
-        return scan(args).await;
-    }
-    let watching = args.iter().any(|arg| arg == "--watch");
+    let (target, watching) = match parse(args) {
+        Ok(Command::Check(target, watching)) => (target, watching),
+        #[cfg(all(feature = "ble", target_os = "linux"))]
+        Ok(Command::Scan(seconds)) => return scan(seconds).await,
+        Err(err) => {
+            println!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
     let options = Options {
         auto_reconnect: watching,
         ..Options::default()
     };
     let started = Instant::now();
-    let mc = match connect(args, options).await {
+    let mc = match connect(target, options).await {
         Ok(mc) => mc,
         Err(err) => {
             println!(

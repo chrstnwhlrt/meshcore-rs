@@ -1014,12 +1014,18 @@ async fn paths_the_length_byte_cannot_describe_are_refused() {
             .await
             .map(drop)
     ));
-    // hash mode 3 (4-byte hashes) is reserved
+    // hash mode 3 (4-byte hashes) is reserved, and that is the reason also
+    // for a path that would be no whole number of such hops
     assert!(refused(
         mc.change_contact_path(&contact, &[1, 2, 3, 4], Some(3))
             .await
             .map(drop)
     ));
+    let reason = mc.change_contact_path(&contact, &[1, 2], Some(3)).await;
+    assert!(
+        matches!(&reason, Err(Error::InvalidArgument(reason)) if reason == "hash mode 3, at most 2"),
+        "{reason:?}"
+    );
     // a length byte announcing 2 hops for a path of 1 byte
     let mut mismatched = contact.clone();
     mismatched.out_path_len = PathLen::new(2, 0).unwrap();
@@ -1041,6 +1047,13 @@ async fn paths_the_length_byte_cannot_describe_are_refused() {
         mc.send_channel_data(1, 1, &[1], Some(&[1, 2, 3]), 1).await
     ));
     assert!(refused(mc.send_raw_data(&[1, 2, 3, 4], &[7; 64], 0).await));
+    let reserved = |result: meshcore::Result<()>| matches!(&result, Err(Error::InvalidArgument(reason)) if reason == "hash mode 3, at most 2");
+    for path in [&[1, 2, 3, 4][..], &[1, 2]] {
+        assert!(reserved(
+            mc.send_channel_data(1, 1, &[1], Some(path), 3).await
+        ));
+        assert!(reserved(mc.send_raw_data(&[1, 2, 3, 4], path, 3).await));
+    }
     assert_eq!(device.commands_with(62).len(), 0);
     assert_eq!(device.commands_with(25).len(), 0);
 }
@@ -3142,9 +3155,14 @@ async fn a_subscription_takes_3_to_14_bytes_of_deltas() {
 
 #[tokio::test(start_paused = true)]
 async fn an_owner_answer_without_a_line_break_is_the_name_alone() {
-    // meshcore_py fails on it with an IndexError
+    // meshcore_py fails on it with an IndexError, and so on an owner info
+    // answer with fewer than two line breaks
     let (mc, _device) = client(Options::default(), |cmd| match cmd[0] {
         30 => vec![err(2)],
+        50 => vec![
+            sent_frame(false, 0x707, 1000),
+            binary_response(0x707, b"v1.18.0\nRep 1\0\0"),
+        ],
         57 => {
             let answer = [&7u32.to_le_bytes()[..], b"Rep 1\0\0"].concat();
             vec![
@@ -3160,6 +3178,12 @@ async fn an_owner_answer_without_a_line_break_is_the_name_alone() {
         .await
         .unwrap();
     assert_eq!((anon.name.as_str(), anon.owner.as_str()), ("Rep 1", ""));
+    let info = mc
+        .req_owner_info_sync(&key(), RequestOptions::default())
+        .await
+        .unwrap();
+    let fields = (info.firmware_version.as_str(), info.name.as_str());
+    assert_eq!((fields, info.owner.as_str()), (("v1.18.0", "Rep 1"), ""));
 }
 
 #[tokio::test(start_paused = true)]
