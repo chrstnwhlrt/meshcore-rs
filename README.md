@@ -361,7 +361,12 @@ meshcore_py leaves a gap:
   another), is merged but does not count as read; meshcore_py goes on from its
   `lastmod` and can miss what changed before or was left out. A list with a
   contact that cannot be read does not count as read either, and the next one
-  is read in full; meshcore_py takes over the list's `lastmod` all the same.
+  is read in full; `get_contacts` fails with `invalid_frame_length` once that
+  list has ended, with the rest of it in the cache. meshcore_py lists such a
+  contact with zeros for what is missing (an empty name, say), or ends
+  `get_contacts` at once with a `parse_error` when the contact ends before its
+  flags, while the rest of the list keeps coming; it takes over the list's
+  `lastmod` all the same.
 - `get_contacts_async` waits for the start of the list, so a refusal (while
   another list is coming in) is its own error; in meshcore_py the refusal
   can pass for the reply to the next command.

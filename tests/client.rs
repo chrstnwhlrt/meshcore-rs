@@ -2557,6 +2557,59 @@ async fn a_busy_device_refuses_a_second_contact_list() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_list_with_a_contact_it_cannot_read_fails_at_its_end_with_the_rest_cached() {
+    // the first contact comes cut short (meshcore_py fills in zeros for its
+    // name and what follows), the rest only when the test pushes it: the call
+    // waits for the end, so the cache then holds the rest
+    let (mc, device) = client(Options::default(), |cmd| match cmd[0] {
+        4 => vec![
+            vec![2, 3, 0, 0, 0],
+            contact_frame(3, KEY, "Alice", 0xff, &[])[..50].to_vec(),
+        ],
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    let mut list = Box::pin(async { mc.get_contacts(0).await });
+    assert!(!poll_once(&mut list).await);
+    device.settle().await;
+    assert!(!poll_once(&mut list).await);
+    device
+        .push(contact_frame(3, [0x22; 32], "Rep", 0xff, &[]))
+        .await;
+    device
+        .push(contact_frame(3, [0x33; 32], "Bob", 0xff, &[]))
+        .await;
+    device
+        .push([&[4u8][..], &1000u32.to_le_bytes()].concat())
+        .await;
+    let failed = list.await;
+    assert!(matches!(failed, Err(Error::Protocol(reason)) if reason == "invalid_frame_length"));
+    let names: Vec<String> = mc.contacts().into_iter().map(|c| c.name).collect();
+    assert_eq!(names, ["Rep", "Bob"]);
+    assert!(mc.contacts_dirty());
+    assert_eq!(mc.contacts_lastmod(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_list_that_stalls_after_a_contact_it_cannot_read_fails_5_seconds_later() {
+    // as any list that stalls: the contact cut short came 3 s after the start
+    let (mc, device) = client(Options::default(), |cmd| match cmd[0] {
+        4 => vec![vec![2, 2, 0, 0, 0]],
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    let started = tokio::time::Instant::now();
+    let cut = async {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let frame = contact_frame(3, KEY, "Alice", 0xff, &[]);
+        device.push(frame[..50].to_vec()).await;
+    };
+    let (failed, ()) = tokio::join!(mc.get_contacts(0), cut);
+    assert!(matches!(failed, Err(Error::Timeout)));
+    assert_eq!(started.elapsed().as_secs(), 8);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_refused_contact_request_is_not_the_answer_to_the_next_command() {
     // a list is coming in when it is asked for again without waiting for it
     let requests = AtomicU32::new(0);

@@ -5,7 +5,7 @@ use std::time::Duration;
 use super::{MeshCore, Turn, reply, wait_reply};
 use crate::error::{Error, Result};
 use crate::event::{Event, Subscription};
-use crate::protocol::codes::CommandType;
+use crate::protocol::codes::{CommandType, PacketType};
 use crate::protocol::path::{MAX_PATH_SIZE, PathLen};
 use crate::state::{Answer, Change, State};
 use crate::types::{AdvertPath, AutoAddConfig, Contact, ContactList, PublicKey};
@@ -19,6 +19,9 @@ const CONTACTS_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`CONTACTS_IDLE_TIMEOUT`] between them.
 async fn read_contacts(link: u64, events: &mut Subscription) -> Result<ContactList> {
     let mut deadline = tokio::time::Instant::now() + CONTACTS_IDLE_TIMEOUT;
+    // A contact that cannot be read fails the list at its end, when the cache
+    // holds the rest of it and the device takes requests again.
+    let mut unreadable = None;
     loop {
         let event = tokio::time::timeout_at(deadline, events.recv_on_link(link))
             .await
@@ -27,7 +30,11 @@ async fn read_contacts(link: u64, events: &mut Subscription) -> Result<ContactLi
             Event::NextContact(_) => {
                 deadline = tokio::time::Instant::now() + CONTACTS_IDLE_TIMEOUT;
             }
-            Event::Contacts(list) => return Ok((*list).clone()),
+            Event::Error(info) if info.packet_type == Some(PacketType::Contact.code()) => {
+                deadline = tokio::time::Instant::now() + CONTACTS_IDLE_TIMEOUT;
+                unreadable.get_or_insert(super::error_from_info(info));
+            }
+            Event::Contacts(list) => return unreadable.map_or_else(|| Ok((*list).clone()), Err),
             Event::Error(info) => return Err(super::error_from_info(info)),
             Event::Disconnected { .. } => return Err(Error::ConnectionLost),
             _ => {}
@@ -143,11 +150,12 @@ impl MeshCore {
     /// When the list stalls for 5 s (no start, contact or end), this fails
     /// with [`Error::Timeout`]. A list that only starts after that, or another
     /// app's on another link, is merged into the cache but does not count as
-    /// read, as it may be partial. A contact that cannot be read ends this
-    /// with [`Error::Protocol`]; the rest of its list does not count as read
-    /// either, and the next one is read in full. A call takes only the end of a list whose
-    /// start came after its request: the end of an earlier list that goes on
-    /// late is not its answer, and the device refuses the request with
+    /// read, as it may be partial. A contact that cannot be read fails this
+    /// with [`Error::Protocol`] once its list has ended: the cache takes the
+    /// rest of the list, which does not count as read either, and the next
+    /// one is read in full. A call takes only the end of a list whose start
+    /// came after its request: the end of an earlier list that goes on late
+    /// is not its answer, and the device refuses the request with
     /// [`ErrorCode::BadState`](crate::ErrorCode::BadState) while such a list
     /// is still coming.
     pub async fn get_contacts(&self, lastmod: u32) -> Result<ContactList> {
