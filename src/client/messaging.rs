@@ -644,7 +644,10 @@ impl MeshCore {
 
     /// Sends raw data (at least 4 bytes) direct along a path (empty: zero-hop),
     /// which takes whole hops as in
-    /// [`change_contact_path`](Self::change_contact_path).
+    /// [`change_contact_path`](Self::change_contact_path). The path's length
+    /// byte holds hop count and hash mode, as firmware 1.18 reads it; before,
+    /// the firmware read it as the length in bytes, so there only hash mode 0
+    /// sends along the right path.
     pub async fn send_raw_data(&self, payload: &[u8], path: &[u8], hash_mode: u8) -> Result<()> {
         if payload.len() < 4 {
             return Err(Error::invalid("raw data needs at least 4 bytes"));
@@ -713,9 +716,12 @@ impl MeshCore {
         self.set_flood_scope(&FloodScope::parse(scope)).await
     }
 
-    /// Back to the default flood scope.
+    /// Back to the default flood scope. The command goes without a key, as
+    /// meshcore_py sends it; the firmware resets the scope for it as for the
+    /// zero key of [`FloodScope::Default`].
     pub async fn reset_flood_scope(&self) -> Result<()> {
-        self.set_flood_scope(&FloodScope::Default).await
+        let frame = [CommandType::SetFloodScope.code(), 0];
+        self.request_ok(&frame).await.map(drop)
     }
 
     /// Floods without any scope.

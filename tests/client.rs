@@ -2778,7 +2778,8 @@ async fn flood_scopes_go_back_to_the_default_or_none() {
     mc.reset_flood_scope().await.unwrap();
     mc.force_unscoped().await.unwrap();
     let scopes = device.commands_with(54);
-    assert_eq!(scopes[0], [&[54u8, 0][..], &[0; 16]].concat());
+    // without a key, as meshcore_py sends it; the firmware resets the scope
+    assert_eq!(scopes[0], [54, 0]);
     assert_eq!(scopes[1], [54, 1]);
     mc.reset_default_flood_scope().await.unwrap();
     assert_eq!(device.commands_with(63), [vec![63]]);

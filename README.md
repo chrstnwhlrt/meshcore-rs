@@ -23,7 +23,9 @@ response and push code that firmware sends. A parity test runs the same 71 devic
 frames through meshcore_py and through this library, with channel log decryption
 on and a binary request of each kind waiting for its answer, and compares the
 JSON of the resulting events; they match except for the deliberate fixes listed
-below.
+below. A second one runs 150 cases of commands through both, against stand-ins
+for a device that answer alike, and compares the frames they write; 116 match
+byte for byte, and the other 34 show the differences listed below.
 The size checks assume frames of 176 bytes, which the firmware takes from 1.16
 on; before, it took 172, so there a private message holds at most 159 bytes
 (see `MAX_TEXT_LENGTH`).
@@ -546,11 +548,19 @@ meshcore_py leaves a gap:
   `send_channel_data` and `send_raw_data`; `parse_path_hex` refuses such a
   hash mode too), and a contact path that does not match its length byte (a
   contact that floods has none) or is longer than 64 bytes (`update_contact`).
-  meshcore_py sends such a path. It counts only whole hops, so the firmware
-  takes fewer and, in channel data, reads the rest as the data type. It packs
+  meshcore_py sends such a path. In `change_contact_path` and
+  `send_channel_data` it counts only whole hops, so the firmware takes fewer
+  and, in channel data, reads the rest as the data type. There it also packs
   hop count and hash mode into one byte unchecked, so more hops spill into the
   mode bits, and mode 4 and above raise an error. A contact path over 64 bytes
   goes out uncut and shifts the fields after it.
+- `send_raw_data` takes a hash mode, as `send_channel_data` does, and puts
+  hop count and mode into the path's length byte, which is how firmware 1.18
+  reads it. meshcore_py's `send_raw_data` takes no hash mode and sends the
+  path's length in bytes, as the firmware read it before 1.18. Both are the
+  same for 1-byte hashes. Firmware 1.18 reads a path of 2- or 3-byte hashes
+  from meshcore_py as one hop per byte, and firmware before 1.18 sends raw
+  data along 1-byte hashes only.
 - `connect` takes the link down again when the device does not answer
   `APP_START`, and returns the error; meshcore_py's `connect` returns `None`
   and leaves the link up (its `create_*` functions take it down).
@@ -613,9 +623,13 @@ cargo clippy --all-targets --all-features
   serial transport over a pseudo terminal (Unix).
 - `tests/ble.rs` (feature `ble`, Linux) runs the BLE transport against a stand-in
   for BlueZ, on a D-Bus bus within the test.
-- `tests/parity.rs` (feature `serde`) compares with meshcore_py. After updating
-  meshcore_py, regenerate its fixtures as described in
+- `tests/parity.rs` (feature `serde`) compares the events with meshcore_py's.
+  After updating meshcore_py, regenerate its fixtures as described in
   `tests/fixtures/meshcore_py_reader.py`.
+- `tests/command_parity.rs` compares the frames the commands write with what
+  meshcore_py writes for the same calls. After updating meshcore_py,
+  regenerate its fixture as described in
+  `tests/fixtures/meshcore_py_commands.py`.
 - `tests/logging.rs` checks the log lines at info level and above:
   meshcore_py's wording where it logs the same case, lines of the library's
   own where meshcore_py logs nothing at that level (such as for a lost link),
