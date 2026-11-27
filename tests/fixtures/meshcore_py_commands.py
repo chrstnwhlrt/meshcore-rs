@@ -415,6 +415,7 @@ CASES = [
     ("update_contact_path_too_long", True,
      lambda mc, c: c.update_contact(
          dict(mc.contacts[KEY.hex()], out_path="01" * 66, out_path_len=33, out_path_hash_mode=1))),
+    ("update_contact_lastmod_0", True, lambda mc, c: c.update_contact(mc.contacts[KEY.hex()], lastmod=0)),
     ("send_cmd_bare_key", True, lambda mc, c: c.send_cmd(KEY2, "ver", T)),
     ("retry_unknown_prefix", False, lambda mc, c: c.send_msg_with_retry(STRANGER[:6], "hi", timestamp=T)),
     ("change_path_hash_mode_refused", True,

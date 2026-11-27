@@ -19,7 +19,10 @@ pub const DEFAULT_BAUD_RATE: u32 = 115_200;
 pub struct SerialConfig {
     /// The port, e.g. `/dev/ttyUSB0` or `COM3`.
     pub port: String,
-    /// The baud rate.
+    /// The baud rate. Boards with native USB ignore it, but those on the
+    /// Adafruit nRF52 core (such as the LilyGO T-Echo) start their bootloader
+    /// in place of the firmware when DTR drops at 1200 baud, as it does when
+    /// the port closes, and stay there until reset: do not use 1200 with them.
     pub baud_rate: u32,
     /// DTR after opening; `None` leaves the line as the OS sets it.
     pub dtr: Option<bool>,
@@ -45,7 +48,7 @@ impl SerialConfig {
         }
     }
 
-    /// Sets the baud rate.
+    /// Sets the baud rate (not 1200 for an nRF52 board: see the field).
     #[must_use]
     pub const fn baud_rate(mut self, baud_rate: u32) -> Self {
         self.baud_rate = baud_rate;

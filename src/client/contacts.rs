@@ -80,6 +80,14 @@ pub(crate) fn update_contact_frame(contact: &Contact, lastmod: Option<u32>) -> R
     if contact.name.contains('\0') {
         return Err(Error::invalid("the contact name holds a NUL byte"));
     }
+    // The device lists only contacts whose lastmod is later than the list's
+    // since, so it would hold this one but leave it out of every list.
+    if lastmod == Some(0) {
+        return Err(Error::invalid(
+            "a lastmod of 0 keeps the contact out of every contact list; \
+             without a lastmod the device stamps it with its clock",
+        ));
+    }
     let mut frame = key_frame(CommandType::AddUpdateContact, &contact.public_key);
     frame.push(contact.contact_type.code());
     frame.push(contact.flags);
@@ -232,11 +240,13 @@ impl MeshCore {
 
     /// Writes a contact to the device (adding it if new) and the cache.
     /// Without `lastmod` the device stamps the record with its clock, which
-    /// the cache does not learn: it keeps the contact's `lastmod` then. With
-    /// a `lastmod` of 0 the device leaves the contact out of every list, a
-    /// full one too, as it lists only contacts whose `lastmod` is later than
-    /// the list's `since`. The cache then loses the contact again with the
-    /// next lists read in full. A new contact without a type
+    /// the cache does not learn: it keeps the contact's `lastmod` then. A
+    /// `lastmod` of 0 is refused before sending (`Error::InvalidArgument`;
+    /// meshcore_py sends it): the device lists only contacts whose `lastmod`
+    /// is later than the list's `since`, so it would leave the contact out of
+    /// every list, a full one too, and the cache would lose it again. That
+    /// includes `Some(c.lastmod)` for a contact from
+    /// [`Contact::new`](crate::Contact::new). A new contact without a type
     /// ([`ContactType::None`](crate::ContactType::None)) the device keeps
     /// only for a while (firmware 1.16 and later) and leaves out of its lists,
     /// so it stays out of the cache too.
@@ -376,6 +386,19 @@ mod tests {
         let with_lastmod = update_contact_frame(&contact, Some(2000)).unwrap();
         assert_eq!(with_lastmod[..frame.len()], frame[..]);
         assert_eq!(with_lastmod[frame.len()..], 2000u32.to_le_bytes());
+    }
+
+    #[test]
+    fn a_lastmod_of_0_is_refused() {
+        let contact = Contact::new(PublicKey::new([3; 32]), ContactType::Chat, "Bob");
+        assert!(matches!(
+            update_contact_frame(&contact, Some(0)),
+            Err(Error::InvalidArgument(_))
+        ));
+        let frame = update_contact_frame(&contact, None).unwrap();
+        let with_1 = update_contact_frame(&contact, Some(1)).unwrap();
+        assert_eq!(with_1[..frame.len()], frame[..]);
+        assert_eq!(with_1[frame.len()..], 1u32.to_le_bytes());
     }
 
     #[test]

@@ -563,8 +563,11 @@ impl MeshCore {
     }
 
     /// Starts a path discovery; the answer arrives as [`Event::PathResponse`].
-    /// Like meshcore_py, it logs a hint to use
-    /// [`send_path_discovery_sync`](Self::send_path_discovery_sync).
+    /// Firmware 1.18 floods it as a telemetry request for the base readings,
+    /// so a node answers it only where it would answer
+    /// [`req_telemetry_sync`](Self::req_telemetry_sync): a companion whose
+    /// telemetry is denied (its default) does not. Like meshcore_py, it logs
+    /// a hint to use [`send_path_discovery_sync`](Self::send_path_discovery_sync).
     pub async fn send_path_discovery(&self, dst: &PublicKey) -> Result<SentInfo> {
         log::warn!(
             target: "meshcore",
@@ -580,7 +583,8 @@ impl MeshCore {
         self.request_sent(&frame).await
     }
 
-    /// Discovers the paths to and from a node and waits for the answer.
+    /// Discovers the paths to and from a node and waits for the answer (which
+    /// nodes give one: see [`send_path_discovery`](Self::send_path_discovery)).
     pub async fn send_path_discovery_sync(
         &self,
         dst: &PublicKey,

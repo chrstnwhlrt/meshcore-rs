@@ -192,6 +192,13 @@ impl MeshCore {
     }
 
     /// Reboots the device. The device does not answer, so this only sends.
+    /// Over BLE and over a board's native USB (whose port goes away and comes
+    /// back) the link ends with the restart; with
+    /// [`Options::auto_reconnect`](crate::Options::auto_reconnect) the client
+    /// connects again once the device answers, which took 3 to 5 s on a
+    /// T-Echo. Over BLE the write ends with ATT error 0x0e, as the device
+    /// restarts before it confirms it; that counts as sent, though the failed
+    /// write is logged as a warning.
     pub async fn reboot(&self) -> Result<()> {
         self.send_only(b"\x13reboot").await
     }

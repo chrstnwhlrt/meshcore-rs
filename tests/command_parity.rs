@@ -191,6 +191,18 @@ const DEVIATIONS: &[(&str, &[&str], &[&str])] = &[
         )],
         &[],
     ),
+    // With the lastmod 0 the device would list the contact nowhere.
+    (
+        "update_contact_lastmod_0",
+        &[concat!(
+            "091111111111111111111111111111111111111111111111111111111111111111020041",
+            "a1a200000000000000000000000000000000000000000000000000000000000000000000",
+            "000000000000000000000000000000000000000000000000000000005265700000000000",
+            "000000000000000000000000000000000000000000000000e8030000fc1f3103e47d9800",
+            "00000000"
+        )],
+        &[],
+    ),
     // The node type of a bare key comes from the contact cache.
     (
         "send_cmd_bare_key",
@@ -693,6 +705,7 @@ async fn act(case: &str, mc: &MeshCore) {
         "remove_contact" => drop(mc.remove_contact(&key).await),
         "update_contact" => drop(mc.update_contact(&cached(&key), None).await),
         "update_contact_lastmod" => drop(mc.update_contact(&cached(&key), Some(7000)).await),
+        "update_contact_lastmod_0" => drop(mc.update_contact(&cached(&key), Some(0)).await),
         "add_contact" => drop(mc.add_contact(&new_contact("New")).await),
         // the latter with a device that refuses the hash mode query
         "change_path_device_mode" | "change_path_hash_mode_refused" => {

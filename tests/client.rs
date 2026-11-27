@@ -2901,9 +2901,10 @@ async fn a_list_during_which_a_contact_is_removed_does_not_count_as_read() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_contact_written_with_the_lastmod_0_leaves_the_cache_with_the_full_lists() {
+async fn a_lastmod_of_0_is_refused_before_sending() {
     // the firmware counts all contacts it holds, but lists only those whose
-    // lastmod is later than the list's since, 0 for a full list
+    // lastmod is later than the list's since, 0 for a full list: a contact
+    // written with the lastmod 0 would be in no list
     let bob = Contact::new(PublicKey::new([0x33; 32]), ContactType::Chat, "Bob");
     let table = Arc::new(std::sync::Mutex::new(vec![(KEY, 5000u32)]));
     let (mc, device) = client(Options::default(), {
@@ -2942,17 +2943,17 @@ async fn a_contact_written_with_the_lastmod_0_leaves_the_cache_with_the_full_lis
     });
     mc.connect().await.unwrap();
     mc.get_contacts(0).await.unwrap();
-    mc.update_contact(&bob, Some(0)).await.unwrap();
-    assert_eq!(mc.contact(&bob.public_key).map(|c| c.lastmod), Some(0));
-    // no list brings it, one asked for in full neither
-    let list = mc.get_contacts(0).await.unwrap();
-    assert_eq!(list.contacts.len(), 1);
-    assert!(mc.contact(&bob.public_key).is_some() && mc.contacts_dirty());
-    assert!(mc.ensure_contacts(true).await.unwrap());
+    let refused = mc.update_contact(&bob, Some(0)).await;
+    assert!(matches!(refused, Err(Error::InvalidArgument(_))));
+    assert_eq!(device.commands_with(9).len(), 0);
     assert!(mc.contact(&bob.public_key).is_none() && !mc.contacts_dirty());
-    assert_eq!(mc.contacts().len(), 1);
-    assert_eq!(device.commands_with(4), [[4], [4], [4]]);
-    // the device still holds it
+    // without a lastmod the device stamps it, and a full list brings it
+    mc.update_contact(&bob, None).await.unwrap();
+    assert_eq!(device.commands_with(9).len(), 1);
+    let list = mc.get_contacts(0).await.unwrap();
+    assert_eq!(list.contacts.len(), 2);
+    assert_eq!(mc.contact(&bob.public_key).map(|c| c.lastmod), Some(6000));
+    assert!(!mc.contacts_dirty());
     assert_eq!(table.lock().unwrap().len(), 2);
 }
 

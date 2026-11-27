@@ -176,7 +176,9 @@ impl MeshCore {
         .await
     }
 
-    /// The status of a repeater or room server.
+    /// The status of a repeater or room server. Such a node reads requests
+    /// only from the clients it holds, so this needs a login (a guest one
+    /// will do); without one the request runs into its timeout.
     pub async fn req_status_sync(
         &self,
         dst: &PublicKey,
@@ -195,7 +197,13 @@ impl MeshCore {
         .await
     }
 
-    /// A node's telemetry.
+    /// A node's telemetry. A companion reads requests only from its contacts,
+    /// and answers only when its `telemetry_mode_base` grants the requester
+    /// the base readings: 2 for every contact, 1 for those whose flags have
+    /// bit 1 set (see [`change_contact_flags`](Self::change_contact_flags)).
+    /// With the default 0 the request runs into its timeout. Repeaters, room
+    /// servers and sensors answer the clients they hold (after a login); the
+    /// guests of a repeater or room server get the base readings only.
     pub async fn req_telemetry_sync(
         &self,
         dst: &PublicKey,

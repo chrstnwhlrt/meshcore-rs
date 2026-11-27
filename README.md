@@ -23,12 +23,12 @@ response and push code that firmware sends. A parity test runs the same 71 devic
 frames through meshcore_py and through this library, with channel log decryption
 on and a binary request of each kind waiting for its answer, and compares the
 JSON of the resulting events; they match except for the deliberate fixes listed
-below. A second one runs 183 cases of commands through both, against stand-ins
+below. A second one runs 184 cases of commands through both, against stand-ins
 for a device that answer alike (refusing or leaving unanswered the same
 commands where a case says so), and compares the frames they write. In 122
 cases they write the same frames byte for byte, the random nonce of a
 neighbours request aside (five of these write none: meshcore_py raises an
-error, this library refuses the input). The other 61 show the differences
+error, this library refuses the input). The other 62 show the differences
 listed below.
 The size checks assume frames of 176 bytes, which the firmware takes from 1.16
 on; before, it took 172, so there a private message holds at most 159 bytes
@@ -40,11 +40,20 @@ only) against a stand-in for BlueZ. Serial and BLE were also tested on a LilyGO
 T-LoRa V2.1-1.6 with the companion firmware 1.18.0, through meshcore-cli-rs and
 `examples/check.rs`: scanning, pairing (also after flashing the device anew),
 connecting by name and by address, the read commands, channel messages, login,
-trace, reboot, reconnecting, and links BlueZ still held. BLE ran on the board
-last with the code of v0.10.15; its changes since (no disconnect for a link
-BlueZ reported gone, later links going to the device found first, a clone
-finding its device anew) ran against the stand-in only. `examples/check.rs`
-runs such checks against any device (see Development).
+trace, reboot, reconnecting, and links BlueZ still held. BLE ran on that board
+last with the code of v0.10.15. The code of v0.10.22 ran on a LilyGO T-Echo
+(nRF52840 with native USB, OTAFIX bootloader 0.9.2-OTAFIX2.3) with the
+companion firmware 1.18.0, over USB and BLE: opening and closing the port
+without a restart, DTR off and `create_serial`'s tries, 1200 baud, reboot and
+factory reset with reconnecting, pairing with the PIN from its display, pairing
+again after the device or BlueZ forgot it, connecting by name and by address,
+links BlueZ still held or a killed program left, another program's link
+(`DeviceInUse`), fetching messages, a trace over a repeater nearby, and, with
+the T-LoRa, direct and channel messages both ways, path discovery and
+telemetry. Two BLE changes since
+v0.10.15 ran against the stand-in only: later links of a client given a name
+going to the device found first, and a clone finding its device anew.
+`examples/check.rs` runs such checks against any device (see Development).
 
 ## Installation
 
@@ -573,6 +582,11 @@ meshcore_py leaves a gap:
   hop count and hash mode into one byte unchecked, so more hops spill into the
   mode bits, and mode 4 and above raise an error. A contact path over 64 bytes
   goes out uncut and shifts the fields after it.
+- `update_contact` refuses a `lastmod` of 0 before sending; without one
+  (`None`) the device stamps the record with its clock. The firmware lists only
+  contacts whose `lastmod` is later than the list's `since`, so it would hold
+  the contact but leave it out of every list, a full one too, and the cache
+  would lose it again with the next list read in full. meshcore_py sends the 0.
 - `send_raw_data` takes a hash mode, as `send_channel_data` does, and puts
   hop count and mode into the path's length byte, which is how firmware 1.18
   reads it. meshcore_py's `send_raw_data` takes no hash mode and sends the

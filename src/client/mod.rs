@@ -462,6 +462,14 @@ impl MeshCore {
     /// [`new`](Self::new) from a [`SerialTransport`](crate::SerialTransport)
     /// tries once, with the lines as configured.
     ///
+    /// Boards with native USB, such as the nRF52840 LilyGO T-Echo, do not
+    /// restart when the port opens or closes, and their firmware sends
+    /// nothing while DTR is off (their USB serial drops what is written then):
+    /// a try with DTR off gets no answer, and the inverted try connects. Right
+    /// after such a board restarted, its port is back before the firmware
+    /// answers (on the T-Echo about 3.5 s later), so the first try may run
+    /// into its timeout and the next one connects.
+    ///
     /// # Errors
     ///
     /// The port cannot be opened, or the device does not answer.
