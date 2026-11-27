@@ -232,10 +232,14 @@ impl MeshCore {
 
     /// Writes a contact to the device (adding it if new) and the cache.
     /// Without `lastmod` the device stamps the record with its clock, which
-    /// the cache does not learn: it keeps the contact's `lastmod` then. A new
-    /// contact without a type ([`ContactType::None`](crate::ContactType::None))
-    /// the device keeps only for a while (firmware 1.16 and later) and leaves
-    /// out of its lists, so it stays out of the cache too.
+    /// the cache does not learn: it keeps the contact's `lastmod` then. With
+    /// a `lastmod` of 0 the device leaves the contact out of every list, a
+    /// full one too, as it lists only contacts whose `lastmod` is later than
+    /// the list's `since`. The cache then loses the contact again with the
+    /// next lists read in full. A new contact without a type
+    /// ([`ContactType::None`](crate::ContactType::None)) the device keeps
+    /// only for a while (firmware 1.16 and later) and leaves out of its lists,
+    /// so it stays out of the cache too.
     pub async fn update_contact(&self, contact: &Contact, lastmod: Option<u32>) -> Result<()> {
         let frame = update_contact_frame(contact, lastmod)?;
         let stored = as_stored(contact, lastmod);

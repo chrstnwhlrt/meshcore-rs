@@ -279,8 +279,11 @@ fn name_field_of(name: &str) -> [u8; 32] {
 pub struct ContactList {
     /// The contacts in the order the device sent them.
     pub contacts: Vec<Contact>,
-    /// The most recent `lastmod` of the list (0 when it brought no contacts),
-    /// to pass as `since` next time.
+    /// The `lastmod` the device ended the list with (0 when it brought no
+    /// contacts). What to ask the next list since is
+    /// [`MeshCore::contacts_lastmod`](crate::MeshCore::contacts_lastmod), which
+    /// is 0 when the next one has to be read in full, as after a list that
+    /// lacked a change the device had reported.
     pub lastmod: u32,
 }
 

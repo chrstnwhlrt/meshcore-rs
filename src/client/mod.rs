@@ -575,11 +575,12 @@ impl MeshCore {
     }
 
     /// Opens the link and starts the session with `APP_START`. A link that is
-    /// up is closed first, at once, so a reply on its way is lost; automatic
-    /// message fetching goes on, as in meshcore_py, and reads what came while
-    /// no link was up. Given up (its future dropped) while it opens the link,
-    /// it leaves the client disconnected; given up later, it leaves the link
-    /// up.
+    /// up is closed first, at once, so a reply on its way is lost, and
+    /// reported gone (`manual_disconnect`) before the new one is reported up;
+    /// automatic message fetching goes on, as in meshcore_py, and reads what
+    /// came while no link was up. Given up (its future dropped) while it opens
+    /// the link, it leaves the client disconnected; given up later, it leaves
+    /// the link up.
     ///
     /// # Errors
     ///
@@ -605,11 +606,13 @@ impl MeshCore {
         }
     }
 
-    /// Closes the link, stops automatic message fetching and reconnecting.
-    /// Automatic contact updates stay on and work again after the next
-    /// [`connect`](Self::connect). A command in flight has half a second to
-    /// finish before: a message the device is handing out would be lost. Those
-    /// that wait for their turn are not sent any more.
+    /// Closes the link, stops automatic message fetching and reconnecting, and
+    /// reports the connection gone ([`Event::Disconnected`] with
+    /// `manual_disconnect`, when it was up). Automatic contact updates stay on
+    /// and work again after the next [`connect`](Self::connect). A command in
+    /// flight has half a second to finish before: a message the device is
+    /// handing out would be lost. Those that wait for their turn are not sent
+    /// any more.
     ///
     /// The link is down when this returns: a serial port can be opened again,
     /// and a BLE device is free for other apps, for which this waits the 2 s
@@ -789,12 +792,14 @@ impl MeshCore {
     }
 
     /// True when the contacts may have changed on the device: no list was read
-    /// yet, the last one lacked a change the device had reported or left the
-    /// cache with other contacts than the device holds, or since it started an
-    /// advert or path update arrived, a link was opened (the device reports
-    /// those only while an app is connected), or a command that changes a
-    /// contact went out and got no answer, or was refused for one the cache
-    /// holds.
+    /// yet, the last one lacked a change the device had reported, held a
+    /// contact that could not be read or left the cache with other contacts
+    /// than the device holds, or since it started an advert or path update
+    /// arrived, a link was opened (the device reports those only while an app
+    /// is connected), a private key was imported (the device reads its
+    /// contacts anew then), a command that changes a contact went out and got
+    /// no answer, or the device refused a command about a contact the cache
+    /// holds (it may not hold that contact any more).
     #[must_use]
     pub fn contacts_dirty(&self) -> bool {
         self.state().contacts_dirty

@@ -49,9 +49,9 @@ pub struct TelemetryResponse {
 
 /// A raw answer to a binary or anonymous request (`PUSH_CODE_BINARY_RESPONSE`).
 ///
-/// Sensor telemetry pushes arrive this way too, with the subscription's push
-/// tag, and from firmware 1.18 on every other answer the device cannot match,
-/// such as one to a request the next has replaced.
+/// From firmware 1.18 on, every answer the device cannot match comes this way
+/// too: a sensor's telemetry pushes, with the subscription's push tag, and an
+/// answer to a request the next has replaced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinaryResponse {
     /// The tag: the `expected_ack` of the request's [`SentInfo`](crate::SentInfo).

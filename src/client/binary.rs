@@ -394,8 +394,10 @@ impl MeshCore {
 
     /// Subscribes to a sensor's telemetry pushes (needs a login). Pushes
     /// arrive as [`Event::BinaryResponse`] with `push_tag` as tag: a 4-byte
-    /// timestamp, then LPP readings. `min_deltas` (3 to 14 bytes) are LPP
-    /// encoded: channel, type and the least change that triggers a push.
+    /// timestamp, then LPP readings. The sensor and the companion need
+    /// firmware 1.18 or later: an older companion drops the pushes.
+    /// `min_deltas` (3 to 14 bytes) are LPP encoded: channel, type and the
+    /// least change that triggers a push.
     pub async fn req_subscribe_sync(
         &self,
         dst: &PublicKey,
@@ -442,8 +444,9 @@ impl MeshCore {
 
     /// Sends an anonymous request (`CMD_SEND_ANON_REQ`), which needs no login
     /// and, from firmware 1.16 on, no contact. Repeaters answer it when it
-    /// comes direct; the answer arrives as [`Event::BinaryResponse`] and starts
-    /// with the repeater's clock (4 bytes).
+    /// comes direct, at most four such requests in three minutes from all
+    /// senders together; the answer arrives as [`Event::BinaryResponse`] and
+    /// starts with the repeater's clock (4 bytes).
     ///
     /// The request carries the reply path: the out path of the device's own
     /// record of the node, which is read first, or zero-hop for a node that is

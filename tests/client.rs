@@ -322,6 +322,25 @@ async fn connect_waits_5_seconds_for_the_link_it_replaces() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_connect_while_connected_reports_the_link_before_gone() {
+    // meshcore_py's serial and TCP connections open a second link next to the
+    // first and report only the new one
+    let (mc, device) = client(Options::default(), |_| vec![]);
+    mc.connect().await.unwrap();
+    let mut events = mc.subscribe();
+    mc.connect().await.unwrap();
+    assert_eq!((device.opens(), device.closes()), (2, 1));
+    let reported: Vec<String> = std::iter::from_fn(|| events.try_recv())
+        .filter_map(|event| match event {
+            Event::Disconnected { reason } => Some(format!("gone: {reason}")),
+            Event::Connected { reconnected, .. } => Some(format!("up: {reconnected}")),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reported, ["gone: manual_disconnect", "up: false"]);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_command_that_is_not_polled_does_not_hold_up_disconnect() {
     let (mc, device) = client(Options::default(), |_| vec![]);
     mc.connect().await.unwrap();
@@ -829,6 +848,23 @@ async fn disabled_key_export_and_import() {
         mc.import_private_key(&[0xab; 64]).await,
         Err(Error::Disabled)
     ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_battery_or_private_key_reply_cut_short_fails_at_once() {
+    // meshcore_py drops both and runs into its timeout
+    let (mc, _device) = client(Options::default(), |cmd| match cmd[0] {
+        20 => vec![vec![12, 0xd4]],
+        23 => vec![vec![14, 0xab, 0xab]],
+        _ => vec![],
+    });
+    mc.connect().await.unwrap();
+    let started = tokio::time::Instant::now();
+    let battery = mc.get_bat().await;
+    assert!(matches!(battery, Err(Error::Protocol(reason)) if reason == "invalid_frame_length"));
+    let key = mc.export_private_key().await;
+    assert!(matches!(key, Err(Error::Protocol(reason)) if reason == "invalid_frame_length"));
+    assert!(started.elapsed() < Duration::from_secs(1));
 }
 
 #[tokio::test(start_paused = true)]
@@ -2335,9 +2371,10 @@ async fn a_list_that_lacks_a_reported_change_is_read_again_in_full() {
         device.push(advert(key)).await;
     }
     device.settle().await;
-    mc.get_contacts(mc.contacts_lastmod()).await.unwrap();
+    let list = mc.get_contacts(mc.contacts_lastmod()).await.unwrap();
     assert!(mc.contacts_dirty());
-    assert_eq!(mc.contacts_lastmod(), 0);
+    // the list's own is the device's, which the next list must not go on from
+    assert_eq!((list.lastmod, mc.contacts_lastmod()), (6000, 0));
     assert!(mc.ensure_contacts(true).await.unwrap());
     assert!(!mc.contacts_dirty());
     assert_eq!(mc.contacts_lastmod(), 5000);
@@ -2861,6 +2898,62 @@ async fn a_list_during_which_a_contact_is_removed_does_not_count_as_read() {
     assert!(mc.get_contact_by_name("Bob").is_some());
     assert!(mc.contact(&key()).is_none() && mc.contacts_dirty());
     assert_eq!(mc.contacts_lastmod(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_contact_written_with_the_lastmod_0_leaves_the_cache_with_the_full_lists() {
+    // the firmware counts all contacts it holds, but lists only those whose
+    // lastmod is later than the list's since, 0 for a full list
+    let bob = Contact::new(PublicKey::new([0x33; 32]), ContactType::Chat, "Bob");
+    let table = Arc::new(std::sync::Mutex::new(vec![(KEY, 5000u32)]));
+    let (mc, device) = client(Options::default(), {
+        let table = Arc::clone(&table);
+        move |cmd| {
+            let mut table = table.lock().unwrap();
+            match cmd[0] {
+                4 => {
+                    let since = cmd
+                        .get(1..5)
+                        .map_or(0, |since| u32::from_le_bytes(since.try_into().unwrap()));
+                    let count = u32::try_from(table.len()).unwrap();
+                    let mut frames = vec![[&[2u8][..], &count.to_le_bytes()].concat()];
+                    let mut newest = 0;
+                    for &(key, lastmod) in table.iter().filter(|(_, lastmod)| *lastmod > since) {
+                        let mut frame = contact_frame(3, key, "Alice", 0xff, &[]);
+                        let at = frame.len() - 4;
+                        frame[at..].copy_from_slice(&lastmod.to_le_bytes());
+                        frames.push(frame);
+                        newest = newest.max(lastmod);
+                    }
+                    frames.push([&[4u8][..], &newest.to_le_bytes()].concat());
+                    frames
+                }
+                9 => {
+                    // the lastmod at the end, else the device's clock
+                    let lastmod = cmd
+                        .get(144..148)
+                        .map_or(6000, |at| u32::from_le_bytes(at.try_into().unwrap()));
+                    table.push((cmd[1..33].try_into().unwrap(), lastmod));
+                    vec![ok()]
+                }
+                _ => vec![],
+            }
+        }
+    });
+    mc.connect().await.unwrap();
+    mc.get_contacts(0).await.unwrap();
+    mc.update_contact(&bob, Some(0)).await.unwrap();
+    assert_eq!(mc.contact(&bob.public_key).map(|c| c.lastmod), Some(0));
+    // no list brings it, one asked for in full neither
+    let list = mc.get_contacts(0).await.unwrap();
+    assert_eq!(list.contacts.len(), 1);
+    assert!(mc.contact(&bob.public_key).is_some() && mc.contacts_dirty());
+    assert!(mc.ensure_contacts(true).await.unwrap());
+    assert!(mc.contact(&bob.public_key).is_none() && !mc.contacts_dirty());
+    assert_eq!(mc.contacts().len(), 1);
+    assert_eq!(device.commands_with(4), [[4], [4], [4]]);
+    // the device still holds it
+    assert_eq!(table.lock().unwrap().len(), 2);
 }
 
 #[tokio::test(start_paused = true)]
@@ -3466,7 +3559,9 @@ async fn a_device_with_an_imported_key_is_still_the_same() {
     });
     mc.connect().await.unwrap();
     assert!(mc.ensure_contacts(false).await.unwrap());
+    assert!(!mc.contacts_dirty());
     mc.import_private_key(&[7; 64]).await.unwrap();
+    assert!(mc.contacts_dirty());
     // it answers with its new key at once
     let telemetry = mc.get_self_telemetry().await.unwrap();
     assert_eq!(telemetry.pubkey_prefix, [0x23; 6]);

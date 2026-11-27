@@ -168,8 +168,9 @@ impl State {
                     self.contacts_changed();
                 }
                 // A reply answers the command in flight, so its caller learns
-                // at once. A push came unasked: an error for it would end an
-                // unrelated command, so it is only logged.
+                // at once (`get_contacts` waits for the end of its list). A
+                // push came unasked: an error for it would end an unrelated
+                // command, so it is only logged.
                 if packet_type.is_push() {
                     Vec::new()
                 } else {

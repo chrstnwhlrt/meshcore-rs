@@ -40,7 +40,10 @@ only) against a stand-in for BlueZ. Serial and BLE were also tested on a LilyGO
 T-LoRa V2.1-1.6 with the companion firmware 1.18.0, through meshcore-cli-rs and
 `examples/check.rs`: scanning, pairing (also after flashing the device anew),
 connecting by name and by address, the read commands, channel messages, login,
-trace, reboot, reconnecting, and links BlueZ still held. `examples/check.rs`
+trace, reboot, reconnecting, and links BlueZ still held. BLE ran on the board
+last with the code of v0.10.15; its changes since (no disconnect for a link
+BlueZ reported gone, later links going to the device found first, a clone
+finding its device anew) ran against the stand-in only. `examples/check.rs`
 runs such checks against any device (see Development).
 
 ## Installation
@@ -496,7 +499,9 @@ meshcore_py leaves a gap:
 - A push too short to read is only logged, and a reply too short to read
   ends its command with an error (reason `invalid_frame_length`); meshcore_py
   fills the missing fields of most frames with zeros, or reports a
-  `parse_error` where a missing byte raises an exception. A channel datagram
+  `parse_error` where a missing byte raises an exception. meshcore_py drops a
+  battery reply without its level and a private key reply cut short, so there
+  `get_bat` and `export_private_key` run into its timeout. A channel datagram
   with less data than its length byte announces is such a reply too;
   meshcore_py reports the bytes there are, with the length byte as `data_len`.
   A neighbours answer cut short likewise comes only as its raw `BinaryResponse`,
@@ -579,7 +584,10 @@ meshcore_py leaves a gap:
   `APP_START`, and returns the error; meshcore_py's `connect` returns `None`
   and leaves the link up (its `create_*` functions take it down). Automatic
   message fetching stays on through a `connect` that fails, also one that
-  cannot open the link, for which meshcore_py stops it.
+  cannot open the link, for which meshcore_py stops it. A `connect` while
+  connected closes the link first and reports it gone (`manual_disconnect`)
+  before the new one comes up; meshcore_py's serial and TCP connections open a
+  second link next to the first, and it reports only the new one.
 - A `disconnect` or another `connect` that comes in while a `connect` opens its
   link counts, and the first one fails with `Error::NotConnected`; meshcore_py
   opens that link all the same. One that comes in while the client reconnects
@@ -591,7 +599,10 @@ meshcore_py leaves a gap:
 - `disconnect` lets the command in flight finish for up to half a second and
   sends none of those that wait for their turn; meshcore_py cuts the one in
   flight off, and a message the automatic fetching has just asked for is lost:
-  the device has taken it out of its queue.
+  the device has taken it out of its queue. `disconnect` reports the
+  connection gone (`manual_disconnect`) right away; meshcore_py stops its event
+  dispatcher first, so its subscribers get that event only with the next
+  `connect`, right before `connected`.
 - A write that does not finish within 10 s takes the link down over serial and
   TCP too (`serial_write_timeout`, `tcp_write_timeout`); meshcore_py limits
   writes over BLE only and queues the others in memory.

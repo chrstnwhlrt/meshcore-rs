@@ -781,9 +781,12 @@ impl MeshCore {
         self.request_ok(&frame).await.map(drop)
     }
 
-    /// Asks nodes nearby to identify themselves; answers arrive as
-    /// [`Event::DiscoverResponse`] with the returned tag. `filter` is a bit
-    /// mask of node types (`1 << type`).
+    /// Asks the nodes in range (zero-hop) to identify themselves; answers
+    /// arrive as [`Event::DiscoverResponse`] with the returned tag. `filter` is
+    /// a bit mask of node types (`1 << type`). With `since` only the nodes
+    /// whose regions were saved at that time or later answer. Repeaters and
+    /// sensors answer, a repeater at most four requests in two minutes and not
+    /// while it does not forward or does not advertise.
     pub async fn send_node_discover_req(
         &self,
         filter: u8,

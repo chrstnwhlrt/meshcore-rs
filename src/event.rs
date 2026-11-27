@@ -127,8 +127,9 @@ pub enum Event {
     TraceData(Box<TraceData>),
     /// Telemetry (`telemetry_response`).
     TelemetryResponse(Box<TelemetryResponse>),
-    /// A raw answer to a binary or anonymous request, a sensor's telemetry
-    /// push, or an answer the device could not match (`binary_response`).
+    /// A raw answer to a binary or anonymous request, and from firmware 1.18
+    /// on any other answer the device cannot match, as a sensor's telemetry
+    /// push (`binary_response`).
     BinaryResponse(Box<BinaryResponse>),
     /// A min/max/average answer (`mma_response`).
     MmaResponse(Box<MmaResponse>),
